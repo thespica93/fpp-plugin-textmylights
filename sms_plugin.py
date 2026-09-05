@@ -2939,8 +2939,7 @@ def index():
                             <option value="twilio" {{ 'selected' if config.get('message_source','twilio') != 'google_voice' else '' }}>Twilio</option>
                             <option value="google_voice" {{ 'selected' if config.get('message_source','twilio') == 'google_voice' else '' }}>Google Voice (Gmail)</option>
                         </select>
-                        <p class="help-text">Choose where incoming text messages come from. Twilio uses its API; Google Voice scans the Gmail inbox that Voice forwards texts to.</p>
-                        <p class="help-text">▶️ The show is started and stopped by the <strong>Start</strong> / <strong>Stop</strong> scheduler commands.</p>
+                        <p class="help-text"><a id="provider_help_link" href="plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=help.php#twilio" target="_top">View Twilio Configuration</a></p>
 
                         <!-- Twilio credentials — shown when Message Source = Twilio -->
                         <div id="twilio_creds">
@@ -2977,7 +2976,6 @@ def index():
 
                             <button class="test-btn" onclick="testGoogleVoice()">🔌 Test Google Voice Connection</button>
                             <div id="gv_test_result" style="margin-top: 8px; font-size: 14px;"></div>
-                            <p class="help-text" style="margin-top:8px;">ℹ️ Replies are sent by emailing Google Voice back (the app password must allow SMTP). Auto-responses on the <strong>SMS Responses</strong> tab work in this mode. Reply delivery via Google Voice is best-effort and may be rate-limited.</p>
                         </div>
 
                         <label>Poll Interval (seconds):</label>
@@ -3020,12 +3018,10 @@ def index():
                         <label>Display Duration (seconds):</label>
                         <input type="number" id="display_duration" value="{{ config.display_duration }}" min="5" max="300" onchange="if(window.renderCanvasPreview)window.renderCanvasPreview();">
                         <p class="help-text">⏱️ Each message displays for this many seconds before moving to the next</p>
-                        <p class="help-text">💡 Scrolling lines set to "Fit to time" use this as their scroll window — one full pass per display.</p>
-                        <p class="help-text">💡 Recommended: set this to a multiple of your Names Display Content sequence's length, so it doesn't cut off mid-loop</p>
+                        <p class="help-text">💡 Scrolling lines set to "Fit to time" use this as their scroll window.</p>
 
                         <label>Max Messages Per Phone (0 = unlimited):</label>
                         <input type="number" id="max_messages" value="{{ config.max_messages_per_phone }}" min="0" max="100">
-                        <p class="help-text">⚙️ Set automatically by Message Source: Google Voice = unlimited (0), Twilio = 5.</p>
 
                         <div id="max_length_section">
                             <label>Max Message Length:</label>
@@ -3104,21 +3100,38 @@ def index():
                 </div>
             </div>
             <script>
-                var _formatRulesInitialized = false;
+                // Remember the last active format-rule choice so enabling the
+                // whitelist (which clears the rules) and then disabling it restores
+                // exactly what was set before — rather than forcing "Two Words Max".
+                var _savedFormatState = {
+                    one_word_only: {{ 'true' if config.get('one_word_only', False) else 'false' }},
+                    two_words_max: {{ 'true' if config.get('two_words_max', True) else 'false' }}
+                };
+                var _prevWhitelistOn = null;
                 function updateFormatRules() {
                     var whitelistOn = document.getElementById('use_whitelist').checked;
+                    var one = document.getElementById('one_word_only');
+                    var two = document.getElementById('two_words_max');
                     var inputs = document.getElementById('format_rules_inputs');
                     var note = document.getElementById('format_rules_disabled_note');
                     inputs.style.opacity = whitelistOn ? '0.4' : '1';
                     inputs.style.pointerEvents = whitelistOn ? 'none' : '';
                     note.style.display = whitelistOn ? 'block' : 'none';
                     if (whitelistOn) {
-                        document.getElementById('one_word_only').checked = false;
-                        document.getElementById('two_words_max').checked = false;
-                    } else if (_formatRulesInitialized) {
-                        document.getElementById('two_words_max').checked = true;
+                        // Snapshot the current choice only when coming from the
+                        // non-whitelist state (when already whitelisted the boxes are
+                        // cleared and no longer reflect a real choice).
+                        if (_prevWhitelistOn === false) {
+                            _savedFormatState.one_word_only = one.checked;
+                            _savedFormatState.two_words_max = two.checked;
+                        }
+                        one.checked = false;
+                        two.checked = false;
+                    } else {
+                        one.checked = _savedFormatState.one_word_only;
+                        two.checked = _savedFormatState.two_words_max;
                     }
-                    _formatRulesInitialized = true;
+                    _prevWhitelistOn = whitelistOn;
                     checkFormatWarning();
                 }
                 function checkFormatWarning() {
@@ -3659,7 +3672,7 @@ def index():
 
                 <div id="test_form_inner">
                     <p style="color: #FF9800; font-size: 14px;">
-                        ⚠️ Use this to test messages without sending actual texts. Works without Twilio credentials.
+                        ⚠️ Use this to test messages without sending actual texts. Works without SMS credentials.
                     </p>
 
                     <label>Test Name:</label>
@@ -3669,30 +3682,6 @@ def index():
 
                     <div id="test_result" style="margin-top: 10px;"></div>
                 </div>
-            </div>
-
-            <div class="section" style="border: 2px solid #FF9800;">
-                <h2>🧪 SMS Response Testing</h2>
-                <p style="color: #FF9800; font-size: 14px;">
-                    ⚠️ Test sending SMS responses to a phone number. Requires Twilio credentials. </p>
-
-                <label>Phone Number:</label>
-                <input type="text" id="test_sms_phone" placeholder="Number to Text">
-
-                <label>Message Type:</label>
-                <select id="test_sms_type">
-                    <option value="success">✅ Success</option>
-                    <option value="profanity">🚫 Profanity</option>
-                    <option value="rate_limited">⛔ Rate Limited</option>
-                    <option value="duplicate">🔄 Duplicate</option>
-                    <option value="invalid_format">❌ Invalid Format</option>
-                    <option value="not_whitelisted">📋 Not Whitelisted</option>
-                    <option value="blocked">🚫 Blocked</option>
-                </select>
-
-                <button class="test-btn" onclick="sendTestSMS()">📤 Send Test SMS</button>
-
-                <div id="test_sms_result" style="margin-top: 10px;"></div>
             </div>
 
         </div>
@@ -5327,6 +5316,14 @@ var _saveTimer = null;
                 if (tw) tw.style.display = isGV ? 'none' : '';
                 if (gv) gv.style.display = isGV ? '' : 'none';
 
+                // Point the help link at the selected provider's config section
+                var helpLink = document.getElementById('provider_help_link');
+                if (helpLink) {
+                    helpLink.textContent = isGV ? 'View Google Voice Configuration' : 'View Twilio Configuration';
+                    helpLink.href = 'plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=help.php#'
+                        + (isGV ? 'google-voice' : 'twilio');
+                }
+
                 // SMS Responses are only exposed for Google Voice right now
                 var smsBtn = document.getElementById('tabbtn-sms');
                 if (smsBtn) {
@@ -5400,33 +5397,6 @@ var _saveTimer = null;
                         if (data.reason) {
                             resultDiv.innerHTML += '<p style="font-size: 12px; color: #666;">Reason: ' + data.reason + '</p>';
                         }
-                    }
-                });
-            }
-
-            function sendTestSMS() {
-                const phone = document.getElementById('test_sms_phone').value.trim();
-                const messageType = document.getElementById('test_sms_type').value;
-                const resultDiv = document.getElementById('test_sms_result');
-
-                if (!phone) {
-                    resultDiv.innerHTML = '<p class="error">❌ Please enter a phone number</p>';
-                    return;
-                }
-
-                resultDiv.innerHTML = '<p>📤 Sending test SMS...</p>';
-
-                fetch('/api/test/sms', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({phone: phone, message_type: messageType})
-                })
-                .then(r => r.json())
-                .then(data => {
-                    if (data.success) {
-                        resultDiv.innerHTML = '<p class="success">✅ Test SMS sent successfully to ' + phone + '</p>';
-                    } else {
-                        resultDiv.innerHTML = '<p class="error">❌ Failed to send: ' + data.error + '</p>';
                     }
                 });
             }
@@ -6052,35 +6022,6 @@ def test_message_submission():
         logging.error(f"🧪 💥 ERROR in test message submission: {e}")
         import traceback
         logging.error(traceback.format_exc())
-        return jsonify({"success": False, "error": str(e)})
-
-@app.route('/api/test/sms', methods=['POST'])
-def test_sms_response():
-    """Test sending an SMS response — bypasses enabled/disabled toggles so any response can be previewed"""
-    try:
-        data = request.json
-        phone = data.get('phone', '').strip()
-        message_type = data.get('message_type', 'success')
-
-        if not phone:
-            return jsonify({"success": False, "error": "Phone number is required"})
-
-        if not twilio_client:
-            return jsonify({"success": False, "error": "Twilio credentials not configured"})
-
-        response_message = config.get(f"response_{message_type}", "")
-        if not response_message:
-            return jsonify({"success": False, "error": f"No message text configured for '{message_type}'"})
-
-        twilio_client.messages.create(
-            body=response_message,
-            from_=config['twilio_phone_number'],
-            to=phone
-        )
-        return jsonify({"success": True, "message": f"Test SMS sent to {phone}"})
-
-    except Exception as e:
-        logging.error(f"Error in test SMS: {e}")
         return jsonify({"success": False, "error": str(e)})
 
 @app.route('/api/phone/block', methods=['POST'])

@@ -33,7 +33,7 @@ $githubBase = "https://github.com/thespica93/fpp-plugin-textmylights";
     <a href="plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=messages.php" target="_top" class="ui-link secondary">📋 View Message Queue</a>
 
     <!-- ================= TWILIO ================= -->
-    <h2>📞 Configure Twilio</h2>
+    <h2 id="twilio">📞 Configure Twilio</h2>
     <p>Twilio is a paid SMS service (~$1/month for a number, ~$0.01 per text). It supports automatic SMS replies to visitors.</p>
     <ol>
         <li>Create an account at <a href="https://www.twilio.com/try-twilio" target="_blank">twilio.com</a> and buy an <strong>SMS-capable phone number</strong>.</li>
@@ -44,7 +44,7 @@ $githubBase = "https://github.com/thespica93/fpp-plugin-textmylights";
     <div class="warn"><strong>US numbers:</strong> Twilio requires <a href="https://www.twilio.com/docs/messaging/compliance/a2p-10dlc" target="_blank">A2P 10DLC registration</a> before texts (including auto-responses) will actually deliver. Register your number in the Twilio Console.</div>
 
     <!-- ================= GOOGLE VOICE ================= -->
-    <h2>🟢 Configure Google Voice</h2>
+    <h2 id="google-voice">🟢 Configure Google Voice</h2>
     <p>Google Voice is <strong>free</strong>. It has no API, so the plugin reads the Gmail inbox that Google Voice forwards texts to. Automatic replies are supported by emailing Google Voice back (best-effort; may be rate-limited).</p>
     <ol>
         <li><strong>Turn on email forwarding.</strong> In <a href="https://voice.google.com/settings" target="_blank">Google Voice → Settings → Messages</a>, enable <em>“Forward messages to email.”</em></li>

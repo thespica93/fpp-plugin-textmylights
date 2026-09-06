@@ -3380,6 +3380,24 @@ def index():
                         row.classList.remove('locked');
                         toggleResp('invalid_format');  // reflect the preserved state
                     }
+
+                    // Not-on-Whitelist response is the inverse: it can only fire while
+                    // the whitelist is ON (names are checked against the list), so grey
+                    // it out when the whitelist is off.
+                    var nwRow = document.getElementById('row_not_whitelisted');
+                    var nwCb = document.getElementById('sms_response_not_whitelisted');
+                    var nwWarn = document.getElementById('not_whitelisted_disabled_warning');
+                    if (nwRow) {
+                        if (nwCb) nwCb.disabled = !whitelistOn;
+                        if (nwWarn) nwWarn.style.display = whitelistOn ? 'none' : '';
+                        if (!whitelistOn) {
+                            nwRow.classList.add('locked');
+                            nwRow.classList.remove('enabled');
+                        } else {
+                            nwRow.classList.remove('locked');
+                            toggleResp('not_whitelisted');  // reflect the preserved state
+                        }
+                    }
                 }
                 // Rate-Limited response is meaningless when Max Messages Per Phone is 0
                 // (unlimited) — no one is ever rate limited. Lock the row live.
@@ -3829,11 +3847,15 @@ def index():
                     <textarea id="response_rate_limited" rows="2">{{ config.get('response_rate_limited', "You've reached the maximum number of messages allowed. Please try again tomorrow!") }}</textarea>
                 </div>
 
-                <div id="row_not_whitelisted" class="resp-row">
+                <div id="row_not_whitelisted" class="resp-row{% if not config.get('use_whitelist', False) %} locked{% endif %}">
                     <div class="resp-toggle">
-                        <label class="toggle-switch"><input type="checkbox" id="sms_response_not_whitelisted" {{ 'checked' if config.get('sms_response_not_whitelisted', False) else '' }} onchange="toggleResp('not_whitelisted')"><span class="toggle-slider"></span></label>
+                        <label class="toggle-switch"><input type="checkbox" id="sms_response_not_whitelisted"
+                               {{ 'checked' if config.get('sms_response_not_whitelisted', False) else '' }}
+                               {{ 'disabled' if not config.get('use_whitelist', False) else '' }}
+                               onchange="toggleResp('not_whitelisted')"><span class="toggle-slider"></span></label>
                         <label for="sms_response_not_whitelisted" style="margin-left:10px;vertical-align:middle;">📋 Not on Whitelist — Send Response</label>
                     </div>
+                    <p id="not_whitelisted_disabled_warning" class="resp-locked-note" style="{{ '' if not config.get('use_whitelist', False) else 'display:none;' }}">⚠️ Not-on-Whitelist responses only apply when the Name Whitelist is enabled.</p>
                     <textarea id="response_not_whitelisted" rows="2">{{ config.get('response_not_whitelisted', 'Sorry, that name is not on our approved list.') }}</textarea>
                 </div>
 
@@ -5123,6 +5145,7 @@ def index():
             initRespRows();
             checkWhitelistResponseState();
             checkRateLimitResponseState();
+            checkDuplicateState();
             setupAutoSave();
             updateLiveStatus();
             setInterval(updateLiveStatus, 5000);

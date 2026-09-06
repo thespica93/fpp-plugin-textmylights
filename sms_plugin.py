@@ -4,9 +4,10 @@ Text My Lights - FPP plugin: viewers text a name that appears on your display.
 Supports Twilio and Google Voice as message sources.
 """
 
-from flask import Flask, request, jsonify, render_template_string, Response
+from flask import Flask, request, jsonify, render_template_string, Response, g
 import logging
 import json
+import secrets as _secrets
 import requests
 from datetime import datetime, timedelta, timezone
 import re
@@ -47,6 +48,13 @@ PLUGIN_DIR      = os.path.dirname(os.path.abspath(__file__))
 # All runtime data lives under one plugin folder
 PLUGIN_DATA_DIR = "/home/fpp/media/plugin.fpp-textmylights"
 CONFIG_FILE     = os.path.join(PLUGIN_DATA_DIR, "plugin.json")
+# Credentials live in their own owner-only directory — NOT in plugin.json, logs,
+# or backups. (True at-rest secrecy isn't possible on this hardware: an
+# unattended service must be able to read them on boot, so any key would sit on
+# the same card. This keeps them out of the shared config and off casual view.)
+SECRETS_DIR     = os.path.join(PLUGIN_DATA_DIR, "secrets")
+SECRETS_FILE    = os.path.join(SECRETS_DIR, "credentials.json")
+SECRET_KEYS     = ("twilio_auth_token", "gv_app_password")
 LOG_FILE        = os.path.join(PLUGIN_DATA_DIR, "logs", "sms_plugin.log")
 QUEUE_FILE      = os.path.join(PLUGIN_DATA_DIR, "queue_pending.json")
 MESSAGES_DIR    = os.path.join(PLUGIN_DATA_DIR, "logs", "messages")
@@ -68,6 +76,12 @@ WHITELIST_ADDED_FILE = os.path.join(PLUGIN_DIR, "whitelist_added.txt")
 
 # Create directory structure before logging setup
 os.makedirs(os.path.join(PLUGIN_DATA_DIR, "logs", "messages"), exist_ok=True)
+# Owner-only secrets directory (created at first run and on install)
+os.makedirs(SECRETS_DIR, exist_ok=True)
+try:
+    os.chmod(SECRETS_DIR, 0o700)
+except OSError:
+    pass
 
 # Setup logging — ensure the log directory exists, then write to file + stderr
 _log_handlers = [logging.StreamHandler()]  # stderr always available via nohup
@@ -87,6 +101,71 @@ flask.cli.show_server_banner = lambda *args: None
 
 app = Flask(__name__)
 
+# ============================================================================
+# NETWORK ACCESS CONTROL
+# ----------------------------------------------------------------------------
+# The service binds 0.0.0.0:5000 so the FPP web UI (running on a different
+# machine — the user's browser) can iframe it. To keep anonymous LAN clients
+# from reading credentials / controlling the show, every *network* request must
+# carry an access token. The token is minted here and read by the FPP-served
+# PHP pages (ui.php / messages.php), which are already behind FPP's own web
+# server — so only someone who can load the FPP UI ever receives it.
+#
+# Loopback (127.0.0.1) is always trusted: the scheduler's activate/deactivate
+# scripts and any on-box tooling reach us over localhost and need no token.
+# Escape hatch: `touch <PLUGIN_DATA_DIR>/.disable_auth` then restart to disable
+# network auth if you are ever locked out.
+# ============================================================================
+ACCESS_TOKEN_FILE = os.path.join(PLUGIN_DATA_DIR, ".access_token")
+AUTH_DISABLE_FILE = os.path.join(PLUGIN_DATA_DIR, ".disable_auth")
+_AUTH_COOKIE = "tml_token"
+
+def _load_or_create_token():
+    """Reuse a persisted token across restarts so already-open UIs keep working;
+    mint one on first run. The token file is world-readable on purpose — the FPP
+    web server (whatever user it runs as) must read it to embed in the UI, and
+    local read access already implies full access to the plaintext config."""
+    try:
+        with open(ACCESS_TOKEN_FILE, 'r') as _f:
+            _tok = _f.read().strip()
+            if _tok:
+                return _tok
+    except OSError:
+        pass
+    _tok = _secrets.token_urlsafe(32)
+    try:
+        with open(ACCESS_TOKEN_FILE, 'w') as _f:
+            _f.write(_tok)
+        os.chmod(ACCESS_TOKEN_FILE, 0o644)
+    except OSError as _e:
+        logging.error(f"Could not persist access token: {_e}")
+    return _tok
+
+ACCESS_TOKEN = _load_or_create_token()
+
+@app.before_request
+def _require_access_token():
+    # Trust the loopback interface (scheduler scripts, on-box curl, the poller
+    # never hits HTTP). remote_addr comes from the socket peer; we never trust
+    # X-Forwarded-For, so it cannot be spoofed to look local.
+    if request.remote_addr in ('127.0.0.1', '::1'):
+        return None
+    if os.path.exists(AUTH_DISABLE_FILE):
+        return None
+    # First load carries the token as a query param (embedded by the FPP UI);
+    # we then set a cookie so subsequent same-origin fetches are authorized.
+    qtok = request.args.get('token', '')
+    if qtok and _secrets.compare_digest(qtok, ACCESS_TOKEN):
+        g._set_auth_cookie = True
+        return None
+    ctok = request.cookies.get(_AUTH_COOKIE, '')
+    if ctok and _secrets.compare_digest(ctok, ACCESS_TOKEN):
+        return None
+    return Response(
+        "Access denied. Open this plugin from the FPP web UI "
+        "(Content Setup → Text My Lights).",
+        status=403, mimetype='text/plain')
+
 IFRAME_RESIZE_SCRIPT = """<script>
 (function() {
     function reportHeight() {
@@ -99,6 +178,11 @@ IFRAME_RESIZE_SCRIPT = """<script>
 
 @app.after_request
 def inject_iframe_resize(response):
+    # Persist the access token as a cookie once a valid ?token= is presented, so
+    # follow-up requests from the same browser don't need the query param.
+    if getattr(g, '_set_auth_cookie', False):
+        response.set_cookie(_AUTH_COOKIE, ACCESS_TOKEN, httponly=True,
+                            samesite='Lax', max_age=60 * 60 * 24 * 365)
     if response.content_type.startswith('text/html'):
         body = response.get_data(as_text=True)
         body = body.replace('</body>', IFRAME_RESIZE_SCRIPT + '</body>')
@@ -220,14 +304,32 @@ def load_config():
     try:
         with open(CONFIG_FILE, 'r') as f:
             loaded = json.load(f)
-            config.update(loaded)
 
-        # If the plugin was updated and new default keys were added, save them
-        # back so the file stays complete across updates
-        new_keys = set(DEFAULT_CONFIG.keys()) - set(loaded.keys())
-        if new_keys:
+        secrets = load_secrets()
+        # One-time migration: older versions stored credentials inside plugin.json.
+        # Move any inline secrets into the owner-only secrets file and strip them
+        # from the main config so they never get rewritten to plugin.json.
+        migrated = False
+        for k in SECRET_KEYS:
+            if k in loaded:
+                if loaded[k] and not secrets.get(k):
+                    secrets[k] = loaded[k]
+                    migrated = True
+                del loaded[k]
+
+        config.update(loaded)
+        config.update(secrets)
+
+        # If the plugin was updated and new default keys were added (or we just
+        # migrated secrets out), save so the files stay complete/clean.
+        present = set(loaded.keys()) | set(secrets.keys())
+        new_keys = set(DEFAULT_CONFIG.keys()) - present
+        if new_keys or migrated:
             save_config()
-            logging.info(f"Saved {len(new_keys)} new default setting(s) after update: {new_keys}")
+            if migrated:
+                logging.info("Migrated inline credentials into the owner-only secrets file")
+            if new_keys:
+                logging.info(f"Saved {len(new_keys)} new default setting(s) after update: {new_keys}")
 
         # Migrate old scroll_speed values (pre-v2.6 stored raw px/s, now 1-10 scale)
         if config.get('scroll_speed', 5) > 10:
@@ -320,11 +422,45 @@ def load_config():
     except Exception as e:
         logging.error(f"Error loading config: {e}")
 
-def save_config():
-    """Save configuration to file"""
+def load_secrets():
+    """Read credentials from the owner-only secrets file. Returns {} if absent."""
     try:
+        with open(SECRETS_FILE, 'r') as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    except Exception as e:
+        logging.error(f"Error loading secrets: {e}")
+        return {}
+
+def save_config():
+    """Persist configuration. Credentials are written to the owner-only secrets
+    file (chmod 600); everything else goes to plugin.json (also 600, without the
+    secrets). `config` in memory always holds the merged view."""
+    try:
+        # Secrets → owner-only file, never into plugin.json/logs/backups.
+        secrets_out = {k: config[k] for k in SECRET_KEYS if config.get(k)}
+        os.makedirs(SECRETS_DIR, exist_ok=True)
+        try:
+            os.chmod(SECRETS_DIR, 0o700)
+        except OSError:
+            pass
+        with open(SECRETS_FILE, 'w') as f:
+            json.dump(secrets_out, f, indent=2)
+        try:
+            os.chmod(SECRETS_FILE, 0o600)
+        except OSError:
+            pass
+
+        # Everything except the secrets → main config file.
+        main_out = {k: v for k, v in config.items() if k not in SECRET_KEYS}
         with open(CONFIG_FILE, 'w') as f:
-            json.dump(config, f, indent=2)
+            json.dump(main_out, f, indent=2)
+        try:
+            os.chmod(CONFIG_FILE, 0o600)
+        except OSError:
+            pass
         logging.info("Configuration saved")
     except Exception as e:
         logging.error(f"Error saving config: {e}")
@@ -1467,6 +1603,14 @@ def send_sms_response(to_phone, message_type):
         return False
 
 
+def _sanitize_header(value):
+    """Strip CR/LF (and stray control chars) from values that come from an inbound
+    email before they go into outbound reply headers, so a crafted message can't
+    inject extra headers (LOW-2 — email header injection)."""
+    if value is None:
+        return ''
+    return re.sub(r'[\r\n\x00]+', ' ', str(value)).strip()
+
 def send_gv_reply(text, message_type=""):
     """Send an outbound SMS via Google Voice by replying to the forwarding email.
 
@@ -1489,14 +1633,14 @@ def send_gv_reply(text, message_type=""):
         from email.mime.text import MIMEText
         reply = MIMEText(text, 'plain', 'utf-8')
         reply['From'] = email_addr
-        reply['To'] = ctx['to']
-        subj = ctx.get('subject', '') or "Re: text message"
+        reply['To'] = _sanitize_header(ctx['to'])
+        subj = _sanitize_header(ctx.get('subject', '')) or "Re: text message"
         reply['Subject'] = subj if subj[:3].lower() == 're:' else ('Re: ' + subj)
         # Thread the reply to the original so Google Voice associates it with the
         # right conversation.
         if ctx.get('message_id'):
-            reply['In-Reply-To'] = ctx['message_id']
-            refs = (ctx.get('references', '') + ' ' + ctx['message_id']).strip()
+            reply['In-Reply-To'] = _sanitize_header(ctx['message_id'])
+            refs = _sanitize_header((ctx.get('references', '') + ' ' + ctx['message_id']).strip())
             reply['References'] = refs
 
         host = config.get('gv_smtp_host', 'smtp.gmail.com')
@@ -1657,6 +1801,56 @@ def get_day_log_path(date=None):
     if date is None:
         date = datetime.now().date()
     return os.path.join(MESSAGES_DIR, f"messages_{date.isoformat()}.json")
+
+def mask_phone(p):
+    """Redact a phone number to its last 4 digits for display/API responses —
+    full numbers are kept only in the on-disk logs and never sent to the browser.
+    Passes through the 'Local Testing' sentinel and empty values unchanged."""
+    if not p or p == 'Local Testing':
+        return p
+    digits = re.sub(r'\D', '', str(p))
+    return '***' + digits[-4:] if len(digits) >= 4 else '***'
+
+def redact_messages(messages, log_date):
+    """Return copies of message log entries with phone numbers masked to last-4,
+    tagged with their log date so the UI can reference a message for blocking
+    without ever holding the full number (see _phone_from_log_ref)."""
+    out = []
+    for m in messages:
+        m = dict(m)
+        masked = mask_phone(m.get('phone_full') or m.get('phone'))
+        m['phone'] = masked
+        m['phone_full'] = masked
+        m['_log_date'] = log_date
+        out.append(m)
+    return out
+
+def _phone_from_log_ref(date_str, ts):
+    """Resolve the full phone number of a stored message by (date, timestamp).
+    Full numbers stay server-side; the UI only ever holds the masked value plus
+    this reference, so blocking-from-history still works without exposing PII."""
+    try:
+        if date_str:
+            path = get_day_log_path(datetime.strptime(date_str, "%Y-%m-%d").date())
+        else:
+            path = get_day_log_path()
+        with open(path, 'r') as f:
+            messages = json.load(f)
+        for m in messages:
+            if m.get('timestamp') == ts:
+                return m.get('phone_full') or m.get('phone')
+    except Exception as e:
+        logging.error(f"Block-by-reference resolve failed: {e}")
+    return None
+
+def _client_error(context, exc, status=None):
+    """Log the real exception server-side and return a generic message to the
+    browser, so internal paths / exception detail never leak in a response
+    (LOW-3). Preserves the original HTTP status when one is given."""
+    logging.error(f"{context}: {exc}")
+    body = jsonify({"success": False,
+                    "error": "An internal error occurred. See the plugin log for details."})
+    return (body, status) if status else body
 
 def cleanup_old_logs():
     """Delete daily message log files older than 7 days from MESSAGES_DIR."""
@@ -2948,7 +3142,8 @@ def index():
                             <input type="text" id="account_sid" value="{{ config.twilio_account_sid }}" placeholder="Starts with AC...">
 
                             <label>Twilio Auth Token:</label>
-                            <input type="password" id="auth_token" value="{{ config.twilio_auth_token }}">
+                            <input type="password" id="auth_token" value="" autocomplete="new-password"
+                                   placeholder="{{ '•••••••• saved — leave blank to keep' if config.twilio_auth_token else 'Twilio Auth Token' }}">
 
                             <label>Twilio Phone Number:</label>
                             <input type="text" id="phone_number" value="{{ config.twilio_phone_number }}" placeholder="+1234567890">
@@ -2972,7 +3167,8 @@ def index():
                             <input type="text" id="gv_email" value="{{ config.get('gv_email','') }}" placeholder="you@gmail.com">
 
                             <label>App Password:</label>
-                            <input type="password" id="gv_app_password" value="{{ config.get('gv_app_password','') }}" placeholder="16-character app password">
+                            <input type="password" id="gv_app_password" value="" autocomplete="new-password"
+                                   placeholder="{{ '•••••••• saved — leave blank to keep' if config.get('gv_app_password') else '16-character app password' }}">
 
                             <button class="test-btn" onclick="testGoogleVoice()">🔌 Test Google Voice Connection</button>
                             <div id="gv_test_result" style="margin-top: 8px; font-size: 14px;"></div>
@@ -5521,7 +5717,14 @@ var _saveTimer = null;
 def update_config():
     global config, twilio_client, polling_thread, stop_polling
     try:
-        new_config = request.json
+        new_config = request.json or {}
+        # Secrets are never rendered back into the config page (the fields render
+        # blank with a "saved" placeholder). A blank value from the client therefore
+        # means "keep the stored secret" — not "clear it" — so we drop blank secret
+        # keys before merging rather than wiping the saved credential.
+        for _sk in ('twilio_auth_token', 'gv_app_password'):
+            if not str(new_config.get(_sk, '')).strip():
+                new_config.pop(_sk, None)
         config.update(new_config)
 
         # Normalize phone number to E.164 (strip spaces, dashes, parens — keep + and digits)
@@ -5547,7 +5750,7 @@ def update_config():
 
         return jsonify({"success": True})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return _client_error("update_config", e)
 
 @app.route('/api/fpp/fonts')
 def fpp_fonts_endpoint():
@@ -5608,7 +5811,7 @@ def get_fpp_data():
         _fpp_data_cache_time = time.time()
         return jsonify(results)
     except Exception as e:
-        return jsonify({"error": str(e)})
+        return _client_error("get_fpp_data", e)
 
 @app.route('/api/fpp/refresh', methods=['POST'])
 def refresh_fpp_data():
@@ -5623,7 +5826,7 @@ def test_fpp_api():
         success, status = test_fpp_connection()
         return jsonify({"success": success, "status": status})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return _client_error("test_fpp_api", e)
 
 @app.route('/api/fseq/debug')
 def fseq_debug():
@@ -5637,6 +5840,7 @@ def fseq_debug():
         return jsonify({'error': 'No sequence specified'}), 400
 
     name     = seq.removeprefix('seq:').removesuffix('.fseq')
+    name     = os.path.basename(name)   # no path traversal — keep filename only
     filepath = os.path.join(FSEQ_SEQUENCE_PATH, name + '.fseq')
     if not os.path.exists(filepath):
         return jsonify({'error': f'Sequence not found: {name}.fseq'}), 404
@@ -5722,6 +5926,7 @@ def fseq_info():
     if not seq:
         return jsonify({'error': 'No sequence specified'}), 400
     name = seq.removeprefix('seq:').removesuffix('.fseq')
+    name = os.path.basename(name)   # no path traversal — keep filename only
     filepath = os.path.join(FSEQ_SEQUENCE_PATH, name + '.fseq')
     if not os.path.exists(filepath):
         return jsonify({'error': f'Sequence not found: {name}.fseq'}), 404
@@ -5740,7 +5945,7 @@ def fseq_info():
             'detected_channel_count':  detected_cc,
         })
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _client_error("fseq_info", e, 500)
 
 @app.route('/api/fseq/frame')
 def fseq_frame():
@@ -5762,6 +5967,7 @@ def fseq_frame():
         return jsonify({'error': 'Overlay model dimensions unknown — select a model first'}), 400
 
     name = seq.removeprefix('seq:').removesuffix('.fseq')
+    name = os.path.basename(name)   # no path traversal — keep filename only
     filepath = os.path.join(FSEQ_SEQUENCE_PATH, name + '.fseq')
     if not os.path.exists(filepath):
         return jsonify({'error': f'Sequence not found: {name}.fseq'}), 404
@@ -5817,7 +6023,7 @@ def fseq_frame():
                         headers={'Cache-Control': 'no-store'})
     except Exception as e:
         logging.error(f"FSEQ frame error: {e}")
-        return jsonify({'error': str(e)}), 500
+        return _client_error("fseq_frame", e, 500)
 
 @app.route('/api/media/preview')
 def media_preview():
@@ -5882,8 +6088,7 @@ def media_preview():
         return Response(buf.read(), mimetype='image/png',
                         headers={'Cache-Control': 'no-store'})
     except Exception as e:
-        logging.error(f"media_preview error: {e}")
-        return jsonify({'error': str(e)}), 500
+        return _client_error("media_preview", e, 500)
 
 
 @app.route('/api/test')
@@ -5947,7 +6152,8 @@ def get_messages():
             messages = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         messages = []
-    return jsonify(list(reversed(messages)))
+    today = datetime.now().date().isoformat()
+    return jsonify(redact_messages(list(reversed(messages)), today))
 
 @app.route('/api/messages/clear', methods=['POST'])
 def clear_messages():
@@ -5957,8 +6163,7 @@ def clear_messages():
         logging.info("Message history cleared (today's file)")
         return jsonify({"success": True})
     except Exception as e:
-        logging.error(f"Error clearing messages: {e}")
-        return jsonify({"success": False, "error": str(e)})
+        return _client_error("clear_messages", e)
 
 @app.route('/api/messages/<date_str>')
 def get_messages_by_date(date_str):
@@ -5972,8 +6177,8 @@ def get_messages_by_date(date_str):
     except (FileNotFoundError, json.JSONDecodeError):
         messages = []
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    return jsonify(list(reversed(messages)))
+        return _client_error("get_messages_by_date", e, 500)
+    return jsonify(redact_messages(list(reversed(messages)), date_str))
 
 @app.route('/api/queue/status')
 def queue_status():
@@ -5981,7 +6186,7 @@ def queue_status():
         status = get_queue_status()
         return jsonify(status)
     except Exception as e:
-        return jsonify({"error": str(e)})
+        return _client_error("queue_status", e)
 
 @app.route('/api/test/message', methods=['POST'])
 def test_message_submission():
@@ -6019,22 +6224,27 @@ def test_message_submission():
             return jsonify({"success": False, "error": "Failed to add to queue"})
             
     except Exception as e:
-        logging.error(f"🧪 💥 ERROR in test message submission: {e}")
         import traceback
         logging.error(traceback.format_exc())
-        return jsonify({"success": False, "error": str(e)})
+        return _client_error("test_message_submission", e)
 
 @app.route('/api/phone/block', methods=['POST'])
 def api_block_phone():
     try:
-        data = request.json
+        data = request.json or {}
         phone = data.get('phone')
+        # Preferred path: block by message reference (date + timestamp). The full
+        # number is resolved from the on-disk log server-side, so the browser only
+        # ever holds the masked value — never the real number.
+        if not phone and data.get('ts'):
+            phone = _phone_from_log_ref(data.get('date'), data.get('ts'))
         if phone:
             success = block_phone(phone)
-            return jsonify({"success": success, "phone": phone})
-        return jsonify({"success": False, "error": "No phone number provided"})
+            # Never echo the full number back to the client.
+            return jsonify({"success": success, "phone": mask_phone(phone)})
+        return jsonify({"success": False, "error": "Could not resolve the number to block"})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return _client_error("api_block_phone", e)
 
 @app.route('/api/phone/unblock', methods=['POST'])
 def api_unblock_phone():
@@ -6046,7 +6256,7 @@ def api_unblock_phone():
             return jsonify({"success": success, "phone": phone})
         return jsonify({"success": False, "error": "No phone number provided"})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return _client_error("api_unblock_phone", e)
 
 @app.route('/api/blocklist')
 def api_get_blocklist():
@@ -6054,7 +6264,7 @@ def api_get_blocklist():
         blocklist = load_blocklist()
         return jsonify({"blocklist": blocklist})
     except Exception as e:
-        return jsonify({"error": str(e)})
+        return _client_error("api_get_blocklist", e)
 
 @app.route('/api/blacklist')
 def api_get_blacklist():
@@ -6062,7 +6272,7 @@ def api_get_blacklist():
         words = load_blacklist_words()
         return jsonify({"blacklist": words})
     except Exception as e:
-        return jsonify({"error": str(e)})
+        return _client_error("api_get_blacklist", e)
 
 @app.route('/api/blacklist/add', methods=['POST'])
 def api_add_blacklist():
@@ -6097,7 +6307,7 @@ def api_add_blacklist():
         logging.info(f"Added '{word}' to user blacklist")
         return jsonify({"success": True})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return _client_error("api_add_blacklist", e)
 
 @app.route('/api/blacklist/remove', methods=['POST'])
 def api_remove_blacklist():
@@ -6126,7 +6336,7 @@ def api_remove_blacklist():
         logging.info(f"Removed '{word}' from blacklist")
         return jsonify({"success": True})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return _client_error("api_remove_blacklist", e)
 
 @app.route('/api/whitelist')
 def api_get_whitelist():
@@ -6134,7 +6344,7 @@ def api_get_whitelist():
         names = sorted(load_whitelist())
         return jsonify({"whitelist": names})
     except Exception as e:
-        return jsonify({"error": str(e)})
+        return _client_error("api_get_whitelist", e)
 
 @app.route('/api/whitelist/add', methods=['POST'])
 def api_add_whitelist():
@@ -6180,7 +6390,7 @@ def api_add_whitelist():
         logging.info(f"Added '{name}' to user whitelist")
         return jsonify({"success": True})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return _client_error("api_add_whitelist", e)
 
 @app.route('/api/whitelist/remove', methods=['POST'])
 def api_remove_whitelist():
@@ -6209,7 +6419,7 @@ def api_remove_whitelist():
         logging.info(f"Removed '{name}' from whitelist")
         return jsonify({"success": True})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return _client_error("api_remove_whitelist", e)
 
 @app.route('/whitelist')
 def view_whitelist():
@@ -6837,7 +7047,7 @@ def view_messages():
                 <p style="color:#333; font-weight:bold; margin-bottom:16px;">What would you like to block?</p>
                 <div style="display:flex; flex-direction:column; gap:10px;">
                     <button style="background:#f44336; color:white; padding:12px; border:none; border-radius:5px; cursor:pointer;"
-                            onclick="blockPhone(document.getElementById('block-modal').dataset.phone)">Block this number from texting again</button>
+                            onclick="blockPhone()">Block this number from texting again</button>
                     <button id="modal-block-name-btn" style="background:#FF9800; color:white; padding:12px; border:none; border-radius:5px; cursor:pointer;"
                             onclick="blockNameFromDisplay()">Block this name from being displayed</button>
                     <p id="whitelist-warning" style="color:#f44336; font-size:12px; margin:0; padding:4px 0; display:none;">
@@ -6961,8 +7171,11 @@ def view_messages():
                     var label = statusLabel[msg.status] || esc(msg.status);
                     var btn = '';
                     if (showBlock && msg.phone_full !== 'Local Testing') {
-                        btn = '<button class="block-btn" data-phone="' + esc(msg.phone_full) + '" data-name="' + esc(msg.extracted_name) +
-                              '" onclick="showBlockModal(this.dataset.phone,this.dataset.name)">Block</button>';
+                        // Block by reference (timestamp + log date) — the full number
+                        // stays server-side; we only carry the masked value for display.
+                        btn = '<button class="block-btn" data-ts="' + esc(msg.timestamp) + '" data-date="' + esc(msg._log_date || '') +
+                              '" data-masked="' + esc(msg.phone) + '" data-name="' + esc(msg.extracted_name) +
+                              '" onclick="showBlockModal(this.dataset.masked,this.dataset.name,this.dataset.ts,this.dataset.date)">Block</button>';
                     }
                     return '<tr class="' + esc(msg.status) + '">' +
                         '<td>' + fmtTime(msg.timestamp) + '</td>' +
@@ -6975,16 +7188,18 @@ def view_messages():
                 return '<table><tr><th>Timestamp</th><th>Phone</th><th>Message</th><th>Name</th><th>Status</th><th>Action</th></tr>' + rows + '</table>';
             }
 
-            function showBlockModal(phone, name) {
+            function showBlockModal(masked, name, ts, date) {
                 modalOpen = true;
-                document.getElementById('modal-phone').textContent = phone;
+                document.getElementById('modal-phone').textContent = masked;
                 document.getElementById('modal-name-text').textContent = name || '(no name)';
                 document.getElementById('modal-block-name-btn').disabled = !name;
                 document.getElementById('modal-block-name-btn').style.opacity = name ? '1' : '0.4';
                 document.getElementById('whitelist-warning').style.display = useWhitelist ? 'none' : 'block';
-                document.getElementById('block-modal').dataset.phone = phone;
-                document.getElementById('block-modal').dataset.name = name || '';
-                document.getElementById('block-modal').style.display = 'flex';
+                var modal = document.getElementById('block-modal');
+                modal.dataset.ts = ts || '';
+                modal.dataset.date = date || '';
+                modal.dataset.name = name || '';
+                modal.style.display = 'flex';
             }
 
             function closeBlockModal() {
@@ -6993,11 +7208,13 @@ def view_messages():
                 scheduleRefresh();
             }
 
-            function blockPhone(phone) {
+            function blockPhone() {
+                var modal = document.getElementById('block-modal');
+                var ts = modal.dataset.ts, date = modal.dataset.date;
                 closeBlockModal();
-                fetch('/api/phone/block', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({phone:phone}) })
+                fetch('/api/phone/block', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ts:ts, date:date}) })
                     .then(function(r) { return r.json(); })
-                    .then(function(data) { if (data.success) alert('Phone number blocked!'); refreshData(); });
+                    .then(function(data) { alert(data.success ? 'Phone number blocked!' : ('Could not block: ' + (data.error || 'unknown error'))); refreshData(); });
             }
 
             function blockNameFromDisplay() {

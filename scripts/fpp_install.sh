@@ -99,6 +99,16 @@ log_and_show "[7/7] zstandard complete"
 # Create config files if they don't exist
 [ ! -f "/home/fpp/media/config/blocked_phones.json" ] && echo "[]" > /home/fpp/media/config/blocked_phones.json
 
+# Create the plugin data dir and an OWNER-ONLY secrets folder for credentials
+# (Twilio auth token, Gmail app password). Kept out of plugin.json/logs/backups;
+# 0700 so only the fpp user can read it. The plugin also ensures this at startup.
+PLUGIN_DATA_DIR="/home/fpp/media/plugin.fpp-textmylights"
+mkdir -p "$PLUGIN_DATA_DIR/secrets"
+chown -R fpp:fpp "$PLUGIN_DATA_DIR" 2>/dev/null
+chmod 700 "$PLUGIN_DATA_DIR/secrets" 2>/dev/null
+[ -f "$PLUGIN_DATA_DIR/secrets/credentials.json" ] && chmod 600 "$PLUGIN_DATA_DIR/secrets/credentials.json" 2>/dev/null
+log_and_show "Secrets folder ready: $PLUGIN_DATA_DIR/secrets (owner-only)"
+
 # whitelist.txt and blacklist.txt ship with the plugin via git.
 # Force git checkout to ensure they are present (FPP update may not pull all files).
 cd "$PLUGIN_DIR" && git checkout -- whitelist.txt blacklist.txt >> "$LOG" 2>&1

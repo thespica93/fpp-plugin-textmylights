@@ -3155,14 +3155,6 @@ def index():
                         <!-- Google Voice credentials — shown when Message Source = Google Voice -->
                         <div id="gv_creds" style="display:none;">
                             <h3 style="margin:14px 0 6px;">Google Voice Settings</h3>
-                            <div style="background:#e3f2fd; color:#0d47a1; border-radius:5px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
-                                <strong>One-time setup:</strong>
-                                <ol style="margin:6px 0 0 18px; padding:0;">
-                                    <li>In <a href="https://voice.google.com/settings" target="_blank">Google Voice → Settings → Messages</a>, turn on <em>“Forward messages to email.”</em></li>
-                                    <li>On your Google account, turn on <a href="https://myaccount.google.com/signinoptions/two-step-verification" target="_blank">2-Step Verification</a>, then create an <a href="https://myaccount.google.com/apppasswords" target="_blank">App Password</a> (16 characters).</li>
-                                    <li>Enter your Gmail address and paste the app password below, then click Test.</li>
-                                </ol>
-                            </div>
                             <label>Gmail Address:</label>
                             <input type="text" id="gv_email" value="{{ config.get('gv_email','') }}" placeholder="you@gmail.com">
 
@@ -5420,6 +5412,20 @@ var _saveTimer = null;
                 // scheduler commands (api_activate / api_deactivate) — there is no
                 // manual enable toggle, so config saves here never touch it.
 
+                // Turn on the auto-responses that can actually fire under Google
+                // Voice (Twilio keeps them off / hidden). Skips rows locked by another
+                // setting: rate-limited (unlimited), duplicate (dupes allowed),
+                // invalid-format (whitelist on) — those stay off.
+                function enableGvResponses() {
+                    ['show_not_live','blocked','profanity','invalid_format','not_whitelisted','success'].forEach(function(id) {
+                        var cb = document.getElementById('sms_response_' + id);
+                        var row = document.getElementById('row_' + id);
+                        if (cb && !cb.disabled && row && !row.classList.contains('locked')) {
+                            cb.checked = true;
+                            toggleResp(id);
+                        }
+                    });
+                }
                 // Message source selector — swap the visible credential block, apply
                 // the source's rate-limit default, and save.
                 var srcEl = document.getElementById('message_source');
@@ -5434,6 +5440,7 @@ var _saveTimer = null;
                     updateSourceUI();
                     checkDuplicateState();          // grey the duplicate response accordingly
                     checkRateLimitResponseState();  // grey the rate-limited response accordingly
+                    if (isGV) enableGvResponses();  // Google Voice: turn on the usable responses
                     saveConfig();
                 });
                 // Google Voice credential fields — save on blur (like Twilio creds)
@@ -5451,6 +5458,7 @@ var _saveTimer = null;
                 ['profanity_filter','use_whitelist','allow_duplicate_names',
                  'default_playlist','name_display_playlist','overlay_model_name',
                  'one_word_only','two_words_max',
+                 'sms_response_show_not_live',
                  'sms_response_success','sms_response_profanity','sms_response_rate_limited',
                  'sms_response_duplicate','sms_response_invalid_format',
                  'sms_response_not_whitelisted','sms_response_blocked'
@@ -5512,11 +5520,15 @@ var _saveTimer = null;
                 if (tw) tw.style.display = isGV ? 'none' : '';
                 if (gv) gv.style.display = isGV ? '' : 'none';
 
-                // Point the help link at the selected provider's config section
+                // Point the help link at the selected provider's config section.
+                // This page runs inside the plugin's own service (port 5000), so a
+                // relative URL would resolve there instead of the FPP web server —
+                // build an absolute URL to the FPP host (default port) explicitly.
                 var helpLink = document.getElementById('provider_help_link');
                 if (helpLink) {
                     helpLink.textContent = isGV ? 'View Google Voice Configuration' : 'View Twilio Configuration';
-                    helpLink.href = 'plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=help.php#'
+                    var fppBase = window.location.protocol + '//' + window.location.hostname;
+                    helpLink.href = fppBase + '/plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=help.php#'
                         + (isGV ? 'google-voice' : 'twilio');
                 }
 

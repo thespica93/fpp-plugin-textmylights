@@ -411,7 +411,7 @@ def load_config():
         # newest on first poll so the whole inbox isn't replayed)
         last_gv_uid = load_last_gv_uid()
 
-        # Enforce source-tied settings on startup (rate limit, Twilio responses off)
+        # Drop responses whose trigger can't fire (limit 0 / duplicates allowed)
         _apply_source_policy()
         save_config()
 
@@ -467,30 +467,34 @@ def save_config():
 
 
 def _apply_source_policy():
-    """Enforce settings tied to the selected message source, and lock responses
-    whose trigger can't fire — so config stays consistent however it was set:
-      - Google Voice: unlimited inbound (rate limit 0), duplicate names allowed
-      - Twilio: rate limit 5, duplicates disallowed, auto-responses OFF (untested)
-      - A response is force-disabled when its condition can never happen:
-          rate-limited (limit 0), duplicate (duplicates allowed),
-          invalid-format (whitelist on)
+    """Keep the saved config self-consistent with the selected message source.
+
+    SMS auto-responses only have a working outbound path over Google Voice
+    (reply-to-email); Twilio has no reply path in this plugin and the config
+    page hides the whole SMS Responses tab under Twilio. So under Twilio we
+    force every response OFF — otherwise a stale toggle left over from Google
+    Voice would imply a reply that can never be sent.
+
+    We do NOT force Max Messages Per Phone or Allow Duplicate Names to source
+    defaults here. Those are the user's to set (the config page seeds sensible
+    defaults when the source is switched), and clobbering them on every save is
+    what previously made the Duplicate / Rate-Limited responses impossible to
+    enable under Google Voice.
+
+    We still drop the two responses whose trigger genuinely can't fire:
+      - rate-limited → off when Max Messages Per Phone is 0 (nobody is limited)
+      - duplicate    → off when duplicate names are allowed (never a duplicate)
+
+    Invalid-format is intentionally not touched: the whitelist only greys it in
+    the UI and the send path already skips it while the whitelist is on, so the
+    user's on/off choice is preserved for when the whitelist is turned back off.
+
     Mutates `config` in place; caller is responsible for saving."""
-    source = config.get('message_source', 'twilio')
-    if source == 'google_voice':
-        config['max_messages_per_phone'] = 0
-        config['allow_duplicate_names'] = True
-    else:  # twilio
-        config['max_messages_per_phone'] = 5
-        config['allow_duplicate_names'] = False
+    if config.get('message_source', 'twilio') != 'google_voice':
         for key in list(config.keys()):
             if key.startswith('sms_response_'):
                 config[key] = False
 
-    # Dependent response locks: force off ONLY the source-tied ones (rate limit /
-    # duplicates are set by the source, so their state isn't a user choice to keep).
-    # Invalid-format is NOT forced off here — the whitelist only greys it in the UI
-    # and the send path already skips it while the whitelist is on, so the user's
-    # on/off choice is preserved for when the whitelist is turned back off.
     if config.get('max_messages_per_phone', 0) == 0:
         config['sms_response_rate_limited'] = False
     if config.get('allow_duplicate_names', False):
@@ -5766,7 +5770,7 @@ def update_config():
         if config.get('twilio_phone_number'):
             config['twilio_phone_number'] = re.sub(r'[^\d+]', '', config['twilio_phone_number'])
 
-        # Enforce source-tied settings (rate limit, Twilio responses off)
+        # Drop responses whose trigger can't fire (limit 0 / duplicates allowed)
         _apply_source_policy()
 
         save_config()

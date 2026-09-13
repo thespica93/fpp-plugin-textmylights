@@ -25,6 +25,7 @@ Visitor texts name → Twilio → Plugin polls & receives → Filters applied �
 | Page | Description |
 |------|-------------|
 | [Twilio Setup](docs/01-twilio-setup.md) | Create a Twilio account, get a phone number, and configure credentials |
+| [Google Voice Setup](docs/11-google-voice-setup.md) | Free alternative to Twilio — set up a Google Voice number and email forwarding |
 | [Installation](docs/02-installation.md) | Install the plugin on your FPP device |
 | [Plugin Configuration](docs/03-plugin-configuration.md) | Full reference for all settings |
 | [Message Queue](docs/04-message-queue.md) | How the queue works, monitoring, and manual controls |

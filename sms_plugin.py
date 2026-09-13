@@ -1585,25 +1585,38 @@ def send_sms_response(to_phone, message_type):
         logging.warning(f"No response message configured for type: {message_type}")
         return False
 
+    return send_sms_text(to_phone, response_message, message_type)
+
+
+def send_sms_text(to_phone, text, message_type="message"):
+    """Send arbitrary SMS text to a recipient via the active message source.
+
+    Lower-level than send_sms_response(): it does NOT consult the per-type
+    enable toggles or response templates, so it's used for dynamically built
+    messages such as the multi-name batch summary. Routing (Twilio REST vs
+    Google Voice reply-to-email) matches send_sms_response()."""
+    if not text:
+        return False
+
     # Google Voice: reply-to-email path
     if config.get('message_source') == 'google_voice':
-        return send_gv_reply(response_message, message_type)
+        return send_gv_reply(text, message_type)
 
     # Twilio: REST API path
     if not twilio_client:
-        logging.warning("Cannot send SMS response: Twilio client not initialized")
+        logging.warning("Cannot send SMS: Twilio client not initialized")
         return False
 
     try:
         twilio_client.messages.create(
-            body=response_message,
+            body=text,
             from_=config['twilio_phone_number'],
             to=to_phone
         )
-        logging.info(f"📤 Sent SMS response to {to_phone[-4:]}: {message_type}")
+        logging.info(f"📤 Sent SMS to {to_phone[-4:]}: {message_type}")
         return True
     except Exception as e:
-        logging.error(f"Error sending SMS response: {e}")
+        logging.error(f"Error sending SMS: {e}")
         return False
 
 
@@ -1673,6 +1686,34 @@ def extract_name(message):
     
     max_len = config.get('max_message_length', 30)
     return message[:max_len] if message else "Guest"
+
+def is_non_name_message(body):
+    """True if an inbound message is a phone 'tapback'/reaction or contains no
+    letters at all (emoji / punctuation only).
+
+    These are courtesy replies to the display notification, not name
+    submissions, so callers should silently ignore them instead of firing an
+    invalid_format (or any) auto-response.
+
+    A message with zero ASCII letters can never yield a valid name anyway —
+    extract_name() strips to [a-zA-Z\\s-], so it would collapse to "Guest" —
+    which makes dropping it safe as well as correct."""
+    text = (body or '').strip()
+    if not text:
+        return True
+
+    # iOS / RCS tapback reactions delivered over SMS, e.g.:
+    #   Loved "…"   Liked "…"   Disliked "…"   Laughed at "…"
+    #   Emphasized "…"   Questioned "…"   Reacted 😂 to "…"
+    if re.match(r'^(loved|liked|disliked|laughed at|emphasized|questioned|reacted\b.*?\bto)\s+["\'“‘”’]',
+                text, flags=re.IGNORECASE):
+        return True
+
+    # No ASCII letters anywhere → emoji / symbols / punctuation only
+    if not re.search(r'[a-zA-Z]', text):
+        return True
+
+    return False
 
 def is_valid_name(text):
     """Check if text is a valid name"""
@@ -2546,6 +2587,72 @@ def get_queue_status():
     
     return status
 
+_RESULT_TO_RESPONSE = {
+    "success":         "success",
+    "duplicate":       "duplicate",
+    "invalid_format":  "invalid_format",
+    "not_whitelisted": "not_whitelisted",
+    "profanity":       "profanity",
+    "rate_limited":    "rate_limited",
+    "error":           None,
+}
+
+def parse_name_list(body):
+    """If `body` is a genuine multi-name list — names separated by commas or
+    line breaks, with 2+ that pass name validation — return the list of
+    extracted names. Otherwise return None, signalling the caller to handle the
+    message as a single submission (unchanged behavior).
+
+    Only commas and line breaks separate names — NEVER spaces — so multi-word
+    names like "Jean Luke" and hyphenated names like "Jean-Luke" each stay a
+    single name."""
+    tokens = [t.strip() for t in re.split(r'[\n\r,]+', body)]
+    tokens = [t for t in tokens if t and re.search(r'[a-zA-Z]', t)]
+    if len(tokens) < 2:
+        return None
+
+    max_names = config.get('max_names_per_text', 25)
+    names = []
+    valid_count = 0
+    for t in tokens[:max_names]:
+        nm = extract_name(t)
+        if nm == "Guest":          # greeting-only / no usable letters — drop noise
+            continue
+        names.append(nm)
+        if is_valid_name(nm)[0]:
+            valid_count += 1
+
+    # Require at least two real names before treating it as a list, so an
+    # ordinary sentence that happens to contain a comma isn't chopped up.
+    if valid_count < 2:
+        return None
+    return names
+
+def build_multi_summary(results):
+    """Build the single summary reply for a multi-name text from the per-name
+    outcomes (a list of (name, outcome) tuples)."""
+    added   = [n for n, o in results if o == "success"]
+    dup     = [n for n, o in results if o == "duplicate"]
+    notwl   = [n for n, o in results if o == "not_whitelisted"]
+    prof    = [n for n, o in results if o == "profanity"]
+    invalid = [n for n, o in results if o == "invalid_format"]
+    limited = [n for n, o in results if o == "rate_limited"]
+
+    parts = []
+    if added:
+        parts.append(f"✅ Added {len(added)}: " + ", ".join(added))
+
+    skipped = []
+    if dup:     skipped.append(", ".join(dup) + " (already sent today)")
+    if notwl:   skipped.append(", ".join(notwl) + " (not on the list)")
+    if prof:    skipped.append(", ".join(prof) + " (not allowed)")
+    if invalid: skipped.append(", ".join(invalid) + " (not a valid name)")
+    if limited: skipped.append(", ".join(limited) + " (daily limit reached)")
+    if skipped:
+        parts.append("⚠️ Skipped: " + "; ".join(skipped))
+
+    return " ".join(parts)
+
 def process_incoming_message(from_number, body):
     """Run one inbound message through the full pipeline: show-live check →
     blocked → name extraction → rate limit → duplicate → whitelist → profanity
@@ -2555,6 +2662,14 @@ def process_incoming_message(from_number, body):
     needs the sender identity and message text; per-source dedup bookkeeping
     (SID / IMAP UID) stays in the caller. Behavior is identical to the logic
     that previously lived inline in poll_twilio()."""
+    # Phone 'tapback' reactions and emoji-only replies to the display
+    # notification are courtesy responses, not name submissions — silently
+    # drop them so we never fire an invalid_format (or any) auto-response.
+    # Returning normally lets the caller advance its dedup marker.
+    if is_non_name_message(body):
+        logging.info(f"🙈 Ignored reaction/emoji-only reply from {from_number[-4:]}: '{body[:30]}'")
+        return
+
     if not config.get('enabled', False):
         # Show not live — reply if enabled, then discard
         if not is_blocked(from_number):
@@ -2570,46 +2685,78 @@ def process_incoming_message(from_number, body):
         send_sms_response(from_number, "blocked")
 
     else:
-        name = extract_name(body)
-        logging.debug(f"👤 Extracted name: '{name}'")
+        # A genuine multi-name list (commas / line breaks, 2+ valid names) is
+        # split into individual names; anything else is handled as a single
+        # message exactly as before.
+        names = parse_name_list(body)
+        multi = names is not None
+        if not multi:
+            names = [extract_name(body)]
+        logging.debug(f"👤 Extracted name(s): {names}")
+
+        # Rate limiting: each name counts as one message against the sender's
+        # daily allowance. Track the running tally and stop queuing once the
+        # limit is reached; the rest are reported as skipped.
         max_msgs = config.get('max_messages_per_phone', 0)
-        msg_count = get_message_count(from_number) if max_msgs > 0 else 0
-        is_valid, _ = is_valid_name(name)
+        used = get_message_count(from_number) if max_msgs > 0 else 0
 
-        if max_msgs > 0 and msg_count >= max_msgs:
-            logging.info(f"⛔ Rate limited: {from_number[-4:]}")
-            log_message(from_number, body, "", "rate_limited")
-            send_sms_response(from_number, "rate_limited")
+        results = []          # list of (name, outcome)
+        limit_hit = False
+        for nm in names:
+            if max_msgs > 0 and used >= max_msgs:
+                logging.info(f"⛔ Rate limited: {from_number[-4:]} ({nm})")
+                results.append((nm, "rate_limited"))
+                limit_hit = True
+                continue
 
-        elif not config.get('allow_duplicate_names', False) and has_sent_name_today(from_number, name):
-            logging.info(f"🔄 Duplicate name: {name}")
-            log_message(from_number, body, name, "duplicate_name_today")
-            send_sms_response(from_number, "duplicate")
+            is_valid, _ = is_valid_name(nm)
+            # Single message: keep the original whole-body profanity check.
+            # List: check the individual name.
+            prof_target = nm if multi else body
 
-        elif not is_valid and not config.get('use_whitelist', False):
-            logging.info(f"❌ Invalid format: '{body[:20]}'")
-            log_message(from_number, body, name, "invalid_format")
-            send_sms_response(from_number, "invalid_format")
-
-        elif not is_on_whitelist(name):
-            logging.info(f"❌ Not on whitelist: {name}")
-            log_message(from_number, body, name, "not_on_whitelist")
-            send_sms_response(from_number, "not_whitelisted")
-
-        elif config['profanity_filter'] and contains_profanity(body):
-            logging.info(f"❌ Profanity rejected")
-            log_message(from_number, body, name, "profanity")
-            send_sms_response(from_number, "profanity")
-
-        else:
-            success = add_to_queue(name, from_number, body)
-            if success:
-                logging.info(f"✅ Queued: {name}")
-                log_message(from_number, body, name, "queued")
-                send_sms_response(from_number, "success")
+            if not config.get('allow_duplicate_names', False) and has_sent_name_today(from_number, nm):
+                logging.info(f"🔄 Duplicate name: {nm}")
+                log_message(from_number, body, nm, "duplicate_name_today")
+                results.append((nm, "duplicate"))
+            elif not is_valid and not config.get('use_whitelist', False):
+                logging.info(f"❌ Invalid format: '{nm[:20]}'")
+                log_message(from_number, body, nm, "invalid_format")
+                results.append((nm, "invalid_format"))
+            elif not is_on_whitelist(nm):
+                logging.info(f"❌ Not on whitelist: {nm}")
+                log_message(from_number, body, nm, "not_on_whitelist")
+                results.append((nm, "not_whitelisted"))
+            elif config['profanity_filter'] and contains_profanity(prof_target):
+                logging.info(f"❌ Profanity rejected: {nm}")
+                log_message(from_number, body, nm, "profanity")
+                results.append((nm, "profanity"))
             else:
-                logging.warning(f"❌ Queue error: {name}")
-                log_message(from_number, body, name, "error")
+                if add_to_queue(nm, from_number, body):
+                    logging.info(f"✅ Queued: {nm}")
+                    log_message(from_number, body, nm, "queued")
+                    results.append((nm, "success"))
+                else:
+                    logging.warning(f"❌ Queue error: {nm}")
+                    log_message(from_number, body, nm, "error")
+                    results.append((nm, "error"))
+
+            used += 1  # every processed name counts toward the daily limit
+
+        # Record a single rate_limited row for the overflow so history isn't
+        # flooded with one row per skipped name.
+        if limit_hit:
+            log_message(from_number, body, "", "rate_limited")
+
+        # Response: a single message keeps the exact per-type auto-response; a
+        # real list gets one combined summary instead of one text per name.
+        if not multi:
+            resp = _RESULT_TO_RESPONSE.get(results[0][1]) if results else None
+            if resp:
+                send_sms_response(from_number, resp)
+        else:
+            summary = build_multi_summary(results)
+            if summary and config.get('sms_response_success', False):
+                send_sms_text(from_number, summary, "summary")
 
 
 def poll_twilio():
@@ -2775,7 +2922,13 @@ def _gv_extract_message(text):
         the actual message               <- one or more lines (keep)
         YOUR ACCOUNT <...> HELP CENTER   <- footer starts here (cut)
     So: cut everything from the footer down, then drop leading blank lines and
-    any bare <URL> logo/link lines, and join what's left."""
+    any bare <URL> logo/link lines, and join what's left.
+
+    The surviving lines are joined with newlines (not spaces) so that a
+    multi-line submission — e.g. a name list typed one-per-line — stays
+    multi-line, matching how Twilio delivers the raw SMS body. The payload was
+    already transfer-decoded upstream, so these newlines are the sender's real
+    line breaks, not email soft-wraps."""
     if not text:
         return ""
     # Cut the footer (and everything after it)
@@ -2798,7 +2951,7 @@ def _gv_extract_message(text):
         if 'voice.google.com' in s and re.fullmatch(r'[<>\s]*https?://\S+[<>\s]*', s):
             continue
         message_lines.append(s)
-    return ' '.join(message_lines).strip()
+    return '\n'.join(message_lines).strip()
 
 
 def _gv_normalize_phone(text):

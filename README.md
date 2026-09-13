@@ -28,6 +28,7 @@ Visitor texts name → Twilio → Plugin polls & receives → Filters applied �
 | [Installation](docs/02-installation.md) | Install the plugin on your FPP device |
 | [Plugin Configuration](docs/03-plugin-configuration.md) | Full reference for all settings |
 | [Message Queue](docs/04-message-queue.md) | How the queue works, monitoring, and manual controls |
+| [Message Formatting](docs/10-message-formatting.md) | How texts become names — single, two-word, and multi-name lists |
 | [Whitelist](docs/05-whitelist.md) | Only allow pre-approved names on your display |
 | [Profanity Blacklist](docs/06-blacklist.md) | Block specific words from appearing |
 | [Phone Blocklist](docs/07-phone-blocklist.md) | Block specific phone numbers |

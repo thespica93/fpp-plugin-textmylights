@@ -39,7 +39,7 @@ When enabled, a response is sent for **every** incoming message — success and 
 
 ## Response Types
 
-There are **seven** response scenarios, each with its own customizable message:
+There are **eight** response scenarios, each with its own customizable message:
 
 | Response Type | When It's Sent |
 |--------------|----------------|
@@ -47,9 +47,12 @@ There are **seven** response scenarios, each with its own customizable message:
 | **Blocked (Profanity)** | Message contained a word from the profanity blacklist |
 | **Rate Limited** | Sender has already reached the daily message limit |
 | **Duplicate Name** | Same name from the same phone was already submitted today |
-| **Invalid Format** | Message didn't contain a recognizable name |
+| **Invalid Format** | Name broke the word-count rule (too many words) |
+| **Message Too Long** | Message was longer than your **Max Message Length** |
 | **Not on Whitelist** | Name was not found in the approved whitelist |
 | **Phone Blocked** | *(No response sent — blocked numbers are silently ignored)* |
+
+> **Invalid Format vs Message Too Long:** length is checked first. If a message is longer than Max Message Length it gets the **Message Too Long** reply (even with the word rules off); if it's within length but has too many words, it gets **Invalid Format**. Both are disabled while the whitelist is active (names are validated against the list, not by format or length).
 
 ---
 
@@ -112,6 +115,11 @@ You've reached today's limit of {limit} messages. Thanks for participating! Chec
 Please send only 1 name ({words}, no sentences).
 ```
 `{words}` automatically becomes **"1 word"** or **"2 words"** to match your current Name Format Rule, so the reply always tells texters the right limit.
+
+### Message Too Long
+```
+I'm sorry, your message exceeds our max message length. Please only send your name.
+```
 
 ### Not on Whitelist
 ```

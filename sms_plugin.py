@@ -273,6 +273,7 @@ DEFAULT_CONFIG = {
     "allow_duplicate_names": False,
     "sms_response_duplicate": False,
     "sms_response_invalid_format": False,
+    "sms_response_too_long": False,
     "sms_response_not_whitelisted": False,
     "sms_response_blocked": False,
     "response_show_not_live": "Ho, Ho, Ho, It looks like our show isn't running now. Try again later.",
@@ -282,6 +283,7 @@ DEFAULT_CONFIG = {
     "response_rate_limited": "You've reached the maximum number of messages allowed. Please try again tomorrow!",
     "response_duplicate": "You've already sent this name today!",
     "response_invalid_format": "Please send only 1 name ({words}, no sentences).",
+    "response_too_long": "I'm sorry, your message exceeds our max message length. Please only send your name.",
     "response_not_whitelisted": "Sorry, that name is not on our approved list and cannot be shown.",
 }
 
@@ -1703,9 +1705,11 @@ def extract_name(message):
     
     if message:
         message = message.title()
-    
-    max_len = config.get('max_message_length', 30)
-    return message[:max_len] if message else "Guest"
+
+    # No length truncation here — an over-length name is REJECTED by
+    # is_valid_name() (Too Long) rather than silently trimmed to fit, so the
+    # sender is told to shorten it instead of a chopped name being displayed.
+    return message if message else "Guest"
 
 def is_non_name_message(body):
     """True if an inbound message is a phone 'tapback'/reaction or contains no
@@ -1736,20 +1740,29 @@ def is_non_name_message(body):
     return False
 
 def is_valid_name(text):
-    """Check if text is a valid name"""
+    """Validate a name. Returns (ok, reason) where reason is '' when ok, else a
+    code the caller maps to a response:
+      - 'too_long'   : exceeds Max Message Length
+      - 'word_count' : violates the One Word / Two Words rule
+
+    Length is checked FIRST, so an over-length name reports 'too_long' even when
+    it also breaks the word rule. Length is enforced regardless of the word
+    toggles (the caller only skips this whole check when the whitelist is on,
+    where Max Message Length doesn't apply)."""
     text = ' '.join(text.split())
     words = text.split()
     word_count = len(words)
-    
+
+    max_len = config.get('max_message_length', 30)
+    if len(text) > max_len:
+        return False, "too_long"
+
     if config.get('one_word_only', False):
         if word_count != 1:
-            return False, "Please send only a first name (one word)"
+            return False, "word_count"
     elif config.get('two_words_max', True):
         if word_count > 2:
-            return False, "Please send only a name (1-2 words, no sentences)"
-    
-    if len(text) > 50:
-        return False, "Message too long - please send only a name"
+            return False, "word_count"
 
     return True, ""
 
@@ -2739,7 +2752,7 @@ def process_incoming_message(from_number, body):
         logging.debug(f"👤 Extracted name: '{name}'")
         max_msgs = config.get('max_messages_per_phone', 0)
         msg_count = get_message_count(from_number) if max_msgs > 0 else 0
-        is_valid, _ = is_valid_name(name)
+        is_valid, reason = is_valid_name(name)
 
         if max_msgs > 0 and msg_count >= max_msgs:
             logging.info(f"⛔ Rate limited: {from_number[-4:]}")
@@ -2752,9 +2765,12 @@ def process_incoming_message(from_number, body):
             send_sms_response(from_number, "duplicate")
 
         elif not is_valid and not config.get('use_whitelist', False):
-            logging.info(f"❌ Invalid format: '{body[:20]}'")
-            log_message(from_number, body, name, "invalid_format")
-            send_sms_response(from_number, "invalid_format")
+            # Too Long (over Max Message Length) gets its own response; any other
+            # format failure (word count) gets the Invalid Format response.
+            resp = "too_long" if reason == "too_long" else "invalid_format"
+            logging.info(f"❌ {resp}: '{body[:30]}'")
+            log_message(from_number, body, name, resp)
+            send_sms_response(from_number, resp)
 
         elif not is_on_whitelist(name):
             logging.info(f"❌ Not on whitelist: {name}")
@@ -3583,6 +3599,23 @@ def index():
                         toggleResp('invalid_format');  // reflect the preserved state
                     }
 
+                    // Too Long response is also meaningless with the whitelist on
+                    // (Max Message Length doesn't apply), so lock it the same way.
+                    var tlRow = document.getElementById('row_too_long');
+                    var tlCb = document.getElementById('sms_response_too_long');
+                    var tlWarn = document.getElementById('too_long_disabled_warning');
+                    if (tlRow) {
+                        if (tlCb) tlCb.disabled = whitelistOn;
+                        if (tlWarn) tlWarn.style.display = whitelistOn ? '' : 'none';
+                        if (whitelistOn) {
+                            tlRow.classList.add('locked');
+                            tlRow.classList.remove('enabled');
+                        } else {
+                            tlRow.classList.remove('locked');
+                            toggleResp('too_long');  // reflect the preserved state
+                        }
+                    }
+
                     // Not-on-Whitelist response is the inverse: it can only fire while
                     // the whitelist is ON (names are checked against the list), so grey
                     // it out when the whitelist is off.
@@ -3997,7 +4030,7 @@ def index():
                     row.classList.toggle('enabled', document.getElementById('sms_response_' + id).checked);
                 }
                 function initRespRows() {
-                    ['show_not_live','blocked','profanity','duplicate','invalid_format','rate_limited','not_whitelisted','success'].forEach(function(id) {
+                    ['show_not_live','blocked','profanity','duplicate','invalid_format','too_long','rate_limited','not_whitelisted','success'].forEach(function(id) {
                         toggleResp(id);
                     });
                 }
@@ -4051,6 +4084,19 @@ def index():
                     <p id="invalid_format_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('use_whitelist', False) else 'display:none;' }}">⚠️ Invalid Format responses are disabled when the whitelist is active — all names are validated against the whitelist instead of format rules.</p>
                     <textarea id="response_invalid_format" rows="2">{{ config.get('response_invalid_format', 'Please send only 1 name ({words}, no sentences).') }}</textarea>
                     <p class="help-text">💡 Type <code>{words}</code> anywhere in this message to auto-fill your current word limit — it becomes "<span id="words_preview">2 words</span>" in the reply, based on your <strong>Name Format Rules</strong> (One Word Only → "1 word", Two Words Maximum → "2 words").</p>
+                </div>
+
+                <div id="row_too_long" class="resp-row{% if config.get('use_whitelist', False) %} locked{% endif %}">
+                    <div class="resp-toggle">
+                        <label class="toggle-switch"><input type="checkbox" id="sms_response_too_long"
+                               {{ 'checked' if config.get('sms_response_too_long', False) else '' }}
+                               {{ 'disabled' if config.get('use_whitelist', False) else '' }}
+                               onchange="toggleResp('too_long')"><span class="toggle-slider"></span></label>
+                        <label for="sms_response_too_long" style="margin-left:10px;vertical-align:middle;">📏 Message Too Long — Send Response</label>
+                    </div>
+                    <p id="too_long_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('use_whitelist', False) else 'display:none;' }}">⚠️ Too Long responses are disabled when the whitelist is active — names are validated against the whitelist, not by length.</p>
+                    <textarea id="response_too_long" rows="2">{{ config.get('response_too_long', "I'm sorry, your message exceeds our max message length. Please only send your name.") }}</textarea>
+                    <p class="help-text">📏 Sent when a message is longer than your <strong>Max Message Length</strong> (Configuration tab). Applies whether or not the word-count rules are on.</p>
                 </div>
 
                 <div id="row_rate_limited" class="resp-row{% if config.get('max_messages_per_phone', 0) == 0 %} locked{% endif %}">
@@ -5620,6 +5666,7 @@ var _saveTimer = null;
                     sms_response_rate_limited: document.getElementById('sms_response_rate_limited').checked,
                     sms_response_duplicate: document.getElementById('sms_response_duplicate').checked,
                     sms_response_invalid_format: document.getElementById('sms_response_invalid_format').checked,
+                    sms_response_too_long: document.getElementById('sms_response_too_long').checked,
                     sms_response_not_whitelisted: document.getElementById('sms_response_not_whitelisted').checked,
                     sms_response_blocked: document.getElementById('sms_response_blocked').checked,
                     response_success: document.getElementById('response_success').value,
@@ -5627,6 +5674,7 @@ var _saveTimer = null;
                     response_rate_limited: document.getElementById('response_rate_limited').value,
                     response_duplicate: document.getElementById('response_duplicate').value,
                     response_invalid_format: document.getElementById('response_invalid_format').value,
+                    response_too_long: document.getElementById('response_too_long').value,
                     response_not_whitelisted: document.getElementById('response_not_whitelisted').value,
                     response_blocked: document.getElementById('response_blocked').value,
                     response_show_not_live: document.getElementById('response_show_not_live').value
@@ -5702,7 +5750,7 @@ var _saveTimer = null;
                  'one_word_only','two_words_max',
                  'sms_response_show_not_live',
                  'sms_response_success','sms_response_profanity','sms_response_rate_limited',
-                 'sms_response_duplicate','sms_response_invalid_format',
+                 'sms_response_duplicate','sms_response_invalid_format','sms_response_too_long',
                  'sms_response_not_whitelisted','sms_response_blocked'
                 ].forEach(function(id) {
                     var el = document.getElementById(id);
@@ -5729,7 +5777,7 @@ var _saveTimer = null;
                  'poll_interval','display_duration','max_messages','max_length',
                  'line_1','line_2','line_3','line_4',
                  'response_success','response_profanity','response_rate_limited',
-                 'response_duplicate','response_invalid_format',
+                 'response_duplicate','response_invalid_format','response_too_long',
                  'response_not_whitelisted','response_blocked'
                 ].forEach(function(id) {
                     var el = document.getElementById(id);
@@ -6457,10 +6505,12 @@ def test_message_submission():
             return jsonify({"success": False, "error": "Name is required"})
 
         test_name = extract_name(test_name)
-        is_valid, validation_msg = is_valid_name(test_name)
+        is_valid, reason = is_valid_name(test_name)
 
-        if not is_valid:
-            return jsonify({"success": False, "error": validation_msg, "reason": "invalid_format"})
+        if not is_valid and not config.get('use_whitelist', False):
+            if reason == "too_long":
+                return jsonify({"success": False, "error": "Message exceeds Max Message Length", "reason": "too_long"})
+            return jsonify({"success": False, "error": "Invalid name format", "reason": "invalid_format"})
 
         if not is_on_whitelist(test_name):
             return jsonify({"success": False, "error": "Name not on whitelist", "reason": "not_on_whitelist"})

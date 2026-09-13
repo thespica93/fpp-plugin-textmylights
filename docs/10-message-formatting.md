@@ -29,7 +29,7 @@ Every incoming text goes through the same steps:
 2. **Emoji, punctuation, and symbols are removed.** Only letters, spaces, and hyphens are kept.
 3. **The name is converted to Proper Case** — `alex` and `ALEX` both become `Alex`.
 4. **The result is validated** against your Name Format Rules (below).
-5. **Long messages are trimmed** to your **Max Message Length** (default 30 characters).
+5. **Over-length messages are rejected** — if the name is longer than your **Max Message Length** (default 30 characters) it's denied with the *Message Too Long* reply, not trimmed. This applies even when the word-count rules are off.
 
 Hyphenated names like **"Mary-Jane"** count as a **single word**.
 

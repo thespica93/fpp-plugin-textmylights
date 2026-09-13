@@ -138,13 +138,16 @@ chmod 666 /home/fpp/media/logs/sms_plugin.log
 chown fpp:fpp /home/fpp/media/logs/sms_plugin.log
 
 # Install scheduler scripts into FPP's scripts directory so they appear in
-# the scheduler under: Command → Run Script → TwilioStart / TwilioStop
+# the scheduler under: Command → Run Script → TextMyLightsStart / TextMyLightsStop
 mkdir -p /home/fpp/media/scripts
-cp "$PLUGIN_DIR/scripts/fpp_activate.sh"   /home/fpp/media/scripts/TwilioStart.sh
-cp "$PLUGIN_DIR/scripts/fpp_deactivate.sh" /home/fpp/media/scripts/TwilioStop.sh
-chmod +x /home/fpp/media/scripts/TwilioStart.sh /home/fpp/media/scripts/TwilioStop.sh
-chown fpp:fpp /home/fpp/media/scripts/TwilioStart.sh /home/fpp/media/scripts/TwilioStop.sh
-log_and_show "Scheduler scripts installed: TwilioStart.sh / TwilioStop.sh"
+# Remove the old Twilio-named scripts from before the rename (full rename).
+# NOTE: update your FPP scheduler to run TextMyLightsStart.sh / TextMyLightsStop.sh.
+rm -f /home/fpp/media/scripts/TwilioStart.sh /home/fpp/media/scripts/TwilioStop.sh
+cp "$PLUGIN_DIR/scripts/fpp_activate.sh"   /home/fpp/media/scripts/TextMyLightsStart.sh
+cp "$PLUGIN_DIR/scripts/fpp_deactivate.sh" /home/fpp/media/scripts/TextMyLightsStop.sh
+chmod +x /home/fpp/media/scripts/TextMyLightsStart.sh /home/fpp/media/scripts/TextMyLightsStop.sh
+chown fpp:fpp /home/fpp/media/scripts/TextMyLightsStart.sh /home/fpp/media/scripts/TextMyLightsStop.sh
+log_and_show "Scheduler scripts installed: TextMyLightsStart.sh / TextMyLightsStop.sh"
 
 log_and_show "========================================"
 log_and_show "Installation complete!"

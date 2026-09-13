@@ -1950,7 +1950,9 @@ def get_message_count(phone):
             logs = json.load(f)
         today = datetime.now().date()
         return sum(1 for log in logs
-                   if log.get('phone_full') == phone and _parse_log_date(log) == today)
+                   if log.get('phone_full') == phone
+                   and _parse_log_date(log) == today
+                   and log.get('counts_toward_limit', True))
     except (FileNotFoundError, json.JSONDecodeError):
         return 0
     except Exception as e:
@@ -2001,8 +2003,12 @@ def load_last_gv_uid():
     except Exception:
         return None
 
-def log_message(phone, message, name, status):
-    """Log received message to today's daily log file."""
+def log_message(phone, message, name, status, counts=True):
+    """Log received message to today's daily log file.
+
+    counts=False marks this row as NOT counting toward the per-phone daily
+    message limit (see get_message_count). Used for rejected/queued grouped
+    (multi-name) texts, which never consume a sender's allowance."""
     try:
         log_path = get_day_log_path()
         try:
@@ -2016,7 +2022,8 @@ def log_message(phone, message, name, status):
             "phone_full": phone,
             "message": message,
             "extracted_name": name,
-            "status": status
+            "status": status,
+            "counts_toward_limit": counts
         })
         with open(log_path, 'w') as f:
             json.dump(logs, f, indent=2)
@@ -2587,16 +2594,6 @@ def get_queue_status():
     
     return status
 
-_RESULT_TO_RESPONSE = {
-    "success":         "success",
-    "duplicate":       "duplicate",
-    "invalid_format":  "invalid_format",
-    "not_whitelisted": "not_whitelisted",
-    "profanity":       "profanity",
-    "rate_limited":    "rate_limited",
-    "error":           None,
-}
-
 def parse_name_list(body):
     """If `body` is a genuine multi-name list — names separated by commas or
     line breaks, with 2+ that pass name validation — return the list of
@@ -2627,31 +2624,6 @@ def parse_name_list(body):
     if valid_count < 2:
         return None
     return names
-
-def build_multi_summary(results):
-    """Build the single summary reply for a multi-name text from the per-name
-    outcomes (a list of (name, outcome) tuples)."""
-    added   = [n for n, o in results if o == "success"]
-    dup     = [n for n, o in results if o == "duplicate"]
-    notwl   = [n for n, o in results if o == "not_whitelisted"]
-    prof    = [n for n, o in results if o == "profanity"]
-    invalid = [n for n, o in results if o == "invalid_format"]
-    limited = [n for n, o in results if o == "rate_limited"]
-
-    parts = []
-    if added:
-        parts.append(f"✅ Added {len(added)}: " + ", ".join(added))
-
-    skipped = []
-    if dup:     skipped.append(", ".join(dup) + " (already sent today)")
-    if notwl:   skipped.append(", ".join(notwl) + " (not on the list)")
-    if prof:    skipped.append(", ".join(prof) + " (not allowed)")
-    if invalid: skipped.append(", ".join(invalid) + " (not a valid name)")
-    if limited: skipped.append(", ".join(limited) + " (daily limit reached)")
-    if skipped:
-        parts.append("⚠️ Skipped: " + "; ".join(skipped))
-
-    return " ".join(parts)
 
 def process_incoming_message(from_number, body):
     """Run one inbound message through the full pipeline: show-live check →
@@ -2684,79 +2656,92 @@ def process_incoming_message(from_number, body):
         log_message(from_number, body, "", "blocked")
         send_sms_response(from_number, "blocked")
 
-    else:
-        # A genuine multi-name list (commas / line breaks, 2+ valid names) is
-        # split into individual names; anything else is handled as a single
-        # message exactly as before.
-        names = parse_name_list(body)
-        multi = names is not None
-        if not multi:
-            names = [extract_name(body)]
-        logging.debug(f"👤 Extracted name(s): {names}")
+    elif parse_name_list(body) is not None:
+        # ── Grouped / multi-name text (commas or line breaks, 2+ valid names) ──
+        # To keep the sender experience simple, a grouped text is all-or-nothing
+        # and is ONLY accepted when the box is fully "open": no rate limiting,
+        # duplicates allowed, and every name valid / whitelisted. Any restriction
+        # rejects the whole text with the Invalid Format reply, and that
+        # rejection does NOT count against the sender's daily message allowance.
+        names     = parse_name_list(body)
+        max_msgs  = config.get('max_messages_per_phone', 0)
+        allow_dup = config.get('allow_duplicate_names', False)
+        use_wl    = config.get('use_whitelist', False)
 
-        # Rate limiting: each name counts as one message against the sender's
-        # daily allowance. Track the running tally and stop queuing once the
-        # limit is reached; the rest are reported as skipped.
-        max_msgs = config.get('max_messages_per_phone', 0)
-        used = get_message_count(from_number) if max_msgs > 0 else 0
+        # Mirror the single-name rule: validate format when the whitelist is off,
+        # validate against the whitelist when it's on (never both).
+        bad_format = (not use_wl) and any(not is_valid_name(nm)[0] for nm in names)
+        not_wl     = use_wl and any(not is_on_whitelist(nm) for nm in names)
 
-        results = []          # list of (name, outcome)
-        limit_hit = False
-        for nm in names:
-            if max_msgs > 0 and used >= max_msgs:
-                logging.info(f"⛔ Rate limited: {from_number[-4:]} ({nm})")
-                results.append((nm, "rate_limited"))
-                limit_hit = True
-                continue
+        if max_msgs > 0 or not allow_dup or bad_format or not_wl:
+            logging.info(f"❌ Grouped text not allowed here → invalid: {from_number[-4:]} "
+                         f"(rate_limit={max_msgs>0}, dup_off={not allow_dup}, "
+                         f"bad_format={bad_format}, not_whitelisted={not_wl})")
+            log_message(from_number, body, "", "invalid_format", counts=False)
+            send_sms_response(from_number, "invalid_format")
 
-            is_valid, _ = is_valid_name(nm)
-            # Single message: keep the original whole-body profanity check.
-            # List: check the individual name.
-            prof_target = nm if multi else body
+        elif config['profanity_filter'] and contains_profanity(body):
+            # Any profanity anywhere fails the whole message.
+            logging.info(f"❌ Grouped text profanity rejected: {from_number[-4:]}")
+            log_message(from_number, body, "", "profanity", counts=False)
+            send_sms_response(from_number, "profanity")
 
-            if not config.get('allow_duplicate_names', False) and has_sent_name_today(from_number, nm):
-                logging.info(f"🔄 Duplicate name: {nm}")
-                log_message(from_number, body, nm, "duplicate_name_today")
-                results.append((nm, "duplicate"))
-            elif not is_valid and not config.get('use_whitelist', False):
-                logging.info(f"❌ Invalid format: '{nm[:20]}'")
-                log_message(from_number, body, nm, "invalid_format")
-                results.append((nm, "invalid_format"))
-            elif not is_on_whitelist(nm):
-                logging.info(f"❌ Not on whitelist: {nm}")
-                log_message(from_number, body, nm, "not_on_whitelist")
-                results.append((nm, "not_whitelisted"))
-            elif config['profanity_filter'] and contains_profanity(prof_target):
-                logging.info(f"❌ Profanity rejected: {nm}")
-                log_message(from_number, body, nm, "profanity")
-                results.append((nm, "profanity"))
-            else:
+        else:
+            # Fully open + clean → queue every name, one Success reply.
+            queued = []
+            for nm in names:
                 if add_to_queue(nm, from_number, body):
                     logging.info(f"✅ Queued: {nm}")
-                    log_message(from_number, body, nm, "queued")
-                    results.append((nm, "success"))
+                    log_message(from_number, body, nm, "queued", counts=False)
+                    queued.append(nm)
                 else:
                     logging.warning(f"❌ Queue error: {nm}")
-                    log_message(from_number, body, nm, "error")
-                    results.append((nm, "error"))
+                    log_message(from_number, body, nm, "error", counts=False)
+            if queued:
+                logging.info(f"✅ Grouped text queued {len(queued)} name(s): {from_number[-4:]}")
+                send_sms_response(from_number, "success")
 
-            used += 1  # every processed name counts toward the daily limit
+    else:
+        # ── Single-name text (original behavior) ──
+        name = extract_name(body)
+        logging.debug(f"👤 Extracted name: '{name}'")
+        max_msgs = config.get('max_messages_per_phone', 0)
+        msg_count = get_message_count(from_number) if max_msgs > 0 else 0
+        is_valid, _ = is_valid_name(name)
 
-        # Record a single rate_limited row for the overflow so history isn't
-        # flooded with one row per skipped name.
-        if limit_hit:
+        if max_msgs > 0 and msg_count >= max_msgs:
+            logging.info(f"⛔ Rate limited: {from_number[-4:]}")
             log_message(from_number, body, "", "rate_limited")
+            send_sms_response(from_number, "rate_limited")
 
-        # Response: a single message keeps the exact per-type auto-response; a
-        # real list gets one combined summary instead of one text per name.
-        if not multi:
-            resp = _RESULT_TO_RESPONSE.get(results[0][1]) if results else None
-            if resp:
-                send_sms_response(from_number, resp)
+        elif not config.get('allow_duplicate_names', False) and has_sent_name_today(from_number, name):
+            logging.info(f"🔄 Duplicate name: {name}")
+            log_message(from_number, body, name, "duplicate_name_today")
+            send_sms_response(from_number, "duplicate")
+
+        elif not is_valid and not config.get('use_whitelist', False):
+            logging.info(f"❌ Invalid format: '{body[:20]}'")
+            log_message(from_number, body, name, "invalid_format")
+            send_sms_response(from_number, "invalid_format")
+
+        elif not is_on_whitelist(name):
+            logging.info(f"❌ Not on whitelist: {name}")
+            log_message(from_number, body, name, "not_on_whitelist")
+            send_sms_response(from_number, "not_whitelisted")
+
+        elif config['profanity_filter'] and contains_profanity(body):
+            logging.info(f"❌ Profanity rejected")
+            log_message(from_number, body, name, "profanity")
+            send_sms_response(from_number, "profanity")
+
         else:
-            summary = build_multi_summary(results)
-            if summary and config.get('sms_response_success', False):
-                send_sms_text(from_number, summary, "summary")
+            if add_to_queue(name, from_number, body):
+                logging.info(f"✅ Queued: {name}")
+                log_message(from_number, body, name, "queued")
+                send_sms_response(from_number, "success")
+            else:
+                logging.warning(f"❌ Queue error: {name}")
+                log_message(from_number, body, name, "error")
 
 
 def poll_twilio():
@@ -3442,6 +3427,28 @@ def index():
                         <label class="checkbox-label">Allow Duplicate Names — same phone number can submit the same name multiple times per day</label>
                     </div>
 
+                </div>
+
+                <!-- Multiple names (grouped texts) explainer -->
+                <div style="background:#e7f3ff; border:1px solid #4a90d9; color:#1a3d5c; border-radius:6px; padding:10px 14px; margin-top:14px; font-size:13px; line-height:1.55;">
+                    <strong>📝 Multiple names in one text</strong><br>
+                    Texters can submit several names at once, separated by <strong>commas or line breaks</strong>
+                    (e.g. <em>"Alex, Sam, Jordan"</em>). Multi-word names like <em>"Mary Jane"</em> stay intact —
+                    only commas and line breaks split names, never spaces.
+                    <br><br>
+                    To keep replies simple, a grouped text is <strong>all-or-nothing</strong> and is only accepted
+                    when the box is fully open:
+                    <ul style="margin:6px 0 0 18px; padding:0;">
+                        <li><strong>Max Messages Per Phone</strong> must be <strong>0</strong> (no rate limiting)</li>
+                        <li><strong>Allow Duplicate Names</strong> must be <strong>on</strong></li>
+                        <li>Every name must pass your format rules — or, if the <strong>Whitelist</strong> is on,
+                            <strong>all</strong> names must be on it</li>
+                    </ul>
+                    <div style="margin-top:6px;">
+                        If any of these isn't met, the whole grouped text gets the <strong>Invalid Format</strong>
+                        reply — and it does <strong>not</strong> count toward the sender's daily limit. Profanity
+                        anywhere fails the whole message. An accepted group sends <strong>one Success</strong> reply.
+                    </div>
                 </div>
             </div>
             <script>

@@ -15,7 +15,6 @@ Name format rules are set in the **⚙️ Configuration** tab at **`http://YOUR_
 - [Sending a Single Name](#sending-a-single-name)
 - [Sending Multiple Names (Lists)](#sending-multiple-names-lists)
 - [What Gets Ignored](#what-gets-ignored)
-- [Rate Limiting with Multiple Names](#rate-limiting-with-multiple-names)
 - [Auto-Responses](#auto-responses)
 - [Twilio vs Google Voice](#twilio-vs-google-voice)
 - [Related Pages](#related-pages)
@@ -70,13 +69,13 @@ Mary Jane        (allowed only if "Two Words Maximum" is on)
 Mary-Jane        (hyphen = one word, always fine)
 ```
 
-The name is validated, queued, and displayed. One name = one queue entry = one auto-response (per your response settings).
+The name is validated, queued, and displayed. One name = one queue entry = one auto-response (per your response settings). All of your usual rules apply: rate limiting, duplicate detection, whitelist, and profanity.
 
 ---
 
 ## Sending Multiple Names (Lists)
 
-A single text can add **several names at once**. This is detected automatically — no setting to turn on.
+A single text can add **several names at once** — this is detected automatically, there's no setting to turn on.
 
 ### How to separate names
 
@@ -97,27 +96,34 @@ Riley
 Casey
 ```
 
-Both of the above add **6 names** to the display.
-
-### Multi-word names stay together
-
-Because names are split **only** on commas and line breaks (not spaces):
+Both of the above add **6 names** to the display. Multi-word names stay together, because names are split **only** on commas and line breaks (not spaces):
 
 | Text | Result |
 |------|--------|
 | `Mary Jane, Alex` | **2 names** — `Mary Jane` and `Alex` |
 | `Mary-Jane, Alex` | **2 names** — `Mary-Jane` and `Alex` |
-| `Mary Jane, Sam` | **2 names** — `Mary Jane` and `Sam` |
 
-> Note: multi-word names like `Mary Jane` require **Two Words Maximum** to be on. If **One Word Only** is set, each two-word entry in a list is rejected as Invalid Format while the single-word names still go through.
+> A text is only treated as a group when it contains **two or more valid names**. A normal sentence that happens to contain a comma is **not** chopped into names. Up to **25 names** per text are processed.
 
-### How lists behave
+### When is a group accepted? (All-or-nothing)
 
-- Each name becomes its **own queue entry** and displays **one at a time**, in order.
-- A text is only treated as a list when it contains **two or more valid names**. A normal sentence that happens to contain a comma is **not** chopped into names.
-- A single name (no commas or line breaks) always uses the normal single-name path — nothing changes.
-- Up to **25 names** per text are processed (extra names beyond that are ignored).
-- Each name is checked individually for duplicates, format, whitelist, and profanity — so some names in a list can be accepted while others are skipped.
+To keep the texter's experience simple, a grouped text is **all-or-nothing**. It's only accepted when your box is **fully open**, meaning **all** of these are true:
+
+| Requirement | Setting |
+|-------------|---------|
+| No rate limiting | **Max Messages Per Phone** = `0` |
+| Duplicates allowed | **Allow Duplicate Names** = **on** |
+| Every name is valid | Each name passes your **Name Format Rules** — *or*, if the **Whitelist** is on, **every** name is on the whitelist |
+| No profanity | No blocked word anywhere in the text |
+
+**If all requirements are met** → every name is queued and the sender gets **one Success reply**.
+
+**If any requirement is *not* met** → the **whole text** is rejected:
+
+- Rate limiting is on, **or** duplicates are off, **or** any name fails format rules, **or** any name isn't on the whitelist → the sender gets your **Invalid Format** reply. This rejection **does not count** toward their daily message limit.
+- Any profanity in the text → the sender gets your **Profanity** reply and nothing is queued.
+
+> **Why all-or-nothing?** Splitting partial credit across a list (some names accepted, some rate-limited, some duplicates) made the replies confusing and hard to word. Instead, group texts are a simple "power user" feature that only works when there are no restrictions to reconcile. If you want per-person limits, duplicate blocking, or whitelist filtering, keep those on — texters just send **one name per message**, which always works.
 
 ---
 
@@ -132,35 +138,13 @@ These used to trigger an **Invalid Format** reply. They are now recognized as co
 
 ---
 
-## Rate Limiting with Multiple Names
-
-If **Max Messages Per Phone** is set (Configuration tab), **each name counts as one message** toward that daily limit — not the text as a whole.
-
-Example — limit of **5**, sender has already sent **3** today, then texts `A, B, C, D`:
-
-| Name | Result |
-|------|--------|
-| A | ✅ Queued (4 of 5 used) |
-| B | ✅ Queued (5 of 5 used) |
-| C | ⛔ Skipped — daily limit reached |
-| D | ⛔ Skipped — daily limit reached |
-
-Set **Max Messages Per Phone** to `0` to turn rate limiting off entirely.
-
----
-
 ## Auto-Responses
 
-- **Single name** → the matching per-type reply is sent (Success, Duplicate, Invalid Format, etc.). See [SMS Auto-Responses](08-sms-responses.md).
-- **Multiple names** → **one combined summary reply** is sent instead of one text per name, for example:
+- **Single name** → the matching per-type reply is sent (Success, Duplicate, Invalid Format, Rate Limited, Not on Whitelist, or Profanity). See [SMS Auto-Responses](08-sms-responses.md).
+- **Multiple names (accepted)** → **one Success reply**.
+- **Multiple names (rejected)** → **one Invalid Format reply** (restriction in place) or **one Profanity reply** (blocked word). No per-name breakdown is sent.
 
-  ```
-  ✅ Added 5: Alex, Sam, Jordan, Taylor, Casey. ⚠️ Skipped: Riley (already sent today)
-  ```
-
-  The summary is sent only when the **Success** auto-response is enabled. If you have auto-responses off, no summary is sent (names are still queued).
-
-Skipped names are grouped by reason: *already sent today*, *not on the list*, *not allowed* (profanity), *not a valid name*, and *daily limit reached*.
+So a texter always gets **exactly one** reply, whether they sent one name or twenty.
 
 ---
 

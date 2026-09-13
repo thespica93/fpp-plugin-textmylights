@@ -55,6 +55,10 @@ CONFIG_FILE     = os.path.join(PLUGIN_DATA_DIR, "plugin.json")
 SECRETS_DIR     = os.path.join(PLUGIN_DATA_DIR, "secrets")
 SECRETS_FILE    = os.path.join(SECRETS_DIR, "credentials.json")
 SECRET_KEYS     = ("twilio_auth_token", "gv_app_password")
+# Placeholder shown in a saved secret field. Submitting it unchanged means
+# "keep the stored secret"; clearing the field to empty means "remove it";
+# any other value updates it. Must be something a real secret never equals.
+SECRET_SENTINEL = "••••••••"  # 8 × •
 LOG_FILE        = os.path.join(PLUGIN_DATA_DIR, "logs", "sms_plugin.log")
 QUEUE_FILE      = os.path.join(PLUGIN_DATA_DIR, "queue_pending.json")
 MESSAGES_DIR    = os.path.join(PLUGIN_DATA_DIR, "logs", "messages")
@@ -277,7 +281,7 @@ DEFAULT_CONFIG = {
     "response_blocked": "Sorry, Your phone number has been blocked from sending messages.",
     "response_rate_limited": "You've reached the maximum number of messages allowed. Please try again tomorrow!",
     "response_duplicate": "You've already sent this name today!",
-    "response_invalid_format": "Please send only a name (1-2 words, no sentences).",
+    "response_invalid_format": "Please send only 1 name ({words}, no sentences).",
     "response_not_whitelisted": "Sorry, that name is not on our approved list and cannot be shown.",
 }
 
@@ -335,6 +339,18 @@ def load_config():
         if config.get('scroll_speed', 5) > 10:
             config['scroll_speed'] = 5
             save_config()
+
+        # Upgrade legacy Invalid Format defaults to the dynamic {words} default so
+        # the reply reflects the active word limit. Only touches known old defaults,
+        # never a genuinely customized message.
+        _legacy_invalid = {
+            "Please send only a name (1-2 words, no sentences).",
+            "Please send only 1 name (1-2 words, no sentences).",
+        }
+        if config.get('response_invalid_format', '') in _legacy_invalid:
+            config['response_invalid_format'] = DEFAULT_CONFIG['response_invalid_format']
+            save_config()
+            logging.info("Upgraded Invalid Format response to the dynamic {words} default")
 
         # Migrate old message_template to message_lines (introduced in v2.6)
         if 'message_lines' not in loaded and 'message_template' in loaded:
@@ -1585,6 +1601,10 @@ def send_sms_response(to_phone, message_type):
         logging.warning(f"No response message configured for type: {message_type}")
         return False
 
+    # {words} expands to the active word-limit phrase ("1 word" / "2 words"),
+    # so the Invalid Format reply always matches the current Name Format Rule.
+    response_message = response_message.replace('{words}', word_rule_phrase())
+
     return send_sms_text(to_phone, response_message, message_type)
 
 
@@ -1730,8 +1750,20 @@ def is_valid_name(text):
     
     if len(text) > 50:
         return False, "Message too long - please send only a name"
-    
+
     return True, ""
+
+def word_rule_phrase():
+    """Human phrase for the current name word-limit ('1 word' / '2 words').
+
+    Used to expand the {words} placeholder in the Invalid Format auto-response
+    and in the UI help text, so the reply always matches the active Name Format
+    Rule. Mirrors is_valid_name()'s precedence (One Word Only wins)."""
+    if config.get('one_word_only', False):
+        return "1 word"
+    if config.get('two_words_max', True):
+        return "2 words"
+    return "1-2 words"
 
 # ============================================================================
 # OPTIMIZED PROFANITY FILTER - WITH CACHING AND PRE-COMPILED REGEX
@@ -3284,8 +3316,10 @@ def index():
                             <input type="text" id="account_sid" value="{{ config.twilio_account_sid }}" placeholder="Starts with AC...">
 
                             <label>Twilio Auth Token:</label>
-                            <input type="password" id="auth_token" value="" autocomplete="new-password"
-                                   placeholder="{{ '•••••••• saved — leave blank to keep' if config.twilio_auth_token else 'Twilio Auth Token' }}">
+                            <input type="password" id="auth_token" autocomplete="new-password" onfocus="this.select()"
+                                   value="{{ secret_sentinel if config.twilio_auth_token else '' }}"
+                                   placeholder="Twilio Auth Token">
+                            {% if config.twilio_auth_token %}<p class="help-text">🔒 Saved. Leave the dots to keep it, type a new token to replace it, or clear the field to remove it.</p>{% endif %}
 
                             <label>Twilio Phone Number:</label>
                             <input type="text" id="phone_number" value="{{ config.twilio_phone_number }}" placeholder="+1234567890">
@@ -3301,8 +3335,10 @@ def index():
                             <input type="text" id="gv_email" value="{{ config.get('gv_email','') }}" placeholder="you@gmail.com">
 
                             <label>App Password:</label>
-                            <input type="password" id="gv_app_password" value="" autocomplete="new-password"
-                                   placeholder="{{ '•••••••• saved — leave blank to keep' if config.get('gv_app_password') else '16-character app password' }}">
+                            <input type="password" id="gv_app_password" autocomplete="new-password" onfocus="this.select()"
+                                   value="{{ secret_sentinel if config.get('gv_app_password') else '' }}"
+                                   placeholder="16-character app password">
+                            {% if config.get('gv_app_password') %}<p class="help-text">🔒 Saved. Leave the dots to keep it, type a new password to replace it, or clear the field to remove it.</p>{% endif %}
 
                             <button class="test-btn" onclick="testGoogleVoice()">🔌 Test Google Voice Connection</button>
                             <div id="gv_test_result" style="margin-top: 8px; font-size: 14px;"></div>
@@ -3401,11 +3437,11 @@ def index():
                             </div>
                             <div id="format_rules_inputs">
                                 <label class="toggle-switch"><input type="checkbox" id="one_word_only" {{ 'checked' if config.get('one_word_only', False) and not config.get('use_whitelist', False) else '' }}
-                                       onchange="if(this.checked) document.getElementById('two_words_max').checked = false; checkFormatWarning(); saveConfig();"><span class="toggle-slider"></span></label>
+                                       onchange="if(this.checked) document.getElementById('two_words_max').checked = false; checkFormatWarning(); updateWordsPreview(); saveConfig();"><span class="toggle-slider"></span></label>
                                 <label class="checkbox-label">One Word Only (e.g., "John" ✓, "John Smith" ✗)</label><br>
 
                                 <label class="toggle-switch"><input type="checkbox" id="two_words_max" {{ 'checked' if config.get('two_words_max', True) and not config.get('use_whitelist', False) else '' }}
-                                       onchange="if(this.checked) document.getElementById('one_word_only').checked = false; checkFormatWarning(); saveConfig();"><span class="toggle-slider"></span></label>
+                                       onchange="if(this.checked) document.getElementById('one_word_only').checked = false; checkFormatWarning(); updateWordsPreview(); saveConfig();"><span class="toggle-slider"></span></label>
                                 <label class="checkbox-label">Two Words Maximum (e.g., "John Smith" ✓, sentences ✗)</label><br>
 
                                 <div id="format_warning" style="display:none; background:#f8d7da; border:1px solid #f5c6cb; color:#721c24; border-radius:5px; padding:10px 14px; margin:8px 0; font-size:13px;">
@@ -3501,13 +3537,15 @@ def index():
                     var cb = document.getElementById('sms_response_duplicate');
                     var warn = document.getElementById('duplicate_disabled_warning');
                     if (!row) return;
+                    // Only disable/grey the row — never change the checkbox's own state,
+                    // so turning Allow Duplicate Names back off restores the prior on/off choice.
+                    if (cb) cb.disabled = allowDupes;
                     if (allowDupes) {
                         row.classList.add('locked');
                         row.classList.remove('enabled');
-                        if (cb) cb.checked = false;
                     } else {
                         row.classList.remove('locked');
-                        toggleResp('duplicate');
+                        toggleResp('duplicate');  // reflect the preserved state
                     }
                     if (warn) warn.style.display = allowDupes ? '' : 'none';
                 }
@@ -3572,20 +3610,34 @@ def index():
                     var cb = document.getElementById('sms_response_rate_limited');
                     var warn = document.getElementById('rate_limited_disabled_warning');
                     if (!row) return;  // SMS-responses tab not parsed yet (init runs later)
+                    // Only disable/grey the row — never change the checkbox's own state,
+                    // so raising Max Messages above 0 restores the prior on/off choice.
                     if (unlimited) {
                         row.classList.add('locked');
                         row.classList.remove('enabled');
-                        if (cb) { cb.checked = false; cb.disabled = true; }
+                        if (cb) cb.disabled = true;
                     } else {
                         row.classList.remove('locked');
                         if (cb) cb.disabled = false;
-                        toggleResp('rate_limited');
+                        toggleResp('rate_limited');  // reflect the preserved state
                     }
                     if (warn) warn.style.display = unlimited ? '' : 'none';
+                }
+                // Live preview for the {words} placeholder in the Invalid Format
+                // response — mirrors word_rule_phrase() on the backend.
+                function updateWordsPreview() {
+                    var el = document.getElementById('words_preview');
+                    if (!el) return;  // SMS-responses tab not parsed yet
+                    var one = document.getElementById('one_word_only');
+                    var two = document.getElementById('two_words_max');
+                    el.textContent = (one && one.checked) ? '1 word'
+                                   : (two && two.checked) ? '2 words'
+                                   : '1-2 words';
                 }
                 updateFormatRules();
                 checkFiltersState();
                 checkDuplicateState();
+                updateWordsPreview();
             </script>
 
         </div>
@@ -3979,7 +4031,8 @@ def index():
                 <div id="row_duplicate" class="resp-row{% if config.get('allow_duplicate_names', False) %} locked{% endif %}">
                     <div class="resp-toggle">
                         <label class="toggle-switch"><input type="checkbox" id="sms_response_duplicate"
-                               {{ 'checked' if config.get('sms_response_duplicate', False) and not config.get('allow_duplicate_names', False) else '' }}
+                               {{ 'checked' if config.get('sms_response_duplicate', False) else '' }}
+                               {{ 'disabled' if config.get('allow_duplicate_names', False) else '' }}
                                onchange="toggleResp('duplicate')"><span class="toggle-slider"></span></label>
                         <label for="sms_response_duplicate" style="margin-left:10px;vertical-align:middle;">🔄 Duplicate Name — Send Response</label>
                     </div>
@@ -3996,13 +4049,14 @@ def index():
                         <label for="sms_response_invalid_format" style="margin-left:10px;vertical-align:middle;">❌ Invalid Format — Send Response</label>
                     </div>
                     <p id="invalid_format_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('use_whitelist', False) else 'display:none;' }}">⚠️ Invalid Format responses are disabled when the whitelist is active — all names are validated against the whitelist instead of format rules.</p>
-                    <textarea id="response_invalid_format" rows="2">{{ config.get('response_invalid_format', 'Please send only a name (1-2 words, no sentences).') }}</textarea>
+                    <textarea id="response_invalid_format" rows="2">{{ config.get('response_invalid_format', 'Please send only 1 name ({words}, no sentences).') }}</textarea>
+                    <p class="help-text">💡 Type <code>{words}</code> anywhere in this message to auto-fill your current word limit — it becomes "<span id="words_preview">2 words</span>" in the reply, based on your <strong>Name Format Rules</strong> (One Word Only → "1 word", Two Words Maximum → "2 words").</p>
                 </div>
 
                 <div id="row_rate_limited" class="resp-row{% if config.get('max_messages_per_phone', 0) == 0 %} locked{% endif %}">
                     <div class="resp-toggle">
                         <label class="toggle-switch"><input type="checkbox" id="sms_response_rate_limited"
-                               {{ 'checked' if config.get('sms_response_rate_limited', False) and config.get('max_messages_per_phone', 0) != 0 else '' }}
+                               {{ 'checked' if config.get('sms_response_rate_limited', False) else '' }}
                                {{ 'disabled' if config.get('max_messages_per_phone', 0) == 0 else '' }}
                                onchange="toggleResp('rate_limited')"><span class="toggle-slider"></span></label>
                         <label for="sms_response_rate_limited" style="margin-left:10px;vertical-align:middle;">⛔ Rate Limited — Send Response</label>
@@ -5310,6 +5364,7 @@ def index():
             checkWhitelistResponseState();
             checkRateLimitResponseState();
             checkDuplicateState();
+            updateWordsPreview();
             setupAutoSave();
             updateLiveStatus();
             setInterval(updateLiveStatus, 5000);
@@ -5910,19 +5965,20 @@ var _saveTimer = null;
     </html>
     """
 
-    return render_template_string(html, config=config)
+    return render_template_string(html, config=config, secret_sentinel=SECRET_SENTINEL)
 
 @app.route('/api/config', methods=['POST'])
 def update_config():
     global config, twilio_client, polling_thread, stop_polling
     try:
         new_config = request.json or {}
-        # Secrets are never rendered back into the config page (the fields render
-        # blank with a "saved" placeholder). A blank value from the client therefore
-        # means "keep the stored secret" — not "clear it" — so we drop blank secret
-        # keys before merging rather than wiping the saved credential.
-        for _sk in ('twilio_auth_token', 'gv_app_password'):
-            if not str(new_config.get(_sk, '')).strip():
+        # Secret fields render with the masked SECRET_SENTINEL when a value is
+        # stored. Interpret the submitted value:
+        #   • unchanged sentinel → keep the stored secret (drop the key)
+        #   • empty              → remove the stored secret (keep '' to clear it)
+        #   • anything else      → update to the new value
+        for _sk in SECRET_KEYS:
+            if str(new_config.get(_sk, '')) == SECRET_SENTINEL:
                 new_config.pop(_sk, None)
         config.update(new_config)
 

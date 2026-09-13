@@ -79,6 +79,7 @@ Use these placeholders in your response messages — they are replaced automatic
 | `{phone}` | The sender's phone number | All types |
 | `{limit}` | The daily message limit number | Rate Limited |
 | `{queue_position}` | Position in the display queue | Success |
+| `{words}` | Your current word limit — `1 word` or `2 words` | Invalid Format |
 
 ---
 
@@ -108,8 +109,9 @@ You've reached today's limit of {limit} messages. Thanks for participating! Chec
 
 ### Invalid Format
 ```
-We couldn't find a name in your message! Please text just a first name (e.g., "Sarah" or "John").
+Please send only 1 name ({words}, no sentences).
 ```
+`{words}` automatically becomes **"1 word"** or **"2 words"** to match your current Name Format Rule, so the reply always tells texters the right limit.
 
 ### Not on Whitelist
 ```

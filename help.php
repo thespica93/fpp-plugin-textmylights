@@ -2,6 +2,20 @@
 // Text My Lights - Help / Documentation page
 $pluginName = "fpp-plugin-textmylights";
 $githubBase = "https://github.com/thespica93/fpp-plugin-textmylights";
+
+// Inline a setup screenshot from the plugin's own docs/images/ folder as a
+// base64 data URI. This renders the walkthrough images inside FPP with no
+// dependency on external hosting or internet access — the files ship with the
+// plugin. Returns '' if the image isn't present.
+function tml_shot($file, $alt) {
+    $path = __DIR__ . '/docs/images/' . basename($file);
+    if (!is_file($path)) {
+        return '';
+    }
+    $data = base64_encode(file_get_contents($path));
+    return '<img class="shot" src="data:image/png;base64,' . $data . '" alt="'
+         . htmlspecialchars($alt, ENT_QUOTES) . '">';
+}
 ?>
 <style>
     .sms-help { max-width: 860px; margin: 0 auto; font-family: Arial, sans-serif; line-height: 1.5; }
@@ -10,6 +24,8 @@ $githubBase = "https://github.com/thespica93/fpp-plugin-textmylights";
     .sms-help ol { margin: 10px 0 10px 4px; padding-left: 20px; }
     .sms-help ol li { margin-bottom: 7px; }
     .sms-help code { background: #f0f0f0; padding: 1px 5px; border-radius: 3px; font-size: 13px; }
+    .sms-help .shot { display: block; max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 6px; margin: 10px 0 16px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
+    .sms-help .step-note { color: #555; font-size: 13px; margin: 4px 0 6px; }
     .ui-link { display: inline-block; background: #4CAF50; color: white; padding: 10px 20px; border-radius: 5px; text-decoration: none; font-weight: bold; margin: 6px 6px 6px 0; }
     .ui-link:hover { background: #45a049; color: white; text-decoration: none; }
     .ui-link.secondary { background: #2196F3; }
@@ -46,9 +62,43 @@ $githubBase = "https://github.com/thespica93/fpp-plugin-textmylights";
     <!-- ================= GOOGLE VOICE ================= -->
     <h2 id="google-voice">🟢 Configure Google Voice</h2>
     <p>Google Voice is <strong>free</strong>. It has no API, so the plugin reads the Gmail inbox that Google Voice forwards texts to. Automatic replies are supported by emailing Google Voice back (best-effort; may be rate-limited).</p>
+    <p><strong>How it works:</strong> Google Voice forwards every incoming text to your Gmail inbox, and the plugin logs into that Gmail account (over IMAP, using an App Password) to read them. Use the Google account you want dedicated to the show — its inbox receives all the texts.</p>
+
+    <h3>1. Choose a phone number</h3>
+    <p>Go to <a href="https://voice.google.com" target="_blank">voice.google.com</a>, sign in, and accept the suggested number or click <em>Pick a different number</em>. (A US-based mobile number is required to qualify.)</p>
+    <?php echo tml_shot('gv-01-choose-number.png', 'Choose a phone number'); ?>
+
+    <h3>2. Verify your identity</h3>
+    <p>Google requires verifying an existing phone number <strong>and</strong> a government-issued ID before the number can send and receive texts. Work through the tasks: link an existing number and enter the 6-digit code, then submit an ID type (Driver's License, Passport, State ID, or Green Card).</p>
+    <?php echo tml_shot('gv-02-verify-tasks.png', 'Verification tasks'); ?>
+    <?php echo tml_shot('gv-03-link-number.png', 'Link an existing number'); ?>
+    <?php echo tml_shot('gv-04-verify-identity.png', 'Verify your identity'); ?>
+    <?php echo tml_shot('gv-05-provide-id.png', 'Provide an ID'); ?>
+    <?php echo tml_shot('gv-06-verified.png', 'Verified'); ?>
+
+    <h3>3. Turn on email forwarding <span style="color:#f44336;">(required)</span></h3>
+    <p>This is the key step that lets the plugin read your texts. In Google Voice <em>Settings → Messages</em>, turn <strong>on</strong> <strong>Forward messages to email</strong>, and confirm the email shown is the Gmail account the plugin will use.</p>
+    <?php echo tml_shot('gv-07-forward-to-email.png', 'Forward messages to email'); ?>
+    <div class="warn">Without this turned on, Google Voice keeps texts only inside its own app and the plugin has nothing to read — no names will reach your display.</div>
+
+    <h3>4. Turn off call answering &amp; forwarding</h3>
+    <p>The number is a <strong>text line</strong> for the show. In <em>Settings → Calls</em>, turn <strong>off</strong> every device under <strong>My devices</strong>, and turn <strong>off</strong> your linked number under <strong>Call forwarding</strong>.</p>
+    <?php echo tml_shot('gv-08-calls-off.png', 'Turn off devices and call forwarding'); ?>
+
+    <h3>5. Set Receiving Calls to Do Not Disturb</h3>
+    <p>At the top of Google Voice, open the <strong>Receiving calls</strong> dropdown and choose <strong>Do not disturb</strong> so incoming calls go straight to voicemail. Texts are unaffected.</p>
+    <?php echo tml_shot('gv-11-do-not-disturb.png', 'Set Receiving Calls to Do Not Disturb'); ?>
+
+    <h3>6. Turn off spam filtering</h3>
+    <p>In <em>Settings → Security</em>, turn <strong>off</strong> <strong>Filter spam calls and texts</strong>. When lots of people text names at once, a burst of messages can look like spam and get diverted to a Spam folder the plugin doesn't read — so names would silently go missing.</p>
+    <?php echo tml_shot('gv-09-spam-off.png', 'Turn off spam filtering'); ?>
+
+    <h3>7. Enable 2-Step Verification</h3>
+    <p>In your <strong>Google Account</strong> (not Google Voice) → <a href="https://myaccount.google.com/signinoptions/two-step-verification" target="_blank">Security → 2-Step Verification</a>, turn it on. This is required to create the App Password in the next step.</p>
+    <?php echo tml_shot('gv-10-2step-verification.png', 'Enable 2-Step Verification'); ?>
+
+    <h3>8. Connect it to the plugin</h3>
     <ol>
-        <li><strong>Turn on email forwarding.</strong> In <a href="https://voice.google.com/settings" target="_blank">Google Voice → Settings → Messages</a>, enable <em>“Forward messages to email.”</em></li>
-        <li><strong>Turn on 2-Step Verification.</strong> On your Google Account, open <a href="https://myaccount.google.com/signinoptions/two-step-verification" target="_blank">Security → 2-Step Verification</a> and enable it (required for the next step).</li>
         <li><strong>Create an App Password.</strong> Go to <a href="https://myaccount.google.com/apppasswords" target="_blank">App Passwords</a>, create one (name it e.g. “FPP”), and copy the <strong>16-character</strong> password.</li>
         <li>In this plugin: <em>Settings → Message Source → Google Voice</em>. Enter your <strong>Gmail address</strong> and paste the <strong>app password</strong> (leave IMAP Host as <code>imap.gmail.com</code>).</li>
         <li>Click <strong>Test Google Voice Connection</strong> — you should see “inbox connected.”</li>

@@ -116,7 +116,7 @@ If you purchased a toll-free number, you must complete a one-time free verificat
 - A **Nextdoor post** or neighborhood group page about your display
 - A **YouTube video** of your display
 - A **personal website or blog** mentioning the display
-- The **plugin GitHub page**: `https://github.com/thespica93/fpp-plugin-sms-twilio` *(if you use this plugin as-is)*
+- The **plugin GitHub page**: `https://github.com/thespica93/fpp-plugin-textmylights` *(if you use this plugin as-is)*
 
 Any public URL that references your display or the plugin is acceptable.
 

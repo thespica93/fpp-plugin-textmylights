@@ -71,13 +71,13 @@ twilio          8.10.0
 ```
 If any are missing, reinstall:
 ```bash
-cd /opt/fpp/plugins/fpp-plugin-sms-twilio
+cd /opt/fpp/plugins/fpp-plugin-textmylights
 bash scripts/fpp_install.sh
 ```
 
 **Check 3 — Is there a Python error on startup?**
 ```bash
-cd /opt/fpp/plugins/fpp-plugin-sms-twilio
+cd /opt/fpp/plugins/fpp-plugin-textmylights
 python3 sms_plugin.py
 ```
 Run it manually and look for error output. Press `Ctrl+C` when done.
@@ -225,15 +225,15 @@ grep -i "response\|sms send\|error" /home/fpp/media/logs/sms_plugin.log | tail -
 
 If removals aren't sticking:
 ```bash
-cat /opt/fpp/plugins/fpp-plugin-sms-twilio/whitelist_removed.txt
-cat /opt/fpp/plugins/fpp-plugin-sms-twilio/blacklist_removed.txt
+cat /opt/fpp/plugins/fpp-plugin-textmylights/whitelist_removed.txt
+cat /opt/fpp/plugins/fpp-plugin-textmylights/blacklist_removed.txt
 ```
 These files should contain the names/words you've removed. If they're missing or empty, try removing the name/word again via the web UI.
 
 **Symptom:** Whitelist shows 0 names after an update
 
 ```bash
-cd /opt/fpp/plugins/fpp-plugin-sms-twilio
+cd /opt/fpp/plugins/fpp-plugin-textmylights
 git checkout -- whitelist.txt
 ```
 This restores the default whitelist from git.
@@ -248,13 +248,13 @@ This can happen if the install was interrupted or the plugin was manually cloned
 
 ```bash
 # Check if plugin directory exists
-ls /opt/fpp/plugins/fpp-plugin-sms-twilio
+ls /opt/fpp/plugins/fpp-plugin-textmylights
 
 # If it exists but isn't showing in FPP, restart FPP
 sudo systemctl restart fppd
 
 # Or try reinstalling
-cd /opt/fpp/plugins/fpp-plugin-sms-twilio
+cd /opt/fpp/plugins/fpp-plugin-textmylights
 bash scripts/fpp_install.sh
 ```
 
@@ -293,7 +293,7 @@ If you need a clean slate:
 
 **Reset configuration only:**
 ```bash
-rm /home/fpp/media/config/plugin.fpp-sms-twilio.json
+rm /home/fpp/media/config/plugin.fpp-textmylights.json
 # Restart the plugin — it will generate default config
 ```
 
@@ -304,15 +304,15 @@ rm /home/fpp/media/logs/received_messages.json
 
 **Clear blocked phones:**
 ```bash
-echo '{}' > /opt/fpp/plugins/fpp-plugin-sms-twilio/blocked_phones.json
+echo '{}' > /opt/fpp/plugins/fpp-plugin-textmylights/blocked_phones.json
 ```
 
 **Full reinstall:**
 ```bash
 cd /opt/fpp/plugins
-rm -rf fpp-plugin-sms-twilio
-git clone https://github.com/thespica93/fpp-plugin-sms-twilio.git
-cd fpp-plugin-sms-twilio
+rm -rf fpp-plugin-textmylights
+git clone https://github.com/thespica93/fpp-plugin-textmylights.git
+cd fpp-plugin-textmylights
 bash scripts/fpp_install.sh
 ```
 
@@ -320,7 +320,7 @@ bash scripts/fpp_install.sh
 
 ## Still Need Help?
 
-- **GitHub Issues:** [github.com/thespica93/fpp-plugin-sms-twilio/issues](https://github.com/thespica93/fpp-plugin-sms-twilio/issues)
+- **GitHub Issues:** [github.com/thespica93/fpp-plugin-textmylights/issues](https://github.com/thespica93/fpp-plugin-textmylights/issues)
 - **FPP Community Forums:** [FalconChristmas.com](https://falconchristmas.com/)
 
 When reporting an issue, please include:

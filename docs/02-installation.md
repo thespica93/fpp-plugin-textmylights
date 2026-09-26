@@ -46,10 +46,10 @@ ssh fpp@YOUR_FPP_IP
 cd /opt/fpp/plugins
 
 # Clone the repository
-git clone https://github.com/thespica93/fpp-plugin-sms-twilio.git
+git clone https://github.com/thespica93/fpp-plugin-textmylights.git
 
 # Run the install script
-cd fpp-plugin-sms-twilio
+cd fpp-plugin-textmylights
 bash scripts/fpp_install.sh
 ```
 
@@ -105,7 +105,7 @@ To update to the latest version:
 
 ### Via SSH
 ```bash
-cd /opt/fpp/plugins/fpp-plugin-sms-twilio
+cd /opt/fpp/plugins/fpp-plugin-textmylights
 git pull
 ```
 
@@ -121,10 +121,10 @@ git pull
 
 ### Via SSH
 ```bash
-cd /opt/fpp/plugins/fpp-plugin-sms-twilio
+cd /opt/fpp/plugins/fpp-plugin-textmylights
 bash scripts/fpp_uninstall.sh
 cd ..
-rm -rf fpp-plugin-sms-twilio
+rm -rf fpp-plugin-textmylights
 ```
 
 ---

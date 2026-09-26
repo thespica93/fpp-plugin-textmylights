@@ -1,6 +1,9 @@
 <?php
 $host = preg_replace('/:\d+$/', '', $_SERVER['HTTP_HOST']);
-$pluginUrl = "http://$host:5000/messages";
+// Pass the plugin's network access token to the iframe (see ui.php for details).
+$tokenFile = "/home/fpp/media/plugin.fpp-textmylights/.access_token";
+$token = is_readable($tokenFile) ? trim(file_get_contents($tokenFile)) : "";
+$pluginUrl = "http://$host:5000/messages" . ($token !== "" ? "?token=" . urlencode($token) : "");
 ?>
 <style>
     #sms-messages-frame {

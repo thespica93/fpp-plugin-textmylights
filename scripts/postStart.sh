@@ -4,7 +4,7 @@
 # This runs automatically after FPPD starts
 ###############################################################################
 
-PLUGIN_DIR="/home/fpp/media/plugins/fpp-plugin-sms-twilio"
+PLUGIN_DIR="/home/fpp/media/plugins/fpp-plugin-textmylights"
 
 # Stop any existing service
 pkill -f sms_plugin.py 2>/dev/null || true

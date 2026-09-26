@@ -1,6 +1,6 @@
-# FPP SMS Twilio Plugin
+# Text My Lights
 
-> Let your audience text their name and watch it light up on your display!
+> Let your audience text their name and watch it light up on your display! Works with **Twilio** or **Google Voice**.
 
 The FPP SMS Twilio Plugin connects your [Falcon Player (FPP)](https://falconchristmas.com/) LED display to Twilio's SMS platform. Visitors text their name to your Twilio number, and it appears on your pixel display — no interruptions, no bad words, fully automatic.
 
@@ -25,9 +25,11 @@ Visitor texts name → Twilio → Plugin polls & receives → Filters applied �
 | Page | Description |
 |------|-------------|
 | [Twilio Setup](docs/01-twilio-setup.md) | Create a Twilio account, get a phone number, and configure credentials |
+| [Google Voice Setup](docs/11-google-voice-setup.md) | Free alternative to Twilio — set up a Google Voice number and email forwarding |
 | [Installation](docs/02-installation.md) | Install the plugin on your FPP device |
 | [Plugin Configuration](docs/03-plugin-configuration.md) | Full reference for all settings |
 | [Message Queue](docs/04-message-queue.md) | How the queue works, monitoring, and manual controls |
+| [Message Formatting](docs/10-message-formatting.md) | How texts become names — single, two-word, and multi-name lists |
 | [Whitelist](docs/05-whitelist.md) | Only allow pre-approved names on your display |
 | [Profanity Blacklist](docs/06-blacklist.md) | Block specific words from appearing |
 | [Phone Blocklist](docs/07-phone-blocklist.md) | Block specific phone numbers |
@@ -75,8 +77,8 @@ Visitor texts name → Twilio → Plugin polls & receives → Filters applied �
 
 | File | Path |
 |------|------|
-| Plugin directory | `/opt/fpp/plugins/fpp-plugin-sms-twilio/` |
-| Configuration | `/home/fpp/media/config/plugin.fpp-sms-twilio.json` |
+| Plugin directory | `/opt/fpp/plugins/fpp-plugin-textmylights/` |
+| Configuration | `/home/fpp/media/config/plugin.fpp-textmylights.json` |
 | Whitelist | `[plugin dir]/whitelist.txt` |
 | Blacklist | `[plugin dir]/blacklist.txt` |
 | Blocked phones | `[plugin dir]/blocked_phones.json` |
@@ -102,7 +104,7 @@ Visitor texts name → Twilio → Plugin polls & receives → Filters applied �
 
 ## Support
 
-- **Issues:** [GitHub Issues](https://github.com/thespica93/fpp-plugin-sms-twilio/issues)
+- **Issues:** [GitHub Issues](https://github.com/thespica93/fpp-plugin-textmylights/issues)
 - **FPP Community:** [FalconChristmas.com Forums](https://falconchristmas.com/)
 - **Logs:** `/home/fpp/media/logs/sms_plugin.log`
 

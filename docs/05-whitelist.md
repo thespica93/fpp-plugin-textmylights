@@ -143,12 +143,12 @@ When you re-add a name via the web UI:
 
 | File | Path | Purpose |
 |------|------|---------|
-| Main whitelist | `/opt/fpp/plugins/fpp-plugin-sms-twilio/whitelist.txt` | List of approved names, one per line |
-| Removals tracking | `/opt/fpp/plugins/fpp-plugin-sms-twilio/whitelist_removed.txt` | Names you've removed (gitignored) |
+| Main whitelist | `/opt/fpp/plugins/fpp-plugin-textmylights/whitelist.txt` | List of approved names, one per line |
+| Removals tracking | `/opt/fpp/plugins/fpp-plugin-textmylights/whitelist_removed.txt` | Names you've removed (gitignored) |
 
 You can also edit `whitelist.txt` directly via SSH if needed:
 ```bash
-nano /opt/fpp/plugins/fpp-plugin-sms-twilio/whitelist.txt
+nano /opt/fpp/plugins/fpp-plugin-textmylights/whitelist.txt
 ```
 One name per line, case-insensitive.
 

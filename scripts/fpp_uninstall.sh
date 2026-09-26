@@ -29,7 +29,7 @@ pip3 uninstall -y --break-system-packages requests >> "$LOG" 2>&1 && log_and_sho
 
 # Remove configuration files
 log_and_show "Removing configuration files..."
-rm -f /home/fpp/media/config/plugin.fpp-sms-twilio.json
+rm -f /home/fpp/media/config/plugin.fpp-textmylights.json
 rm -f /home/fpp/media/config/blacklist.txt
 rm -f /home/fpp/media/config/whitelist.txt
 rm -f /home/fpp/media/config/blocked_phones.json

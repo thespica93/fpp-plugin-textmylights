@@ -1,15 +1,15 @@
 <?php
-// Plugin Name: SMS Twilio Integration
-// Plugin Description: Allow viewers to text names that appear on your display
+// Plugin Name: Text My Lights
+// Plugin Description: Viewers text a name that appears on your display (Twilio or Google Voice)
 // Plugin Version: 2.5
 // Plugin Author: Nick
-// Plugin URL: https://github.com/YOUR_USERNAME/fpp-plugin-sms-twilio
+// Plugin URL: https://github.com/thespica93/fpp-plugin-textmylights
 
 // This file is required by FPP to recognize and install the plugin
 
-$pluginName = "fpp-plugin-sms-twilio";
+$pluginName = "fpp-plugin-textmylights";
 $pluginVersion = "2.5";
-$pluginDescription = "SMS Twilio Integration - Allow viewers to text names that appear on your display";
+$pluginDescription = "Text My Lights - Viewers text a name that appears on your display (Twilio or Google Voice)";
 $pluginAuthor = "Nick";
 
 // Plugin configuration
@@ -76,7 +76,7 @@ function installDependencies() {
         exec("bash " . escapeshellarg($installScript) . " 2>&1", $output, $return);
         
         // Log the output
-        error_log("FPP SMS Plugin Install: " . implode("\n", $output));
+        error_log("Text My Lights Install: " . implode("\n", $output));
         
         return $return === 0;
     }

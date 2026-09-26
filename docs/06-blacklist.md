@@ -149,12 +149,12 @@ When you re-add a removed word:
 
 | File | Path | Purpose |
 |------|------|---------|
-| Main blacklist | `/opt/fpp/plugins/fpp-plugin-sms-twilio/blacklist.txt` | Blocked words, one per line |
-| Removals tracking | `/opt/fpp/plugins/fpp-plugin-sms-twilio/blacklist_removed.txt` | Words you've removed (gitignored) |
+| Main blacklist | `/opt/fpp/plugins/fpp-plugin-textmylights/blacklist.txt` | Blocked words, one per line |
+| Removals tracking | `/opt/fpp/plugins/fpp-plugin-textmylights/blacklist_removed.txt` | Words you've removed (gitignored) |
 
 You can also edit `blacklist.txt` directly via SSH:
 ```bash
-nano /opt/fpp/plugins/fpp-plugin-sms-twilio/blacklist.txt
+nano /opt/fpp/plugins/fpp-plugin-textmylights/blacklist.txt
 ```
 One word per line, case-insensitive.
 

@@ -10,7 +10,7 @@
 mkdir -p /home/fpp/media/config /home/fpp/media/logs
 
 LOG="/home/fpp/media/logs/sms_plugin_install.log"
-PLUGIN_DIR="/home/fpp/media/plugins/fpp-plugin-sms-twilio"
+PLUGIN_DIR="/home/fpp/media/plugins/fpp-plugin-textmylights"
 
 # Log to both file and stdout so FPP UI shows progress
 log_and_show() {
@@ -99,6 +99,16 @@ log_and_show "[7/7] zstandard complete"
 # Create config files if they don't exist
 [ ! -f "/home/fpp/media/config/blocked_phones.json" ] && echo "[]" > /home/fpp/media/config/blocked_phones.json
 
+# Create the plugin data dir and an OWNER-ONLY secrets folder for credentials
+# (Twilio auth token, Gmail app password). Kept out of plugin.json/logs/backups;
+# 0700 so only the fpp user can read it. The plugin also ensures this at startup.
+PLUGIN_DATA_DIR="/home/fpp/media/plugin.fpp-textmylights"
+mkdir -p "$PLUGIN_DATA_DIR/secrets"
+chown -R fpp:fpp "$PLUGIN_DATA_DIR" 2>/dev/null
+chmod 700 "$PLUGIN_DATA_DIR/secrets" 2>/dev/null
+[ -f "$PLUGIN_DATA_DIR/secrets/credentials.json" ] && chmod 600 "$PLUGIN_DATA_DIR/secrets/credentials.json" 2>/dev/null
+log_and_show "Secrets folder ready: $PLUGIN_DATA_DIR/secrets (owner-only)"
+
 # whitelist.txt and blacklist.txt ship with the plugin via git.
 # Force git checkout to ensure they are present (FPP update may not pull all files).
 cd "$PLUGIN_DIR" && git checkout -- whitelist.txt blacklist.txt >> "$LOG" 2>&1
@@ -128,13 +138,16 @@ chmod 666 /home/fpp/media/logs/sms_plugin.log
 chown fpp:fpp /home/fpp/media/logs/sms_plugin.log
 
 # Install scheduler scripts into FPP's scripts directory so they appear in
-# the scheduler under: Command → Run Script → TwilioStart / TwilioStop
+# the scheduler under: Command → Run Script → TextMyLightsStart / TextMyLightsStop
 mkdir -p /home/fpp/media/scripts
-cp "$PLUGIN_DIR/scripts/fpp_activate.sh"   /home/fpp/media/scripts/TwilioStart.sh
-cp "$PLUGIN_DIR/scripts/fpp_deactivate.sh" /home/fpp/media/scripts/TwilioStop.sh
-chmod +x /home/fpp/media/scripts/TwilioStart.sh /home/fpp/media/scripts/TwilioStop.sh
-chown fpp:fpp /home/fpp/media/scripts/TwilioStart.sh /home/fpp/media/scripts/TwilioStop.sh
-log_and_show "Scheduler scripts installed: TwilioStart.sh / TwilioStop.sh"
+# Remove the old Twilio-named scripts from before the rename (full rename).
+# NOTE: update your FPP scheduler to run TextMyLightsStart.sh / TextMyLightsStop.sh.
+rm -f /home/fpp/media/scripts/TwilioStart.sh /home/fpp/media/scripts/TwilioStop.sh
+cp "$PLUGIN_DIR/scripts/fpp_activate.sh"   /home/fpp/media/scripts/TextMyLightsStart.sh
+cp "$PLUGIN_DIR/scripts/fpp_deactivate.sh" /home/fpp/media/scripts/TextMyLightsStop.sh
+chmod +x /home/fpp/media/scripts/TextMyLightsStart.sh /home/fpp/media/scripts/TextMyLightsStop.sh
+chown fpp:fpp /home/fpp/media/scripts/TextMyLightsStart.sh /home/fpp/media/scripts/TextMyLightsStop.sh
+log_and_show "Scheduler scripts installed: TextMyLightsStart.sh / TextMyLightsStop.sh"
 
 log_and_show "========================================"
 log_and_show "Installation complete!"

@@ -1,11 +1,11 @@
 {
-	"repoName": "fpp-plugin-sms-twilio",
-	"name": "SMS Twilio Integration",
+	"repoName": "fpp-plugin-textmylights",
+	"name": "Text My Lights",
 	"author": "Nick Spica (thespica93)",
-	"description": "Allow viewers to text names that will appear on your light display using Twilio SMS. Features include message queueing, profanity filtering with customizable blacklist, name whitelist, automatic SMS responses, phone number blocking and rate limiting, and duplicate message detection.",
-	"homeURL": "https://github.com/thespica93/fpp-plugin-sms-twilio",
-	"srcURL": "https://github.com/thespica93/fpp-plugin-sms-twilio.git",
-	"bugURL": "https://github.com/thespica93/fpp-plugin-sms-twilio/issues",
+	"description": "Viewers text a name that appears on your light display — via Twilio SMS or Google Voice. Features include message queueing, profanity filtering with customizable blacklist, name whitelist, automatic responses, phone number blocking and rate limiting, and duplicate message detection.",
+	"homeURL": "https://github.com/thespica93/fpp-plugin-textmylights",
+	"srcURL": "https://github.com/thespica93/fpp-plugin-textmylights.git",
+	"bugURL": "https://github.com/thespica93/fpp-plugin-textmylights/issues",
 	"allowUpdates": 1,
 	"requires": [],
 	"versions": [

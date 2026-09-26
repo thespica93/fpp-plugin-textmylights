@@ -4,6 +4,23 @@ Place screenshot images here to be referenced in the documentation pages.
 
 ## Required Screenshots
 
+### Google Voice Setup
+> ⚠️ **Blur ALL personal info before saving these** — these publish to a public repo.
+> Blur in every shot: the account **profile photo / "N" avatar** (top-right), any **full name**,
+> **email address**, **street/city location**, and **phone numbers** (personal *and* the Google
+> Voice number).
+- `gv-01-choose-number.png` — Choose a phone number screen *(blur: suggested number, city/state)*
+- `gv-02-verify-tasks.png` — "To finish setting up…" tasks (Continue) *(blur: the GV number in the title)*
+- `gv-03-link-number.png` — Enter a number to link / Send code *(blur: GV number in title)*
+- `gv-04-verify-identity.png` — "Let's verify your identity" (Get started) *(blur: first name in the greeting, avatar)*
+- `gv-05-provide-id.png` — Provide an ID (ID-type list, Next) *(blur: avatar)*
+- `gv-06-verified.png` — "You're verified" confirmation *(blur: FULL NAME, avatar)*
+- `gv-07-forward-to-email.png` — Settings → Messages → Forward messages to email (ON) *(blur: email address)*
+- `gv-08-calls-off.png` — Settings → Calls: My devices + Call forwarding OFF *(blur: forwarding phone number, email under missed-call alerts)*
+- `gv-09-spam-off.png` — Settings → Security → Filter spam calls and texts (OFF) *(no personal info, but check the avatar)*
+- `gv-10-2step-verification.png` — Google Account → Security → 2-Step Verification ON *(blur: the two phone numbers — 2-Step & Recovery — and avatar)*
+- `gv-11-do-not-disturb.png` — Receiving calls → Do not disturb (On) *(no personal info)*
+
 ### Twilio Setup
 - `twilio-signup.png` — Twilio sign-up page
 - `twilio-dashboard-credentials.png` — Twilio console showing Account SID and Auth Token

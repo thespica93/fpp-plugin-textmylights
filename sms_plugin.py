@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-FPP SMS Plugin v2.5 - Twilio Integration
+Text My Lights - FPP plugin: viewers text a name that appears on your display.
+Supports Twilio and Google Voice as message sources.
 """
 
-from flask import Flask, request, jsonify, render_template_string, Response
+from flask import Flask, request, jsonify, render_template_string, Response, g
 import logging
 import json
+import secrets as _secrets
 import requests
 from datetime import datetime, timedelta, timezone
 import re
@@ -17,6 +19,11 @@ from collections import deque
 import os
 import struct
 import io
+import imaplib
+import smtplib
+import email
+import email.utils
+from email.header import decode_header, make_header
 
 # PIL/Pillow for pixel-accurate text rendering (optional — falls back to FPP text API if unavailable)
 try:
@@ -39,12 +46,24 @@ _scroll_thread = None   # background PIL scroll animation thread
 PLUGIN_DIR      = os.path.dirname(os.path.abspath(__file__))
 
 # All runtime data lives under one plugin folder
-PLUGIN_DATA_DIR = "/home/fpp/media/plugin.fpp-sms-twilio"
+PLUGIN_DATA_DIR = "/home/fpp/media/plugin.fpp-textmylights"
 CONFIG_FILE     = os.path.join(PLUGIN_DATA_DIR, "plugin.json")
+# Credentials live in their own owner-only directory — NOT in plugin.json, logs,
+# or backups. (True at-rest secrecy isn't possible on this hardware: an
+# unattended service must be able to read them on boot, so any key would sit on
+# the same card. This keeps them out of the shared config and off casual view.)
+SECRETS_DIR     = os.path.join(PLUGIN_DATA_DIR, "secrets")
+SECRETS_FILE    = os.path.join(SECRETS_DIR, "credentials.json")
+SECRET_KEYS     = ("twilio_auth_token", "gv_app_password")
+# Placeholder shown in a saved secret field. Submitting it unchanged means
+# "keep the stored secret"; clearing the field to empty means "remove it";
+# any other value updates it. Must be something a real secret never equals.
+SECRET_SENTINEL = "••••••••"  # 8 × •
 LOG_FILE        = os.path.join(PLUGIN_DATA_DIR, "logs", "sms_plugin.log")
 QUEUE_FILE      = os.path.join(PLUGIN_DATA_DIR, "queue_pending.json")
 MESSAGES_DIR    = os.path.join(PLUGIN_DATA_DIR, "logs", "messages")
 LAST_SID_FILE   = os.path.join(PLUGIN_DATA_DIR, "last_message_sid.txt")
+LAST_GV_UID_FILE = os.path.join(PLUGIN_DATA_DIR, "last_gv_uid.txt")
 BLOCKLIST_FILE  = os.path.join(PLUGIN_DATA_DIR, "blocked_phones.json")
 
 FSEQ_SEQUENCE_PATH = '/home/fpp/media/sequences'
@@ -59,13 +78,14 @@ WHITELIST_FILE = os.path.join(PLUGIN_DIR, "whitelist.txt")
 WHITELIST_REMOVED_FILE = os.path.join(PLUGIN_DIR, "whitelist_removed.txt")
 WHITELIST_ADDED_FILE = os.path.join(PLUGIN_DIR, "whitelist_added.txt")
 
-# SMS auto-responses are functional on the beta branch but not yet verified on
-# stable. Flip to True once beta testing confirms the feature is solid, or drop
-# this whole flag/gating when merging that verification back into stable.
-SMS_AUTO_RESPONSES_ENABLED = False
-
 # Create directory structure before logging setup
 os.makedirs(os.path.join(PLUGIN_DATA_DIR, "logs", "messages"), exist_ok=True)
+# Owner-only secrets directory (created at first run and on install)
+os.makedirs(SECRETS_DIR, exist_ok=True)
+try:
+    os.chmod(SECRETS_DIR, 0o700)
+except OSError:
+    pass
 
 # Setup logging — ensure the log directory exists, then write to file + stderr
 _log_handlers = [logging.StreamHandler()]  # stderr always available via nohup
@@ -85,6 +105,71 @@ flask.cli.show_server_banner = lambda *args: None
 
 app = Flask(__name__)
 
+# ============================================================================
+# NETWORK ACCESS CONTROL
+# ----------------------------------------------------------------------------
+# The service binds 0.0.0.0:5000 so the FPP web UI (running on a different
+# machine — the user's browser) can iframe it. To keep anonymous LAN clients
+# from reading credentials / controlling the show, every *network* request must
+# carry an access token. The token is minted here and read by the FPP-served
+# PHP pages (ui.php / messages.php), which are already behind FPP's own web
+# server — so only someone who can load the FPP UI ever receives it.
+#
+# Loopback (127.0.0.1) is always trusted: the scheduler's activate/deactivate
+# scripts and any on-box tooling reach us over localhost and need no token.
+# Escape hatch: `touch <PLUGIN_DATA_DIR>/.disable_auth` then restart to disable
+# network auth if you are ever locked out.
+# ============================================================================
+ACCESS_TOKEN_FILE = os.path.join(PLUGIN_DATA_DIR, ".access_token")
+AUTH_DISABLE_FILE = os.path.join(PLUGIN_DATA_DIR, ".disable_auth")
+_AUTH_COOKIE = "tml_token"
+
+def _load_or_create_token():
+    """Reuse a persisted token across restarts so already-open UIs keep working;
+    mint one on first run. The token file is world-readable on purpose — the FPP
+    web server (whatever user it runs as) must read it to embed in the UI, and
+    local read access already implies full access to the plaintext config."""
+    try:
+        with open(ACCESS_TOKEN_FILE, 'r') as _f:
+            _tok = _f.read().strip()
+            if _tok:
+                return _tok
+    except OSError:
+        pass
+    _tok = _secrets.token_urlsafe(32)
+    try:
+        with open(ACCESS_TOKEN_FILE, 'w') as _f:
+            _f.write(_tok)
+        os.chmod(ACCESS_TOKEN_FILE, 0o644)
+    except OSError as _e:
+        logging.error(f"Could not persist access token: {_e}")
+    return _tok
+
+ACCESS_TOKEN = _load_or_create_token()
+
+@app.before_request
+def _require_access_token():
+    # Trust the loopback interface (scheduler scripts, on-box curl, the poller
+    # never hits HTTP). remote_addr comes from the socket peer; we never trust
+    # X-Forwarded-For, so it cannot be spoofed to look local.
+    if request.remote_addr in ('127.0.0.1', '::1'):
+        return None
+    if os.path.exists(AUTH_DISABLE_FILE):
+        return None
+    # First load carries the token as a query param (embedded by the FPP UI);
+    # we then set a cookie so subsequent same-origin fetches are authorized.
+    qtok = request.args.get('token', '')
+    if qtok and _secrets.compare_digest(qtok, ACCESS_TOKEN):
+        g._set_auth_cookie = True
+        return None
+    ctok = request.cookies.get(_AUTH_COOKIE, '')
+    if ctok and _secrets.compare_digest(ctok, ACCESS_TOKEN):
+        return None
+    return Response(
+        "Access denied. Open this plugin from the FPP web UI "
+        "(Content Setup → Text My Lights).",
+        status=403, mimetype='text/plain')
+
 IFRAME_RESIZE_SCRIPT = """<script>
 (function() {
     function reportHeight() {
@@ -97,6 +182,11 @@ IFRAME_RESIZE_SCRIPT = """<script>
 
 @app.after_request
 def inject_iframe_resize(response):
+    # Persist the access token as a cookie once a valid ?token= is presented, so
+    # follow-up requests from the same browser don't need the query param.
+    if getattr(g, '_set_auth_cookie', False):
+        response.set_cookie(_AUTH_COOKIE, ACCESS_TOKEN, httponly=True,
+                            samesite='Lax', max_age=60 * 60 * 24 * 365)
     if response.content_type.startswith('text/html'):
         body = response.get_data(as_text=True)
         body = body.replace('</body>', IFRAME_RESIZE_SCRIPT + '</body>')
@@ -125,9 +215,21 @@ FPP_HOST = 'http://127.0.0.1'
 # Default configuration
 DEFAULT_CONFIG = {
     "enabled": False,
+    # Which inbound message source feeds the pipeline: "twilio" | "google_voice"
+    "message_source": "twilio",
     "twilio_account_sid": "",
     "twilio_auth_token": "",
     "twilio_phone_number": "",
+    # Google Voice source: scans the Gmail inbox that Voice forwards SMS to.
+    # No public GV API exists; requires "Forward messages to email" enabled in
+    # Google Voice and a Google App Password (2-Step Verification must be on).
+    "gv_email": "",
+    "gv_app_password": "",
+    "gv_imap_host": "imap.gmail.com",
+    "gv_imap_folder": "INBOX",
+    # SMTP is used only for Google Voice outbound replies (reply-to-email trick)
+    "gv_smtp_host": "smtp.gmail.com",
+    "gv_smtp_port": 587,
     "poll_interval": 2,
     "display_duration": 10,
     "max_messages_per_phone": 5,
@@ -171,6 +273,7 @@ DEFAULT_CONFIG = {
     "allow_duplicate_names": False,
     "sms_response_duplicate": False,
     "sms_response_invalid_format": False,
+    "sms_response_too_long": False,
     "sms_response_not_whitelisted": False,
     "sms_response_blocked": False,
     "response_show_not_live": "Ho, Ho, Ho, It looks like our show isn't running now. Try again later.",
@@ -179,14 +282,19 @@ DEFAULT_CONFIG = {
     "response_blocked": "Sorry, Your phone number has been blocked from sending messages.",
     "response_rate_limited": "You've reached the maximum number of messages allowed. Please try again tomorrow!",
     "response_duplicate": "You've already sent this name today!",
-    "response_invalid_format": "Please send only a name (1-2 words, no sentences).",
+    "response_invalid_format": "Please send only 1 name ({words}, no sentences).",
+    "response_too_long": "I'm sorry, your message exceeds our max message length. Please only send your name.",
     "response_not_whitelisted": "Sorry, that name is not on our approved list and cannot be shown.",
 }
 
 config = DEFAULT_CONFIG.copy()
 twilio_client = None
 last_message_sid = None
+last_gv_uid = None
 polling_thread = None
+polling_source = None      # which message source the live polling_thread serves
+polling_generation = 0     # bumped to retire an obsolete poller when source changes
+_gv_reply_ctx = None       # reply target/headers for the GV message being processed
 display_thread = None
 stop_polling = False
 stop_display = False
@@ -198,23 +306,53 @@ queue_lock = threading.Lock()
 
 def load_config():
     """Load configuration from file, merging with defaults so new settings survive updates"""
-    global config, twilio_client, last_message_sid
+    global config, twilio_client, last_message_sid, last_gv_uid
     try:
         with open(CONFIG_FILE, 'r') as f:
             loaded = json.load(f)
-            config.update(loaded)
 
-        # If the plugin was updated and new default keys were added, save them
-        # back so the file stays complete across updates
-        new_keys = set(DEFAULT_CONFIG.keys()) - set(loaded.keys())
-        if new_keys:
+        secrets = load_secrets()
+        # One-time migration: older versions stored credentials inside plugin.json.
+        # Move any inline secrets into the owner-only secrets file and strip them
+        # from the main config so they never get rewritten to plugin.json.
+        migrated = False
+        for k in SECRET_KEYS:
+            if k in loaded:
+                if loaded[k] and not secrets.get(k):
+                    secrets[k] = loaded[k]
+                    migrated = True
+                del loaded[k]
+
+        config.update(loaded)
+        config.update(secrets)
+
+        # If the plugin was updated and new default keys were added (or we just
+        # migrated secrets out), save so the files stay complete/clean.
+        present = set(loaded.keys()) | set(secrets.keys())
+        new_keys = set(DEFAULT_CONFIG.keys()) - present
+        if new_keys or migrated:
             save_config()
-            logging.info(f"Saved {len(new_keys)} new default setting(s) after update: {new_keys}")
+            if migrated:
+                logging.info("Migrated inline credentials into the owner-only secrets file")
+            if new_keys:
+                logging.info(f"Saved {len(new_keys)} new default setting(s) after update: {new_keys}")
 
         # Migrate old scroll_speed values (pre-v2.6 stored raw px/s, now 1-10 scale)
         if config.get('scroll_speed', 5) > 10:
             config['scroll_speed'] = 5
             save_config()
+
+        # Upgrade legacy Invalid Format defaults to the dynamic {words} default so
+        # the reply reflects the active word limit. Only touches known old defaults,
+        # never a genuinely customized message.
+        _legacy_invalid = {
+            "Please send only a name (1-2 words, no sentences).",
+            "Please send only 1 name (1-2 words, no sentences).",
+        }
+        if config.get('response_invalid_format', '') in _legacy_invalid:
+            config['response_invalid_format'] = DEFAULT_CONFIG['response_invalid_format']
+            save_config()
+            logging.info("Upgraded Invalid Format response to the dynamic {words} default")
 
         # Migrate old message_template to message_lines (introduced in v2.6)
         if 'message_lines' not in loaded and 'message_template' in loaded:
@@ -287,6 +425,12 @@ def load_config():
         except:
             last_message_sid = None
 
+        # Resume Google Voice dedup marker across restarts (None => anchor to
+        # newest on first poll so the whole inbox isn't replayed)
+        last_gv_uid = load_last_gv_uid()
+
+        save_config()
+
         logging.info("Configuration loaded successfully")
     except FileNotFoundError:
         save_config()
@@ -294,14 +438,76 @@ def load_config():
     except Exception as e:
         logging.error(f"Error loading config: {e}")
 
-def save_config():
-    """Save configuration to file"""
+def load_secrets():
+    """Read credentials from the owner-only secrets file. Returns {} if absent."""
     try:
+        with open(SECRETS_FILE, 'r') as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    except Exception as e:
+        logging.error(f"Error loading secrets: {e}")
+        return {}
+
+def save_config():
+    """Persist configuration. Credentials are written to the owner-only secrets
+    file (chmod 600); everything else goes to plugin.json (also 600, without the
+    secrets). `config` in memory always holds the merged view."""
+    try:
+        # Secrets → owner-only file, never into plugin.json/logs/backups.
+        secrets_out = {k: config[k] for k in SECRET_KEYS if config.get(k)}
+        os.makedirs(SECRETS_DIR, exist_ok=True)
+        try:
+            os.chmod(SECRETS_DIR, 0o700)
+        except OSError:
+            pass
+        with open(SECRETS_FILE, 'w') as f:
+            json.dump(secrets_out, f, indent=2)
+        try:
+            os.chmod(SECRETS_FILE, 0o600)
+        except OSError:
+            pass
+
+        # Everything except the secrets → main config file.
+        main_out = {k: v for k, v in config.items() if k not in SECRET_KEYS}
         with open(CONFIG_FILE, 'w') as f:
-            json.dump(config, f, indent=2)
+            json.dump(main_out, f, indent=2)
+        try:
+            os.chmod(CONFIG_FILE, 0o600)
+        except OSError:
+            pass
         logging.info("Configuration saved")
     except Exception as e:
         logging.error(f"Error saving config: {e}")
+
+
+def _response_is_muted(message_type):
+    """Return True when this auto-response must not send right now because a
+    companion setting has "greyed it out" — WITHOUT touching the stored toggle.
+
+    The config page disables (greys) a response row when another setting makes
+    it moot, but deliberately never unchecks the toggle, so the user's on/off
+    choice survives the row un-greying. We mirror that on the backend: the send
+    path honors the mute at runtime, while plugin.json keeps the last state. The
+    toggle only ever changes when the user changes it.
+
+      - Any response over Twilio — the plugin has no Twilio reply path, so the
+        SMS Responses tab is hidden and nothing may send.
+      - rate-limited when Max Messages Per Phone is 0 (nobody is ever limited).
+      - duplicate    when Allow Duplicate Names is on (never a duplicate).
+
+    Invalid-Format / Too-Long / Not-Whitelisted are intentionally NOT muted
+    here: the single-name path greys them under the whitelist, but the
+    grouped-text path reuses the Invalid-Format reply for whitelist rejects,
+    and their single-name triggers can't fire in the greyed case anyway."""
+    if config.get('message_source', 'twilio') != 'google_voice':
+        return True
+    if message_type == 'rate_limited' and config.get('max_messages_per_phone', 0) == 0:
+        return True
+    if message_type == 'duplicate' and config.get('allow_duplicate_names', False):
+        return True
+    return False
 
 _font_path_cache = {}
 
@@ -1372,35 +1578,120 @@ def is_on_whitelist(name):
     return name_lower in whitelist
 
 def send_sms_response(to_phone, message_type):
-    """Send an SMS response to the user based on message type"""
-    if not SMS_AUTO_RESPONSES_ENABLED:
-        return False
+    """Send an SMS response to the user based on message type.
 
+    Twilio: sends via the Twilio API. Google Voice: sends by replying to the
+    forwarding email (Google Voice converts an email reply into an outbound SMS),
+    using the reply context captured by the poller for the current message."""
     if not config.get(f'sms_response_{message_type}', False):
         return False
-    
-    if not twilio_client:
-        logging.warning("Cannot send SMS response: Twilio client not initialized")
+
+    # Honor the "greyed out" state at send time without ever having persisted
+    # the toggle to off, so the stored on/off choice survives the row un-greying.
+    if _response_is_muted(message_type):
         return False
-    
+
     # Get the appropriate response message
     response_key = f"response_{message_type}"
     response_message = config.get(response_key, "")
-    
+
     if not response_message:
         logging.warning(f"No response message configured for type: {message_type}")
         return False
-    
+
+    # {words} expands to the active word-limit phrase ("1 word" / "2 words"),
+    # so the Invalid Format reply always matches the current Name Format Rule.
+    response_message = response_message.replace('{words}', word_rule_phrase())
+
+    return send_sms_text(to_phone, response_message, message_type)
+
+
+def send_sms_text(to_phone, text, message_type="message"):
+    """Send arbitrary SMS text to a recipient via the active message source.
+
+    Lower-level than send_sms_response(): it does NOT consult the per-type
+    enable toggles or response templates, so it's used for dynamically built
+    messages such as the multi-name batch summary. Routing (Twilio REST vs
+    Google Voice reply-to-email) matches send_sms_response()."""
+    if not text:
+        return False
+
+    # Google Voice: reply-to-email path
+    if config.get('message_source') == 'google_voice':
+        return send_gv_reply(text, message_type)
+
+    # Twilio: REST API path
+    if not twilio_client:
+        logging.warning("Cannot send SMS: Twilio client not initialized")
+        return False
+
     try:
         twilio_client.messages.create(
-            body=response_message,
+            body=text,
             from_=config['twilio_phone_number'],
             to=to_phone
         )
-        logging.info(f"📤 Sent SMS response to {to_phone[-4:]}: {message_type}")
+        logging.info(f"📤 Sent SMS to {to_phone[-4:]}: {message_type}")
         return True
     except Exception as e:
-        logging.error(f"Error sending SMS response: {e}")
+        logging.error(f"Error sending SMS: {e}")
+        return False
+
+
+def _sanitize_header(value):
+    """Strip CR/LF (and stray control chars) from values that come from an inbound
+    email before they go into outbound reply headers, so a crafted message can't
+    inject extra headers (LOW-2 — email header injection)."""
+    if value is None:
+        return ''
+    return re.sub(r'[\r\n\x00]+', ' ', str(value)).strip()
+
+def send_gv_reply(text, message_type="", ctx=None):
+    """Send an outbound SMS via Google Voice by replying to the forwarding email.
+
+    Replying to the notification email from the same Gmail account causes Google
+    Voice to deliver the reply body as an SMS to the original sender. Uses the
+    reply context (target address + threading headers) — an explicit `ctx` when
+    given (e.g. a manual reply from the queue page, resolved from the message
+    log), otherwise the one captured by the poller for the message currently
+    being processed."""
+    ctx = ctx if ctx is not None else _gv_reply_ctx
+    if not ctx or not ctx.get('to'):
+        logging.warning("GV reply: no reply context for current message; cannot respond")
+        return False
+
+    email_addr = config.get('gv_email', '').strip()
+    app_pw = config.get('gv_app_password', '').strip()
+    if not email_addr or not app_pw:
+        logging.warning("GV reply: Gmail address / app password not configured")
+        return False
+
+    try:
+        from email.mime.text import MIMEText
+        reply = MIMEText(text, 'plain', 'utf-8')
+        reply['From'] = email_addr
+        reply['To'] = _sanitize_header(ctx['to'])
+        subj = _sanitize_header(ctx.get('subject', '')) or "Re: text message"
+        reply['Subject'] = subj if subj[:3].lower() == 're:' else ('Re: ' + subj)
+        # Thread the reply to the original so Google Voice associates it with the
+        # right conversation.
+        if ctx.get('message_id'):
+            reply['In-Reply-To'] = _sanitize_header(ctx['message_id'])
+            refs = _sanitize_header((ctx.get('references', '') + ' ' + ctx['message_id']).strip())
+            reply['References'] = refs
+
+        host = config.get('gv_smtp_host', 'smtp.gmail.com')
+        port = int(config.get('gv_smtp_port', 587))
+        with smtplib.SMTP(host, port, timeout=20) as s:
+            s.ehlo()
+            s.starttls()
+            s.ehlo()
+            s.login(email_addr, app_pw)
+            s.sendmail(email_addr, [ctx['to']], reply.as_string())
+        logging.info(f"📤 Sent Google Voice reply ({message_type}) to {ctx['to']}")
+        return True
+    except Exception as e:
+        logging.error(f"Error sending Google Voice reply: {e}")
         return False
 
 def extract_name(message):
@@ -1412,27 +1703,78 @@ def extract_name(message):
     
     if message:
         message = message.title()
-    
-    max_len = config.get('max_message_length', 30)
-    return message[:max_len] if message else "Guest"
+
+    # No length truncation here — an over-length name is REJECTED by
+    # is_valid_name() (Too Long) rather than silently trimmed to fit, so the
+    # sender is told to shorten it instead of a chopped name being displayed.
+    return message if message else "Guest"
+
+def is_non_name_message(body):
+    """True if an inbound message is a phone 'tapback'/reaction or contains no
+    letters at all (emoji / punctuation only).
+
+    These are courtesy replies to the display notification, not name
+    submissions, so callers should silently ignore them instead of firing an
+    invalid_format (or any) auto-response.
+
+    A message with zero ASCII letters can never yield a valid name anyway —
+    extract_name() strips to [a-zA-Z\\s-], so it would collapse to "Guest" —
+    which makes dropping it safe as well as correct."""
+    text = (body or '').strip()
+    if not text:
+        return True
+
+    # iOS / RCS tapback reactions delivered over SMS, e.g.:
+    #   Loved "…"   Liked "…"   Disliked "…"   Laughed at "…"
+    #   Emphasized "…"   Questioned "…"   Reacted 😂 to "…"
+    if re.match(r'^(loved|liked|disliked|laughed at|emphasized|questioned|reacted\b.*?\bto)\s+["\'“‘”’]',
+                text, flags=re.IGNORECASE):
+        return True
+
+    # No ASCII letters anywhere → emoji / symbols / punctuation only
+    if not re.search(r'[a-zA-Z]', text):
+        return True
+
+    return False
 
 def is_valid_name(text):
-    """Check if text is a valid name"""
+    """Validate a name. Returns (ok, reason) where reason is '' when ok, else a
+    code the caller maps to a response:
+      - 'too_long'   : exceeds Max Message Length
+      - 'word_count' : violates the One Word / Two Words rule
+
+    Length is checked FIRST, so an over-length name reports 'too_long' even when
+    it also breaks the word rule. Length is enforced regardless of the word
+    toggles (the caller only skips this whole check when the whitelist is on,
+    where Max Message Length doesn't apply)."""
     text = ' '.join(text.split())
     words = text.split()
     word_count = len(words)
-    
+
+    max_len = config.get('max_message_length', 30)
+    if len(text) > max_len:
+        return False, "too_long"
+
     if config.get('one_word_only', False):
         if word_count != 1:
-            return False, "Please send only a first name (one word)"
+            return False, "word_count"
     elif config.get('two_words_max', True):
         if word_count > 2:
-            return False, "Please send only a name (1-2 words, no sentences)"
-    
-    if len(text) > 50:
-        return False, "Message too long - please send only a name"
-    
+            return False, "word_count"
+
     return True, ""
+
+def word_rule_phrase():
+    """Human phrase for the current name word-limit ('1 word' / '2 words').
+
+    Used to expand the {words} placeholder in the Invalid Format auto-response
+    and in the UI help text, so the reply always matches the active Name Format
+    Rule. Mirrors is_valid_name()'s precedence (One Word Only wins)."""
+    if config.get('one_word_only', False):
+        return "1 word"
+    if config.get('two_words_max', True):
+        return "2 words"
+    return "1-2 words"
 
 # ============================================================================
 # OPTIMIZED PROFANITY FILTER - WITH CACHING AND PRE-COMPILED REGEX
@@ -1548,6 +1890,79 @@ def get_day_log_path(date=None):
         date = datetime.now().date()
     return os.path.join(MESSAGES_DIR, f"messages_{date.isoformat()}.json")
 
+def mask_phone(p):
+    """Redact a phone number to its last 4 digits for display/API responses —
+    full numbers are kept only in the on-disk logs and never sent to the browser.
+    Passes through the 'Local Testing' sentinel and empty values unchanged."""
+    if not p or p == 'Local Testing':
+        return p
+    digits = re.sub(r'\D', '', str(p))
+    return '***' + digits[-4:] if len(digits) >= 4 else '***'
+
+def redact_messages(messages, log_date):
+    """Return copies of message log entries with phone numbers masked to last-4,
+    tagged with their log date so the UI can reference a message for blocking
+    without ever holding the full number (see _phone_from_log_ref)."""
+    out = []
+    for m in messages:
+        m = dict(m)
+        masked = mask_phone(m.get('phone_full') or m.get('phone'))
+        m['phone'] = masked
+        m['phone_full'] = masked
+        m['_log_date'] = log_date
+        # Expose only whether a reply is possible; the stored reply context
+        # (real reply-to address + threading headers) never leaves the server.
+        m['can_respond'] = bool((m.get('reply_ctx') or {}).get('to'))
+        m.pop('reply_ctx', None)
+        out.append(m)
+    return out
+
+def _phone_from_log_ref(date_str, ts):
+    """Resolve the full phone number of a stored message by (date, timestamp).
+    Full numbers stay server-side; the UI only ever holds the masked value plus
+    this reference, so blocking-from-history still works without exposing PII."""
+    try:
+        if date_str:
+            path = get_day_log_path(datetime.strptime(date_str, "%Y-%m-%d").date())
+        else:
+            path = get_day_log_path()
+        with open(path, 'r') as f:
+            messages = json.load(f)
+        for m in messages:
+            if m.get('timestamp') == ts:
+                return m.get('phone_full') or m.get('phone')
+    except Exception as e:
+        logging.error(f"Block-by-reference resolve failed: {e}")
+    return None
+
+def _reply_ctx_from_log_ref(date_str, ts):
+    """Resolve the stored Google Voice reply context of a logged message by
+    (date, timestamp). Mirrors _phone_from_log_ref: the reply-to address and
+    threading headers stay server-side, so the browser only ever holds the
+    (date, ts) reference — never the real address."""
+    try:
+        if date_str:
+            path = get_day_log_path(datetime.strptime(date_str, "%Y-%m-%d").date())
+        else:
+            path = get_day_log_path()
+        with open(path, 'r') as f:
+            messages = json.load(f)
+        for m in messages:
+            if m.get('timestamp') == ts:
+                return m.get('reply_ctx')
+    except Exception as e:
+        logging.error(f"Reply-context resolve failed: {e}")
+    return None
+
+def _client_error(context, exc, status=None):
+    """Log the real exception server-side and return a generic message to the
+    browser, so internal paths / exception detail never leak in a response
+    (LOW-3). Preserves the original HTTP status when one is given."""
+    logging.error(f"{context}: {exc}")
+    body = jsonify({"success": False,
+                    "error": "An internal error occurred. See the plugin log for details."})
+    return (body, status) if status else body
+
 def cleanup_old_logs():
     """Delete daily message log files older than 7 days from MESSAGES_DIR."""
     try:
@@ -1601,7 +2016,9 @@ def get_message_count(phone):
             logs = json.load(f)
         today = datetime.now().date()
         return sum(1 for log in logs
-                   if log.get('phone_full') == phone and _parse_log_date(log) == today)
+                   if log.get('phone_full') == phone
+                   and _parse_log_date(log) == today
+                   and log.get('counts_toward_limit', True))
     except (FileNotFoundError, json.JSONDecodeError):
         return 0
     except Exception as e:
@@ -1635,8 +2052,29 @@ def save_last_sid(sid):
     except Exception as e:
         logging.error(f"Error saving last SID: {e}")
 
-def log_message(phone, message, name, status):
-    """Log received message to today's daily log file."""
+def save_last_gv_uid(uid):
+    """Persist the last processed Google Voice IMAP UID for dedup across restarts"""
+    try:
+        with open(LAST_GV_UID_FILE, 'w') as f:
+            f.write(str(uid))
+    except Exception as e:
+        logging.error(f"Error saving last GV UID: {e}")
+
+def load_last_gv_uid():
+    """Read the persisted Google Voice IMAP UID, or None if not set yet"""
+    try:
+        with open(LAST_GV_UID_FILE, 'r') as f:
+            val = f.read().strip()
+            return val or None
+    except Exception:
+        return None
+
+def log_message(phone, message, name, status, counts=True):
+    """Log received message to today's daily log file.
+
+    counts=False marks this row as NOT counting toward the per-phone daily
+    message limit (see get_message_count). Used for rejected/queued grouped
+    (multi-name) texts, which never consume a sender's allowance."""
     try:
         log_path = get_day_log_path()
         try:
@@ -1644,14 +2082,22 @@ def log_message(phone, message, name, status):
                 logs = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             logs = []
-        logs.append({
+        entry = {
             "timestamp": datetime.now().isoformat(),
             "phone": phone,
             "phone_full": phone,
             "message": message,
             "extracted_name": name,
-            "status": status
-        })
+            "status": status,
+            "counts_toward_limit": counts
+        }
+        # Under Google Voice, stash how to reply to this exact message (target
+        # address + threading headers) so the queue page's Respond button can
+        # answer it later. Kept server-side only — redact_messages() strips it
+        # before anything reaches the browser.
+        if config.get('message_source') == 'google_voice' and _gv_reply_ctx and _gv_reply_ctx.get('to'):
+            entry["reply_ctx"] = _gv_reply_ctx
+        logs.append(entry)
         with open(log_path, 'w') as f:
             json.dump(logs, f, indent=2)
         logging.info(f"✅ Message logged: {phone[-4:]} | {name} | {status}")
@@ -2221,6 +2667,159 @@ def get_queue_status():
     
     return status
 
+def parse_name_list(body):
+    """If `body` is a genuine multi-name list — names separated by commas or
+    line breaks, with 2+ that pass name validation — return the list of
+    extracted names. Otherwise return None, signalling the caller to handle the
+    message as a single submission (unchanged behavior).
+
+    Only commas and line breaks separate names — NEVER spaces — so multi-word
+    names like "Jean Luke" and hyphenated names like "Jean-Luke" each stay a
+    single name."""
+    tokens = [t.strip() for t in re.split(r'[\n\r,]+', body)]
+    tokens = [t for t in tokens if t and re.search(r'[a-zA-Z]', t)]
+    if len(tokens) < 2:
+        return None
+
+    max_names = config.get('max_names_per_text', 25)
+    names = []
+    valid_count = 0
+    for t in tokens[:max_names]:
+        nm = extract_name(t)
+        if nm == "Guest":          # greeting-only / no usable letters — drop noise
+            continue
+        names.append(nm)
+        if is_valid_name(nm)[0]:
+            valid_count += 1
+
+    # Require at least two real names before treating it as a list, so an
+    # ordinary sentence that happens to contain a comma isn't chopped up.
+    if valid_count < 2:
+        return None
+    return names
+
+def process_incoming_message(from_number, body):
+    """Run one inbound message through the full pipeline: show-live check →
+    blocked → name extraction → rate limit → duplicate → whitelist → profanity
+    → queue, sending the appropriate auto-response along the way.
+
+    Source-agnostic — used by both poll_twilio() and poll_google_voice(). Only
+    needs the sender identity and message text; per-source dedup bookkeeping
+    (SID / IMAP UID) stays in the caller. Behavior is identical to the logic
+    that previously lived inline in poll_twilio()."""
+    # Phone 'tapback' reactions and emoji-only replies to the display
+    # notification are courtesy responses, not name submissions — silently
+    # drop them so we never fire an invalid_format (or any) auto-response.
+    # Returning normally lets the caller advance its dedup marker.
+    if is_non_name_message(body):
+        logging.info(f"🙈 Ignored reaction/emoji-only reply from {from_number[-4:]}: '{body[:30]}'")
+        return
+
+    if not config.get('enabled', False):
+        # Show not live — reply if enabled, then discard
+        if not is_blocked(from_number):
+            send_sms_response(from_number, "show_not_live")
+            log_message(from_number, body, "", "show_not_live")
+            logging.info(f"🔴 Show not live reply sent to {from_number[-4:]}")
+        return
+
+    # Exactly one branch fires — only one SMS response is ever sent per message
+    if is_blocked(from_number):
+        logging.info(f"🚫 Blocked: {from_number[-4:]}")
+        log_message(from_number, body, "", "blocked")
+        send_sms_response(from_number, "blocked")
+
+    elif parse_name_list(body) is not None:
+        # ── Grouped / multi-name text (commas or line breaks, 2+ valid names) ──
+        # To keep the sender experience simple, a grouped text is all-or-nothing
+        # and is ONLY accepted when the box is fully "open": no rate limiting,
+        # duplicates allowed, and every name valid / whitelisted. Any restriction
+        # rejects the whole text with the Invalid Format reply, and that
+        # rejection does NOT count against the sender's daily message allowance.
+        names     = parse_name_list(body)
+        max_msgs  = config.get('max_messages_per_phone', 0)
+        allow_dup = config.get('allow_duplicate_names', False)
+        use_wl    = config.get('use_whitelist', False)
+
+        # Mirror the single-name rule: validate format when the whitelist is off,
+        # validate against the whitelist when it's on (never both).
+        bad_format = (not use_wl) and any(not is_valid_name(nm)[0] for nm in names)
+        not_wl     = use_wl and any(not is_on_whitelist(nm) for nm in names)
+
+        if max_msgs > 0 or not allow_dup or bad_format or not_wl:
+            logging.info(f"❌ Grouped text not allowed here → invalid: {from_number[-4:]} "
+                         f"(rate_limit={max_msgs>0}, dup_off={not allow_dup}, "
+                         f"bad_format={bad_format}, not_whitelisted={not_wl})")
+            log_message(from_number, body, "", "invalid_format", counts=False)
+            send_sms_response(from_number, "invalid_format")
+
+        elif config['profanity_filter'] and contains_profanity(body):
+            # Any profanity anywhere fails the whole message.
+            logging.info(f"❌ Grouped text profanity rejected: {from_number[-4:]}")
+            log_message(from_number, body, "", "profanity", counts=False)
+            send_sms_response(from_number, "profanity")
+
+        else:
+            # Fully open + clean → queue every name, one Success reply.
+            queued = []
+            for nm in names:
+                if add_to_queue(nm, from_number, body):
+                    logging.info(f"✅ Queued: {nm}")
+                    log_message(from_number, body, nm, "queued", counts=False)
+                    queued.append(nm)
+                else:
+                    logging.warning(f"❌ Queue error: {nm}")
+                    log_message(from_number, body, nm, "error", counts=False)
+            if queued:
+                logging.info(f"✅ Grouped text queued {len(queued)} name(s): {from_number[-4:]}")
+                send_sms_response(from_number, "success")
+
+    else:
+        # ── Single-name text (original behavior) ──
+        name = extract_name(body)
+        logging.debug(f"👤 Extracted name: '{name}'")
+        max_msgs = config.get('max_messages_per_phone', 0)
+        msg_count = get_message_count(from_number) if max_msgs > 0 else 0
+        is_valid, reason = is_valid_name(name)
+
+        if max_msgs > 0 and msg_count >= max_msgs:
+            logging.info(f"⛔ Rate limited: {from_number[-4:]}")
+            log_message(from_number, body, "", "rate_limited")
+            send_sms_response(from_number, "rate_limited")
+
+        elif not config.get('allow_duplicate_names', False) and has_sent_name_today(from_number, name):
+            logging.info(f"🔄 Duplicate name: {name}")
+            log_message(from_number, body, name, "duplicate_name_today")
+            send_sms_response(from_number, "duplicate")
+
+        elif not is_valid and not config.get('use_whitelist', False):
+            # Too Long (over Max Message Length) gets its own response; any other
+            # format failure (word count) gets the Invalid Format response.
+            resp = "too_long" if reason == "too_long" else "invalid_format"
+            logging.info(f"❌ {resp}: '{body[:30]}'")
+            log_message(from_number, body, name, resp)
+            send_sms_response(from_number, resp)
+
+        elif not is_on_whitelist(name):
+            logging.info(f"❌ Not on whitelist: {name}")
+            log_message(from_number, body, name, "not_on_whitelist")
+            send_sms_response(from_number, "not_whitelisted")
+
+        elif config['profanity_filter'] and contains_profanity(body):
+            logging.info(f"❌ Profanity rejected")
+            log_message(from_number, body, name, "profanity")
+            send_sms_response(from_number, "profanity")
+
+        else:
+            if add_to_queue(name, from_number, body):
+                logging.info(f"✅ Queued: {name}")
+                log_message(from_number, body, name, "queued")
+                send_sms_response(from_number, "success")
+            else:
+                logging.warning(f"❌ Queue error: {name}")
+                log_message(from_number, body, name, "error")
+
+
 def poll_twilio():
     """Poll Twilio for new messages"""
     global last_message_sid, stop_polling
@@ -2229,8 +2828,9 @@ def poll_twilio():
     first_run = last_message_sid is None
     thread_start_time = datetime.now(timezone.utc)  # used to skip pre-start messages on first run
     _current_day = datetime.now().date()
+    my_gen = polling_generation  # exit if a source switch retires this poller
 
-    while not stop_polling:
+    while not stop_polling and my_gen == polling_generation:
         try:
             # Midnight cleanup — delete daily log files older than 7 days
             today = datetime.now().date()
@@ -2292,64 +2892,9 @@ def poll_twilio():
                 logging.info(f"📱 SMS from {from_number[-4:]}: '{body[:30]}'")  # keep at INFO — new message is significant
 
                 try:
-                    if not config.get('enabled', False):
-                        # Show not live — reply if enabled, then discard
-                        if not is_blocked(from_number):
-                            send_sms_response(from_number, "show_not_live")
-                            log_message(from_number, body, "", "show_not_live")
-                            logging.info(f"🔴 Show not live reply sent to {from_number[-4:]}")
-                        last_message_sid = msg.sid
-                        save_last_sid(msg.sid)
-                        continue
-
-                    # Exactly one branch fires — only one SMS response is ever sent per message
-                    if is_blocked(from_number):
-                        logging.info(f"🚫 Blocked: {from_number[-4:]}")
-                        log_message(from_number, body, "", "blocked")
-                        send_sms_response(from_number, "blocked")
-
-                    else:
-                        name = extract_name(body)
-                        logging.debug(f"👤 Extracted name: '{name}'")
-                        max_msgs = config.get('max_messages_per_phone', 0)
-                        msg_count = get_message_count(from_number) if max_msgs > 0 else 0
-                        is_valid, _ = is_valid_name(name)
-
-                        if max_msgs > 0 and msg_count >= max_msgs:
-                            logging.info(f"⛔ Rate limited: {from_number[-4:]}")
-                            log_message(from_number, body, "", "rate_limited")
-                            send_sms_response(from_number, "rate_limited")
-
-                        elif not config.get('allow_duplicate_names', False) and has_sent_name_today(from_number, name):
-                            logging.info(f"🔄 Duplicate name: {name}")
-                            log_message(from_number, body, name, "duplicate_name_today")
-                            send_sms_response(from_number, "duplicate")
-
-                        elif not is_valid and not config.get('use_whitelist', False):
-                            logging.info(f"❌ Invalid format: '{body[:20]}'")
-                            log_message(from_number, body, name, "invalid_format")
-                            send_sms_response(from_number, "invalid_format")
-
-                        elif not is_on_whitelist(name):
-                            logging.info(f"❌ Not on whitelist: {name}")
-                            log_message(from_number, body, name, "not_on_whitelist")
-                            send_sms_response(from_number, "not_whitelisted")
-
-                        elif config['profanity_filter'] and contains_profanity(body):
-                            logging.info(f"❌ Profanity rejected")
-                            log_message(from_number, body, name, "profanity")
-                            send_sms_response(from_number, "profanity")
-
-                        else:
-                            success = add_to_queue(name, from_number, body)
-                            if success:
-                                logging.info(f"✅ Queued: {name}")
-                                log_message(from_number, body, name, "queued")
-                                send_sms_response(from_number, "success")
-                            else:
-                                logging.warning(f"❌ Queue error: {name}")
-                                log_message(from_number, body, name, "error")
-
+                    process_incoming_message(from_number, body)
+                    # Advance the dedup marker only on success — an exception
+                    # leaves the SID unsaved so the message is retried next poll.
                     last_message_sid = msg.sid
                     save_last_sid(msg.sid)
                     logging.debug(f"💾 Saved SID: {msg.sid[:10]}...")
@@ -2363,8 +2908,358 @@ def poll_twilio():
             logging.error(f"💥 Error polling Twilio: {e}")
         
         time.sleep(config['poll_interval'])
-    
+
     logging.info("🛑 Twilio polling stopped")
+
+
+# ============================================================================
+# GOOGLE VOICE SOURCE (Gmail IMAP scanning)
+# ----------------------------------------------------------------------------
+# Google Voice has no public API. When "Forward messages to email" is enabled in
+# Voice settings, each incoming SMS is emailed to the linked Gmail account from
+# an @txt.voice.google.com address. We scan that inbox over IMAP and feed parsed
+# messages through the same process_incoming_message() pipeline as Twilio.
+# Inbound-only in v1: no outbound auto-responses (see send_sms_response()).
+# ============================================================================
+
+# Markers that begin the Google Voice footer, which sits BELOW the SMS text.
+# Everything from the earliest marker onward is footer and is discarded. These
+# must be strings that only ever appear in the footer — NOT the bare
+# "voice.google.com" URL, which also appears in the logo link ABOVE the message.
+_GV_FOOTER_MARKERS = (
+    "YOUR ACCOUNT",
+    "To respond to this text message",
+    "This email was sent to you",
+    "This message was sent to you",
+)
+
+
+def _gv_decode_header(value):
+    """Decode an RFC 2047 encoded header (e.g. a UTF-8 sender name) to str."""
+    if not value:
+        return ""
+    try:
+        return str(make_header(decode_header(value))).strip()
+    except Exception:
+        return str(value).strip()
+
+
+def _gv_get_part_body(msg, want_type):
+    """Return the decoded body of the first part matching want_type
+    ('text/plain' or 'text/html'), or '' if none."""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == want_type and \
+               'attachment' not in str(part.get('Content-Disposition', '')).lower():
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or 'utf-8'
+                    return payload.decode(charset, errors='replace')
+        return ''
+    if msg.get_content_type() == want_type:
+        payload = msg.get_payload(decode=True)
+        if payload is None:
+            return msg.get_payload() or ''
+        charset = msg.get_content_charset() or 'utf-8'
+        return payload.decode(charset, errors='replace')
+    return ''
+
+
+def _gv_html_to_text(html):
+    """Crudely convert HTML to text for the fallback path: drop <style>/<script>,
+    replace tags with spaces, and unescape entities."""
+    import html as _html_mod
+    html = re.sub(r'(?is)<(style|script|head).*?</\1>', ' ', html)
+    text = re.sub(r'(?s)<[^>]+>', ' ', html)
+    return _html_mod.unescape(text)
+
+
+def _gv_extract_message(text):
+    """Pull just the SMS text out of a Google Voice forwarding-email body.
+
+    The GV plain-text layout is:
+        <blank lines>
+        <https://voice.google.com>       <- logo link (skip)
+        the actual message               <- one or more lines (keep)
+        YOUR ACCOUNT <...> HELP CENTER   <- footer starts here (cut)
+    So: cut everything from the footer down, then drop leading blank lines and
+    any bare <URL> logo/link lines, and join what's left.
+
+    The surviving lines are joined with newlines (not spaces) so that a
+    multi-line submission — e.g. a name list typed one-per-line — stays
+    multi-line, matching how Twilio delivers the raw SMS body. The payload was
+    already transfer-decoded upstream, so these newlines are the sender's real
+    line breaks, not email soft-wraps."""
+    if not text:
+        return ""
+    # Cut the footer (and everything after it)
+    cut = len(text)
+    for marker in _GV_FOOTER_MARKERS:
+        idx = text.find(marker)
+        if idx != -1:
+            cut = min(cut, idx)
+    head = text[:cut]
+
+    message_lines = []
+    for ln in head.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        # Skip the Google Voice logo/link line(s): a line that is only a <URL>
+        if re.fullmatch(r'<https?://[^>]+>', s):
+            continue
+        # Skip any leftover bare voice.google.com link fragments
+        if 'voice.google.com' in s and re.fullmatch(r'[<>\s]*https?://\S+[<>\s]*', s):
+            continue
+        message_lines.append(s)
+    return '\n'.join(message_lines).strip()
+
+
+def _gv_normalize_phone(text):
+    """Pull the first phone-number-looking run out of text and return it in
+    E.164-ish form (+1XXXXXXXXXX for US), or None."""
+    if not text:
+        return None
+    m = re.search(r'\+?\d[\d\-\.\s()]{6,}\d', text)
+    if not m:
+        return None
+    digits = re.sub(r'\D', '', m.group(0))
+    if len(digits) == 11 and digits.startswith('1'):
+        return '+' + digits
+    if len(digits) == 10:
+        return '+1' + digits
+    if len(digits) >= 7:
+        return '+' + digits
+    return None
+
+
+def _gv_sender_id(msg, display_name):
+    """Resolve the sender's phone number for a Google Voice forward, so the key
+    used for display / blocklist / rate-limiting is the actual number regardless
+    of whether the sender is a saved contact.
+
+    Sources, most reliable first:
+      1. Subject: "New text message from <name> (610) 809-3236" (sender only)
+      2. From local-part: "<yourGVnum>.<sendernum>.<token>@txt.voice.google.com"
+      3. The display name (contact name, or the raw number for unknown senders)
+    """
+    # 1) Subject line — contains only the sender's number
+    subj = _gv_decode_header(str(msg.get('Subject', '')))
+    num = _gv_normalize_phone(subj)
+    if num:
+        return num
+
+    # 2) From address local-part — segments are <GVnum>.<sendernum>.<token>;
+    #    the sender's number is the 2nd all-digit segment (1st is your own GV number)
+    _n, addr = email.utils.parseaddr(str(msg.get('From', '')))
+    local = addr.split('@', 1)[0]
+    numeric_segs = [s for s in local.split('.') if s.isdigit() and len(s) >= 10]
+    if len(numeric_segs) >= 2:
+        num = _gv_normalize_phone(numeric_segs[1])
+        if num:
+            return num
+    if len(numeric_segs) == 1:
+        num = _gv_normalize_phone(numeric_segs[0])
+        if num:
+            return num
+
+    # 3) Fall back to the display name (already the raw number for unknown senders)
+    if display_name and re.fullmatch(r'[\d\s\-\.\(\)\+]+', display_name):
+        n = _gv_normalize_phone(display_name)
+        if n:
+            return n
+    return display_name or "Guest"
+
+
+def parse_gv_email(raw_bytes):
+    """Parse a Google Voice SMS-forwarding email into (from_id, body).
+
+    The forwarding format is undocumented and can change, so this is deliberately
+    defensive and logs the raw email on failure so drift is diagnosable. Returns
+    None for mail that isn't a parseable GV SMS.
+
+    Sender identity: the From display name is the saved contact name, or — for an
+    unknown sender — the raw phone number. When it looks like a number we
+    normalize it to digits so blocklist / rate-limit keys line up with how a
+    number would be stored; otherwise the contact name is used as the key.
+    """
+    try:
+        msg = email.message_from_bytes(raw_bytes)
+
+        # Only handle mail actually forwarded by Google Voice
+        from_hdr = str(msg.get('From', ''))
+        if 'voice.google.com' not in from_hdr.lower():
+            return None
+
+        display_name, _addr = email.utils.parseaddr(from_hdr)
+        display_name = _gv_decode_header(display_name)
+
+        # The message text lives in the text/plain part, between the logo link
+        # and the footer. Fall back to the HTML part if plain yields nothing.
+        body = _gv_extract_message(_gv_get_part_body(msg, 'text/plain'))
+        if not body:
+            body = _gv_extract_message(_gv_html_to_text(_gv_get_part_body(msg, 'text/html')))
+
+        if not body:
+            logging.warning("GV email parsed but message body was empty; raw logged at debug")
+            logging.debug(f"GV raw (empty body): {raw_bytes[:2000]!r}")
+            return None
+
+        # Resolve the sender's actual phone number (Subject / From address),
+        # falling back to the display name — so blocklist / rate-limit / display
+        # key on the real number whether or not the sender is a saved contact.
+        from_id = _gv_sender_id(msg, display_name)
+
+        # Reply context: how to answer this message via the reply-to-email trick.
+        # Replying to the From address (with the original threading headers) makes
+        # Google Voice deliver the reply body as an SMS to the sender.
+        reply_ctx = {
+            'to': _addr,
+            'message_id': str(msg.get('Message-ID', '')).strip(),
+            'references': str(msg.get('References', '')).strip(),
+            'subject': _gv_decode_header(str(msg.get('Subject', ''))),
+        }
+
+        return from_id, body, reply_ctx
+    except Exception as e:
+        logging.error(f"Error parsing GV email: {e}")
+        logging.debug(f"GV raw (parse error): {raw_bytes[:2000]!r}")
+        return None
+
+
+def poll_google_voice():
+    """Poll a Gmail inbox (IMAP) for Google Voice SMS-forwarding emails and feed
+    them through the shared processing pipeline. Mirrors poll_twilio()'s loop
+    shape (midnight cleanup, first-run anchoring, per-message dedup)."""
+    global last_gv_uid, stop_polling, _gv_reply_ctx
+
+    logging.info("🚀 Google Voice polling started")
+    first_run = last_gv_uid is None
+    _current_day = datetime.now().date()
+    my_gen = polling_generation  # exit if a source switch retires this poller
+
+    while not stop_polling and my_gen == polling_generation:
+        try:
+            # Midnight cleanup — delete daily log files older than 7 days
+            today = datetime.now().date()
+            if today != _current_day:
+                _current_day = today
+                try:
+                    cleanup_old_logs()
+                    logging.error(f"🌙 Midnight: old daily logs cleaned up for {today}")
+                except Exception as e:
+                    logging.error(f"Error during midnight cleanup: {e}")
+
+            email_addr = config.get('gv_email', '').strip()
+            app_pw = config.get('gv_app_password', '').strip()
+            if not email_addr or not app_pw:
+                time.sleep(config.get('poll_interval', 2))
+                continue
+
+            imap = None
+            try:
+                imap = imaplib.IMAP4_SSL(config.get('gv_imap_host', 'imap.gmail.com'))
+                imap.login(email_addr, app_pw)
+                imap.select(config.get('gv_imap_folder', 'INBOX'))
+
+                # UIDs of all Google Voice messages (IMAP FROM matches a substring)
+                typ, data = imap.uid('search', None, 'FROM', 'txt.voice.google.com')
+                raw_uids = data[0].split() if (typ == 'OK' and data and data[0]) else []
+                uids = [u.decode() if isinstance(u, bytes) else str(u) for u in raw_uids]
+
+                # Keep only UIDs newer than the last processed one (UIDs are
+                # monotonic within a mailbox)
+                if last_gv_uid:
+                    try:
+                        last_int = int(last_gv_uid)
+                        uids = [u for u in uids if int(u) > last_int]
+                    except ValueError:
+                        pass
+
+                if first_run:
+                    # Anchor to the newest UID so we don't replay the inbox backlog
+                    if uids:
+                        newest = max(int(u) for u in uids)
+                        last_gv_uid = str(newest)
+                        save_last_gv_uid(last_gv_uid)
+                    first_run = False
+                    uids = []
+                    logging.info("⚙️ GV first run: baseline UID set, backlog skipped")
+
+                for uid in sorted(uids, key=int):
+                    try:
+                        typ, msg_data = imap.uid('fetch', uid, '(RFC822)')
+                        if typ == 'OK' and msg_data and msg_data[0]:
+                            raw = msg_data[0][1]
+                            parsed = parse_gv_email(raw)
+                            if parsed:
+                                from_id, body, reply_ctx = parsed
+                                logging.info(f"📱 GV SMS from {from_id[-4:]}: '{body[:30]}'")
+                                # Make the reply target available to send_sms_response
+                                # for the duration of this message's processing.
+                                _gv_reply_ctx = reply_ctx
+                                try:
+                                    process_incoming_message(from_id, body)
+                                finally:
+                                    _gv_reply_ctx = None
+                    except Exception as e:
+                        logging.error(f"💥 EXCEPTION processing GV message {uid}: {e}")
+                        import traceback
+                        logging.error(traceback.format_exc())
+                    # Advance the dedup marker even for skipped/unparseable mail so
+                    # the same UID isn't fetched again forever
+                    last_gv_uid = uid
+                    save_last_gv_uid(uid)
+            finally:
+                if imap is not None:
+                    try:
+                        imap.logout()
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            logging.error(f"💥 Error polling Google Voice: {e}")
+
+        time.sleep(config.get('poll_interval', 2))
+
+    logging.info("🛑 Google Voice polling stopped")
+
+
+def start_polling_if_needed():
+    """Ensure the polling thread for the currently selected message source is
+    running (and that no poller for the *other* source is). Returns True if a
+    poller is (or is now) running for the selected source.
+
+    If a poller for a different source is already live, its generation is bumped
+    so it exits on its next loop, and a fresh poller is started — this lets the
+    provider be switched from the UI without a service restart."""
+    global polling_thread, polling_source, polling_generation
+
+    source = config.get('message_source', 'twilio')
+    if source == 'google_voice':
+        if not (config.get('gv_email') and config.get('gv_app_password')):
+            logging.warning("⚠️  Google Voice selected but email/app password not set; polling not started")
+            return False
+        target = poll_google_voice
+    else:
+        if not twilio_client:
+            return False
+        target = poll_twilio
+
+    # Correct poller already running — nothing to do
+    if polling_thread and polling_thread.is_alive() and polling_source == source:
+        return True
+
+    # Bumping the generation retires any poller currently running for the other
+    # source (it sees my_gen != polling_generation and exits its loop).
+    polling_generation += 1
+    polling_thread = threading.Thread(target=target, daemon=True)
+    polling_source = source
+    polling_thread.start()
+    logging.info(f"▶️  Polling started ({source})")
+    return True
+
+
 @app.route('/')
 def index():
     """Main configuration page"""
@@ -2372,7 +3267,7 @@ def index():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>FPP SMS Plugin Configuration</title>
+        <title>Text My Lights — Configuration</title>
         <style>
             body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #ffffff; color: #333; }
             h1 { color: #4CAF50; }
@@ -2420,13 +3315,13 @@ def index():
         <div class="tabs" style="display:flex; align-items:center; gap:2px;">
             <button class="tab-btn active" onclick="showTab('settings', this)">⚙️ Settings</button>
             <button class="tab-btn" onclick="showTab('display', this)">🖥️ Display</button>
-            {% if sms_responses_enabled %}<button class="tab-btn" onclick="showTab('sms', this)">📱 SMS Responses</button>{% endif %}
+            <button class="tab-btn" id="tabbtn-sms" onclick="showTab('sms', this)">📱 SMS Responses</button>
             <button class="tab-btn" onclick="showTab('testing', this)">🧪 Testing</button>
             <button class="view-btn" onclick="viewMessages()" style="margin:0 0 0 10px; padding:7px 14px; font-size:13px;">📋 View Message Queue</button>
             <span id="autosave_status" style="font-size:13px; margin-left:8px;"></span>
             <div style="margin-left:auto; display:flex; gap:4px; align-items:center;">
-                <button id="btn_twilio_start" onclick="twilioStart()" style="background:#2e7d32; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-size:12px; font-weight:bold; cursor:pointer;">▶ TwilioStart</button>
-                <button id="btn_twilio_stop" onclick="twilioStop()" style="background:#c62828; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-size:12px; font-weight:bold; cursor:pointer;">■ TwilioStop</button>
+                <button id="btn_twilio_start" onclick="twilioStart()" style="background:#2e7d32; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-size:12px; font-weight:bold; cursor:pointer;">▶ Text My Lights Start</button>
+                <button id="btn_twilio_stop" onclick="twilioStop()" style="background:#c62828; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-size:12px; font-weight:bold; cursor:pointer;">■ Text My Lights Stop</button>
             </div>
         </div>
 
@@ -2439,7 +3334,7 @@ def index():
         <!-- Plugin Not Live Banner -->
         <div id="plugin_not_live_banner" style="display:none; background:#b71c1c; color:#fff; padding:10px 16px; border-radius:5px; margin-top:10px; font-size:14px; font-weight:bold; align-items:center; gap:10px;">
             <span style="display:inline-block; width:12px; height:12px; background:#ff8a80; border-radius:50%; box-shadow:0 0 6px #ff8a80;"></span>
-            <span>Plugin is Not Live &mdash; Start Twilio to display incoming messages.<br>
+            <span>Plugin is Not Live &mdash; Press Text My Lights Start to display incoming messages.<br>
             <span style="font-weight:normal; font-size:12px;">Note: Viewers can still send messages, messaging rates will apply, but no messages will be displayed.</span></span>
         </div>
 
@@ -2450,31 +3345,57 @@ def index():
                 <!-- LEFT COLUMN: Twilio + FPP Display + Message Settings -->
                 <div class="column">
                     <div class="section">
-                        <h2>Twilio Settings</h2>
-                        <label>Enable Plugin:</label>
-                        <label class="toggle-switch"><input type="checkbox" id="enabled" {{ 'checked' if config.enabled else '' }}><span class="toggle-slider"></span></label>
-                        <label class="checkbox-label">Enable SMS polling</label>
+                        <h2>Message Source</h2>
+                        <label>SMS Provider:</label>
+                        <select id="message_source">
+                            <option value="twilio" {{ 'selected' if config.get('message_source','twilio') != 'google_voice' else '' }}>Twilio</option>
+                            <option value="google_voice" {{ 'selected' if config.get('message_source','twilio') == 'google_voice' else '' }}>Google Voice (Gmail)</option>
+                        </select>
+                        <p class="help-text"><a id="provider_help_link" href="plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=help.php#twilio" target="_top">View Twilio Configuration</a></p>
 
-                        <label>Twilio Account SID:</label>
-                        <input type="text" id="account_sid" value="{{ config.twilio_account_sid }}" placeholder="Starts with AC...">
+                        <!-- Twilio credentials — shown when Message Source = Twilio -->
+                        <div id="twilio_creds">
+                            <h3 style="margin:14px 0 6px;">Twilio Settings</h3>
+                            <label>Twilio Account SID:</label>
+                            <input type="text" id="account_sid" value="{{ config.twilio_account_sid }}" placeholder="Starts with AC...">
 
-                        <label>Twilio Auth Token:</label>
-                        <input type="password" id="auth_token" value="{{ config.twilio_auth_token }}">
+                            <label>Twilio Auth Token:</label>
+                            <input type="password" id="auth_token" autocomplete="new-password" onfocus="this.select()"
+                                   value="{{ secret_sentinel if config.twilio_auth_token else '' }}"
+                                   placeholder="Twilio Auth Token">
+                            {% if config.twilio_auth_token %}<p class="help-text">🔒 Saved. Leave the dots to keep it, type a new token to replace it, or clear the field to remove it.</p>{% endif %}
 
-                        <label>Twilio Phone Number:</label>
-                        <input type="text" id="phone_number" value="{{ config.twilio_phone_number }}" placeholder="+1234567890">
+                            <label>Twilio Phone Number:</label>
+                            <input type="text" id="phone_number" value="{{ config.twilio_phone_number }}" placeholder="+1234567890">
+
+                            <button class="test-btn" onclick="testConnection()">🔌 Test Twilio Connection</button>
+                            <div id="twilio_test_result" style="margin-top: 8px; font-size: 14px;"></div>
+                        </div>
+
+                        <!-- Google Voice credentials — shown when Message Source = Google Voice -->
+                        <div id="gv_creds" style="display:none;">
+                            <h3 style="margin:14px 0 6px;">Google Voice Settings</h3>
+                            <label>Gmail Address:</label>
+                            <input type="text" id="gv_email" value="{{ config.get('gv_email','') }}" placeholder="you@gmail.com">
+
+                            <label>App Password:</label>
+                            <input type="password" id="gv_app_password" autocomplete="new-password" onfocus="this.select()"
+                                   value="{{ secret_sentinel if config.get('gv_app_password') else '' }}"
+                                   placeholder="16-character app password">
+                            {% if config.get('gv_app_password') %}<p class="help-text">🔒 Saved. Leave the dots to keep it, type a new password to replace it, or clear the field to remove it.</p>{% endif %}
+
+                            <button class="test-btn" onclick="testGoogleVoice()">🔌 Test Google Voice Connection</button>
+                            <div id="gv_test_result" style="margin-top: 8px; font-size: 14px;"></div>
+                        </div>
 
                         <label>Poll Interval (seconds):</label>
                         <input type="number" id="poll_interval" value="{{ config.poll_interval }}" min="1" max="60">
-
-                        <button class="test-btn" onclick="testConnection()">🔌 Test Twilio Connection</button>
-                        <div id="twilio_test_result" style="margin-top: 8px; font-size: 14px;"></div>
 
                         <hr style="border: none; border-top: 1px solid #ddd; margin: 15px 0;">
                         <h2 style="margin-top: 0;">FPP Display Settings</h2>
 
                         <div id="fpp_content_live_warning" style="display:none; background:#b71c1c; color:#fff; border-radius:5px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
-                            🔴 <strong>Plugin is Live</strong> — run TwilioStop to edit
+                            🔴 <strong>Plugin is Live</strong> — run Text My Lights Stop to edit
                         </div>
                         <div id="fpp_content_inputs">
                             <label>Default "Waiting" Content: <span style="color:#f44336;font-size:12px;">* required</span></label>
@@ -2507,8 +3428,7 @@ def index():
                         <label>Display Duration (seconds):</label>
                         <input type="number" id="display_duration" value="{{ config.display_duration }}" min="5" max="300" onchange="if(window.renderCanvasPreview)window.renderCanvasPreview();">
                         <p class="help-text">⏱️ Each message displays for this many seconds before moving to the next</p>
-                        <p class="help-text">💡 Scrolling lines set to "Fit to time" use this as their scroll window — one full pass per display.</p>
-                        <p class="help-text">💡 Recommended: set this to a multiple of your Names Display Content sequence's length, so it doesn't cut off mid-loop</p>
+                        <p class="help-text">💡 Scrolling lines set to "Fit to time" use this as their scroll window.</p>
 
                         <label>Max Messages Per Phone (0 = unlimited):</label>
                         <input type="number" id="max_messages" value="{{ config.max_messages_per_phone }}" min="0" max="100">
@@ -2547,7 +3467,7 @@ def index():
 
                         <hr style="border:none; border-top:1px solid #444; margin:15px 0;">
 
-                        <label class="toggle-switch"><input type="checkbox" id="use_whitelist" {{ 'checked' if config.get('use_whitelist', False) else '' }} onchange="updateFormatRules(); checkFiltersState(); saveConfig();"><span class="toggle-slider"></span></label>
+                        <label class="toggle-switch"><input type="checkbox" id="use_whitelist" {{ 'checked' if config.get('use_whitelist', False) else '' }} onchange="updateFormatRules(); checkFiltersState(); checkWhitelistResponseState(); saveConfig();"><span class="toggle-slider"></span></label>
                         <label class="checkbox-label">Enable Name Whitelist — only allow approved names</label><br>
                         <button class="view-btn" onclick="location.href='/whitelist'" style="margin-top:6px;">📋 Manage Whitelist</button>
                     </div>
@@ -2561,11 +3481,11 @@ def index():
                             </div>
                             <div id="format_rules_inputs">
                                 <label class="toggle-switch"><input type="checkbox" id="one_word_only" {{ 'checked' if config.get('one_word_only', False) and not config.get('use_whitelist', False) else '' }}
-                                       onchange="if(this.checked) document.getElementById('two_words_max').checked = false; checkFormatWarning(); saveConfig();"><span class="toggle-slider"></span></label>
+                                       onchange="if(this.checked) document.getElementById('two_words_max').checked = false; checkFormatWarning(); updateWordsPreview(); saveConfig();"><span class="toggle-slider"></span></label>
                                 <label class="checkbox-label">One Word Only (e.g., "John" ✓, "John Smith" ✗)</label><br>
 
                                 <label class="toggle-switch"><input type="checkbox" id="two_words_max" {{ 'checked' if config.get('two_words_max', True) and not config.get('use_whitelist', False) else '' }}
-                                       onchange="if(this.checked) document.getElementById('one_word_only').checked = false; checkFormatWarning(); saveConfig();"><span class="toggle-slider"></span></label>
+                                       onchange="if(this.checked) document.getElementById('one_word_only').checked = false; checkFormatWarning(); updateWordsPreview(); saveConfig();"><span class="toggle-slider"></span></label>
                                 <label class="checkbox-label">Two Words Maximum (e.g., "John Smith" ✓, sentences ✗)</label><br>
 
                                 <div id="format_warning" style="display:none; background:#f8d7da; border:1px solid #f5c6cb; color:#721c24; border-radius:5px; padding:10px 14px; margin:8px 0; font-size:13px;">
@@ -2588,23 +3508,62 @@ def index():
                     </div>
 
                 </div>
+
+                <!-- Multiple names (grouped texts) explainer -->
+                <div style="background:#e7f3ff; border:1px solid #4a90d9; color:#1a3d5c; border-radius:6px; padding:10px 14px; margin-top:14px; font-size:13px; line-height:1.55;">
+                    <strong>📝 Multiple names in one text</strong><br>
+                    Texters can submit several names at once, separated by <strong>commas or line breaks</strong>
+                    (e.g. <em>"Alex, Sam, Jordan"</em>). Multi-word names like <em>"Mary Jane"</em> stay intact —
+                    only commas and line breaks split names, never spaces.
+                    <br><br>
+                    To keep replies simple, a grouped text is <strong>all-or-nothing</strong> and is only accepted
+                    when the box is fully open:
+                    <ul style="margin:6px 0 0 18px; padding:0;">
+                        <li><strong>Max Messages Per Phone</strong> must be <strong>0</strong> (no rate limiting)</li>
+                        <li><strong>Allow Duplicate Names</strong> must be <strong>on</strong></li>
+                        <li>Every name must pass your format rules — or, if the <strong>Whitelist</strong> is on,
+                            <strong>all</strong> names must be on it</li>
+                    </ul>
+                    <div style="margin-top:6px;">
+                        If any of these isn't met, the whole grouped text gets the <strong>Invalid Format</strong>
+                        reply — and it does <strong>not</strong> count toward the sender's daily limit. Profanity
+                        anywhere fails the whole message. An accepted group sends <strong>one Success</strong> reply.
+                    </div>
+                </div>
             </div>
             <script>
-                var _formatRulesInitialized = false;
+                // Remember the last active format-rule choice so enabling the
+                // whitelist (which clears the rules) and then disabling it restores
+                // exactly what was set before — rather than forcing "Two Words Max".
+                var _savedFormatState = {
+                    one_word_only: {{ 'true' if config.get('one_word_only', False) else 'false' }},
+                    two_words_max: {{ 'true' if config.get('two_words_max', True) else 'false' }}
+                };
+                var _prevWhitelistOn = null;
                 function updateFormatRules() {
                     var whitelistOn = document.getElementById('use_whitelist').checked;
+                    var one = document.getElementById('one_word_only');
+                    var two = document.getElementById('two_words_max');
                     var inputs = document.getElementById('format_rules_inputs');
                     var note = document.getElementById('format_rules_disabled_note');
                     inputs.style.opacity = whitelistOn ? '0.4' : '1';
                     inputs.style.pointerEvents = whitelistOn ? 'none' : '';
                     note.style.display = whitelistOn ? 'block' : 'none';
                     if (whitelistOn) {
-                        document.getElementById('one_word_only').checked = false;
-                        document.getElementById('two_words_max').checked = false;
-                    } else if (_formatRulesInitialized) {
-                        document.getElementById('two_words_max').checked = true;
+                        // Snapshot the current choice only when coming from the
+                        // non-whitelist state (when already whitelisted the boxes are
+                        // cleared and no longer reflect a real choice).
+                        if (_prevWhitelistOn === false) {
+                            _savedFormatState.one_word_only = one.checked;
+                            _savedFormatState.two_words_max = two.checked;
+                        }
+                        one.checked = false;
+                        two.checked = false;
+                    } else {
+                        one.checked = _savedFormatState.one_word_only;
+                        two.checked = _savedFormatState.two_words_max;
                     }
-                    _formatRulesInitialized = true;
+                    _prevWhitelistOn = whitelistOn;
                     checkFormatWarning();
                 }
                 function checkFormatWarning() {
@@ -2622,13 +3581,15 @@ def index():
                     var cb = document.getElementById('sms_response_duplicate');
                     var warn = document.getElementById('duplicate_disabled_warning');
                     if (!row) return;
+                    // Only disable/grey the row — never change the checkbox's own state,
+                    // so turning Allow Duplicate Names back off restores the prior on/off choice.
+                    if (cb) cb.disabled = allowDupes;
                     if (allowDupes) {
                         row.classList.add('locked');
                         row.classList.remove('enabled');
-                        if (cb) cb.checked = false;
                     } else {
                         row.classList.remove('locked');
-                        toggleResp('duplicate');
+                        toggleResp('duplicate');  // reflect the preserved state
                     }
                     if (warn) warn.style.display = allowDupes ? '' : 'none';
                 }
@@ -2645,9 +3606,99 @@ def index():
                     document.getElementById('blacklist_disabled_warning').style.display = whitelistOn ? 'block' : 'none';
                     document.getElementById('profanity_disabled_warning').style.display = (!whitelistOn && !profanityOn) ? 'block' : 'none';
                 }
+                // Invalid-Format response is meaningless when the whitelist is on
+                // (names are validated against the list, not format rules). Lock the
+                // row live when whitelist is enabled, and restore it when disabled.
+                function checkWhitelistResponseState() {
+                    var whitelistOn = document.getElementById('use_whitelist').checked;
+                    var row = document.getElementById('row_invalid_format');
+                    var cb = document.getElementById('sms_response_invalid_format');
+                    var warn = document.getElementById('invalid_format_disabled_warning');
+                    if (!row) return;  // SMS-responses tab not parsed yet (init runs later)
+                    // Only disable/grey the row — never change the checkbox's own state,
+                    // so toggling the whitelist off restores the prior on/off choice.
+                    if (cb) cb.disabled = whitelistOn;
+                    if (warn) warn.style.display = whitelistOn ? '' : 'none';
+                    if (whitelistOn) {
+                        row.classList.add('locked');
+                        row.classList.remove('enabled');
+                    } else {
+                        row.classList.remove('locked');
+                        toggleResp('invalid_format');  // reflect the preserved state
+                    }
+
+                    // Too Long response is also meaningless with the whitelist on
+                    // (Max Message Length doesn't apply), so lock it the same way.
+                    var tlRow = document.getElementById('row_too_long');
+                    var tlCb = document.getElementById('sms_response_too_long');
+                    var tlWarn = document.getElementById('too_long_disabled_warning');
+                    if (tlRow) {
+                        if (tlCb) tlCb.disabled = whitelistOn;
+                        if (tlWarn) tlWarn.style.display = whitelistOn ? '' : 'none';
+                        if (whitelistOn) {
+                            tlRow.classList.add('locked');
+                            tlRow.classList.remove('enabled');
+                        } else {
+                            tlRow.classList.remove('locked');
+                            toggleResp('too_long');  // reflect the preserved state
+                        }
+                    }
+
+                    // Not-on-Whitelist response is the inverse: it can only fire while
+                    // the whitelist is ON (names are checked against the list), so grey
+                    // it out when the whitelist is off.
+                    var nwRow = document.getElementById('row_not_whitelisted');
+                    var nwCb = document.getElementById('sms_response_not_whitelisted');
+                    var nwWarn = document.getElementById('not_whitelisted_disabled_warning');
+                    if (nwRow) {
+                        if (nwCb) nwCb.disabled = !whitelistOn;
+                        if (nwWarn) nwWarn.style.display = whitelistOn ? 'none' : '';
+                        if (!whitelistOn) {
+                            nwRow.classList.add('locked');
+                            nwRow.classList.remove('enabled');
+                        } else {
+                            nwRow.classList.remove('locked');
+                            toggleResp('not_whitelisted');  // reflect the preserved state
+                        }
+                    }
+                }
+                // Rate-Limited response is meaningless when Max Messages Per Phone is 0
+                // (unlimited) — no one is ever rate limited. Lock the row live.
+                function checkRateLimitResponseState() {
+                    var mmEl = document.getElementById('max_messages');
+                    var unlimited = !mmEl || parseInt(mmEl.value || '0', 10) === 0;
+                    var row = document.getElementById('row_rate_limited');
+                    var cb = document.getElementById('sms_response_rate_limited');
+                    var warn = document.getElementById('rate_limited_disabled_warning');
+                    if (!row) return;  // SMS-responses tab not parsed yet (init runs later)
+                    // Only disable/grey the row — never change the checkbox's own state,
+                    // so raising Max Messages above 0 restores the prior on/off choice.
+                    if (unlimited) {
+                        row.classList.add('locked');
+                        row.classList.remove('enabled');
+                        if (cb) cb.disabled = true;
+                    } else {
+                        row.classList.remove('locked');
+                        if (cb) cb.disabled = false;
+                        toggleResp('rate_limited');  // reflect the preserved state
+                    }
+                    if (warn) warn.style.display = unlimited ? '' : 'none';
+                }
+                // Live preview for the {words} placeholder in the Invalid Format
+                // response — mirrors word_rule_phrase() on the backend.
+                function updateWordsPreview() {
+                    var el = document.getElementById('words_preview');
+                    if (!el) return;  // SMS-responses tab not parsed yet
+                    var one = document.getElementById('one_word_only');
+                    var two = document.getElementById('two_words_max');
+                    el.textContent = (one && one.checked) ? '1 word'
+                                   : (two && two.checked) ? '2 words'
+                                   : '1-2 words';
+                }
                 updateFormatRules();
                 checkFiltersState();
                 checkDuplicateState();
+                updateWordsPreview();
             </script>
 
         </div>
@@ -2971,20 +4022,22 @@ def index():
         </div>
 
         <!-- SMS Responses Tab -->
-        {% if sms_responses_enabled %}
         <div id="tab-sms" class="tab-content">
             <div class="section" style="border: 2px solid #2196F3; margin-top: 20px;">
                 <h2>📱 SMS Auto-Response Settings</h2>
                 <p class="help-text">💡 Enable a response for each event type individually. Only one response is ever sent per incoming message.</p>
-                <div style="background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:5px; padding:10px 14px; margin:10px 0; font-size:13px;">
-                    ⚠️ <strong>Message &amp; data rates may apply.</strong>
-                </div>
-                <div style="background:#f8d7da; border:2px solid #f5c6cb; color:#721c24; border-radius:6px; padding:12px 16px; margin:10px 0; font-size:14px; font-weight:bold;">
-                    ⛔ SMS responses will NOT be delivered unless your Twilio number is registered:<br>
-                    <span style="font-weight:normal; font-size:13px; display:block; margin-top:6px;">
-                        • <strong>Local 10-digit number</strong> — requires a valid A2P 10DLC brand &amp; campaign approval<br>
-                        • <strong>Toll-free number</strong> — requires a completed toll-free verification (recommended)
-                    </span>
+                <!-- Twilio-specific delivery warnings — hidden when Google Voice is the source -->
+                <div id="twilio_sms_warnings">
+                    <div style="background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:5px; padding:10px 14px; margin:10px 0; font-size:13px;">
+                        ⚠️ <strong>Message &amp; data rates may apply.</strong>
+                    </div>
+                    <div style="background:#f8d7da; border:2px solid #f5c6cb; color:#721c24; border-radius:6px; padding:12px 16px; margin:10px 0; font-size:14px; font-weight:bold;">
+                        ⛔ SMS responses will NOT be delivered unless your Twilio number is registered:<br>
+                        <span style="font-weight:normal; font-size:13px; display:block; margin-top:6px;">
+                            • <strong>Local 10-digit number</strong> — requires a valid A2P 10DLC brand &amp; campaign approval<br>
+                            • <strong>Toll-free number</strong> — requires a completed toll-free verification (recommended)
+                        </span>
+                    </div>
                 </div>
 
                 <style>
@@ -3005,27 +4058,53 @@ def index():
                     row.classList.toggle('enabled', document.getElementById('sms_response_' + id).checked);
                 }
                 function initRespRows() {
-                    ['show_not_live','blocked','profanity','duplicate','invalid_format','rate_limited','not_whitelisted','success'].forEach(function(id) {
+                    ['show_not_live','blocked','profanity','duplicate','invalid_format','too_long','rate_limited','not_whitelisted','success'].forEach(function(id) {
                         toggleResp(id);
                     });
                 }
                 </script>
+
+                <div id="row_success" class="resp-row">
+                    <div class="resp-toggle">
+                        <label class="toggle-switch"><input type="checkbox" id="sms_response_success" {{ 'checked' if config.get('sms_response_success', False) else '' }} onchange="toggleResp('success')"><span class="toggle-slider"></span></label>
+                        <label for="sms_response_success" style="margin-left:10px;vertical-align:middle;">✅ Success — Send Response</label>
+                    </div>
+                    <textarea id="response_success" rows="2">{{ config.get('response_success', 'Thanks! Your name will appear on our display soon! 🎄') }}</textarea>
+                </div>
 
                 <div id="row_show_not_live" class="resp-row">
                     <div class="resp-toggle">
                         <label class="toggle-switch"><input type="checkbox" id="sms_response_show_not_live" {{ 'checked' if config.get('sms_response_show_not_live', False) else '' }} onchange="toggleResp('show_not_live')"><span class="toggle-slider"></span></label>
                         <label for="sms_response_show_not_live" style="margin-left:10px;vertical-align:middle;">🔴 Show Not Live — Send Response</label>
                     </div>
-                    <p class="help-text" style="margin:4px 0 6px;">Sent to anyone who texts while the show is not active (TwilioStop has been called).</p>
+                    <p class="help-text" style="margin:4px 0 6px;">Sent to anyone who texts while the show is not active (Text My Lights Stop has been called).</p>
                     <textarea id="response_show_not_live" rows="2">{{ config.get('response_show_not_live', "Ho, Ho, Ho, It looks like our show isn't running now. Try again later.") }}</textarea>
                 </div>
 
-                <div id="row_blocked" class="resp-row">
+                <div id="row_invalid_format" class="resp-row{% if config.get('use_whitelist', False) %} locked{% endif %}">
                     <div class="resp-toggle">
-                        <label class="toggle-switch"><input type="checkbox" id="sms_response_blocked" {{ 'checked' if config.get('sms_response_blocked', False) else '' }} onchange="toggleResp('blocked')"><span class="toggle-slider"></span></label>
-                        <label for="sms_response_blocked" style="margin-left:10px;vertical-align:middle;">🚫 Blocked Number — Send Response</label>
+                        <label class="toggle-switch"><input type="checkbox" id="sms_response_invalid_format"
+                               {{ 'checked' if config.get('sms_response_invalid_format', False) else '' }}
+                               {{ 'disabled' if config.get('use_whitelist', False) else '' }}
+                               onchange="toggleResp('invalid_format')"><span class="toggle-slider"></span></label>
+                        <label for="sms_response_invalid_format" style="margin-left:10px;vertical-align:middle;">❌ Invalid Format — Send Response</label>
                     </div>
-                    <textarea id="response_blocked" rows="2">{{ config.get('response_blocked', 'You have been blocked from sending messages.') }}</textarea>
+                    <p id="invalid_format_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('use_whitelist', False) else 'display:none;' }}">⚠️ Invalid Format responses are disabled when the whitelist is active — all names are validated against the whitelist instead of format rules.</p>
+                    <textarea id="response_invalid_format" rows="2">{{ config.get('response_invalid_format', 'Please send only 1 name ({words}, no sentences).') }}</textarea>
+                    <p class="help-text">💡 Type <code>{words}</code> anywhere in this message to auto-fill your current word limit — it becomes "<span id="words_preview">2 words</span>" in the reply, based on your <strong>Name Format Rules</strong> (One Word Only → "1 word", Two Words Maximum → "2 words").</p>
+                </div>
+
+                <div id="row_too_long" class="resp-row{% if config.get('use_whitelist', False) %} locked{% endif %}">
+                    <div class="resp-toggle">
+                        <label class="toggle-switch"><input type="checkbox" id="sms_response_too_long"
+                               {{ 'checked' if config.get('sms_response_too_long', False) else '' }}
+                               {{ 'disabled' if config.get('use_whitelist', False) else '' }}
+                               onchange="toggleResp('too_long')"><span class="toggle-slider"></span></label>
+                        <label for="sms_response_too_long" style="margin-left:10px;vertical-align:middle;">📏 Message Too Long — Send Response</label>
+                    </div>
+                    <p id="too_long_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('use_whitelist', False) else 'display:none;' }}">⚠️ Too Long responses are disabled when the whitelist is active — names are validated against the whitelist, not by length.</p>
+                    <textarea id="response_too_long" rows="2">{{ config.get('response_too_long', "I'm sorry, your message exceeds our max message length. Please only send your name.") }}</textarea>
+                    <p class="help-text">📏 Sent when a message is longer than your <strong>Max Message Length</strong> (Configuration tab). Applies whether or not the word-count rules are on.</p>
                 </div>
 
                 <div id="row_profanity" class="resp-row">
@@ -3036,10 +4115,31 @@ def index():
                     <textarea id="response_profanity" rows="2">{{ config.get('response_profanity', 'Sorry, your message contains inappropriate content and cannot be displayed.') }}</textarea>
                 </div>
 
+                <div id="row_blocked" class="resp-row">
+                    <div class="resp-toggle">
+                        <label class="toggle-switch"><input type="checkbox" id="sms_response_blocked" {{ 'checked' if config.get('sms_response_blocked', False) else '' }} onchange="toggleResp('blocked')"><span class="toggle-slider"></span></label>
+                        <label for="sms_response_blocked" style="margin-left:10px;vertical-align:middle;">🚫 Blocked Number — Send Response</label>
+                    </div>
+                    <textarea id="response_blocked" rows="2">{{ config.get('response_blocked', 'You have been blocked from sending messages.') }}</textarea>
+                </div>
+
+                <div id="row_rate_limited" class="resp-row{% if config.get('max_messages_per_phone', 0) == 0 %} locked{% endif %}">
+                    <div class="resp-toggle">
+                        <label class="toggle-switch"><input type="checkbox" id="sms_response_rate_limited"
+                               {{ 'checked' if config.get('sms_response_rate_limited', False) else '' }}
+                               {{ 'disabled' if config.get('max_messages_per_phone', 0) == 0 else '' }}
+                               onchange="toggleResp('rate_limited')"><span class="toggle-slider"></span></label>
+                        <label for="sms_response_rate_limited" style="margin-left:10px;vertical-align:middle;">⛔ Rate Limited — Send Response</label>
+                    </div>
+                    <p id="rate_limited_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('max_messages_per_phone', 0) == 0 else 'display:none;' }}">⚠️ Rate-Limited responses are disabled when Max Messages Per Phone is 0 (unlimited) — no one is ever rate limited.</p>
+                    <textarea id="response_rate_limited" rows="2">{{ config.get('response_rate_limited', "You've reached the maximum number of messages allowed. Please try again tomorrow!") }}</textarea>
+                </div>
+
                 <div id="row_duplicate" class="resp-row{% if config.get('allow_duplicate_names', False) %} locked{% endif %}">
                     <div class="resp-toggle">
                         <label class="toggle-switch"><input type="checkbox" id="sms_response_duplicate"
-                               {{ 'checked' if config.get('sms_response_duplicate', False) and not config.get('allow_duplicate_names', False) else '' }}
+                               {{ 'checked' if config.get('sms_response_duplicate', False) else '' }}
+                               {{ 'disabled' if config.get('allow_duplicate_names', False) else '' }}
                                onchange="toggleResp('duplicate')"><span class="toggle-slider"></span></label>
                         <label for="sms_response_duplicate" style="margin-left:10px;vertical-align:middle;">🔄 Duplicate Name — Send Response</label>
                     </div>
@@ -3047,47 +4147,20 @@ def index():
                     <textarea id="response_duplicate" rows="2">{{ config.get('response_duplicate', "You've already sent this name today!") }}</textarea>
                 </div>
 
-                <div id="row_invalid_format" class="resp-row{% if config.get('use_whitelist', False) %} locked{% endif %}">
+                <div id="row_not_whitelisted" class="resp-row{% if not config.get('use_whitelist', False) %} locked{% endif %}">
                     <div class="resp-toggle">
-                        <label class="toggle-switch"><input type="checkbox" id="sms_response_invalid_format"
-                               {{ 'checked' if config.get('sms_response_invalid_format', False) and not config.get('use_whitelist', False) else '' }}
-                               {{ 'disabled' if config.get('use_whitelist', False) else '' }}
-                               onchange="toggleResp('invalid_format')"><span class="toggle-slider"></span></label>
-                        <label for="sms_response_invalid_format" style="margin-left:10px;vertical-align:middle;">❌ Invalid Format — Send Response</label>
-                    </div>
-                    {% if config.get('use_whitelist', False) %}
-                    <p class="resp-locked-note">⚠️ Invalid Format responses are disabled when the whitelist is active — all names are validated against the whitelist instead of format rules.</p>
-                    {% endif %}
-                    <textarea id="response_invalid_format" rows="2">{{ config.get('response_invalid_format', 'Please send only a name (1-2 words, no sentences).') }}</textarea>
-                </div>
-
-                <div id="row_rate_limited" class="resp-row">
-                    <div class="resp-toggle">
-                        <label class="toggle-switch"><input type="checkbox" id="sms_response_rate_limited" {{ 'checked' if config.get('sms_response_rate_limited', False) else '' }} onchange="toggleResp('rate_limited')"><span class="toggle-slider"></span></label>
-                        <label for="sms_response_rate_limited" style="margin-left:10px;vertical-align:middle;">⛔ Rate Limited — Send Response</label>
-                    </div>
-                    <textarea id="response_rate_limited" rows="2">{{ config.get('response_rate_limited', "You've reached the maximum number of messages allowed. Please try again tomorrow!") }}</textarea>
-                </div>
-
-                <div id="row_not_whitelisted" class="resp-row">
-                    <div class="resp-toggle">
-                        <label class="toggle-switch"><input type="checkbox" id="sms_response_not_whitelisted" {{ 'checked' if config.get('sms_response_not_whitelisted', False) else '' }} onchange="toggleResp('not_whitelisted')"><span class="toggle-slider"></span></label>
+                        <label class="toggle-switch"><input type="checkbox" id="sms_response_not_whitelisted"
+                               {{ 'checked' if config.get('sms_response_not_whitelisted', False) else '' }}
+                               {{ 'disabled' if not config.get('use_whitelist', False) else '' }}
+                               onchange="toggleResp('not_whitelisted')"><span class="toggle-slider"></span></label>
                         <label for="sms_response_not_whitelisted" style="margin-left:10px;vertical-align:middle;">📋 Not on Whitelist — Send Response</label>
                     </div>
+                    <p id="not_whitelisted_disabled_warning" class="resp-locked-note" style="{{ '' if not config.get('use_whitelist', False) else 'display:none;' }}">⚠️ Not-on-Whitelist responses only apply when the Name Whitelist is enabled.</p>
                     <textarea id="response_not_whitelisted" rows="2">{{ config.get('response_not_whitelisted', 'Sorry, that name is not on our approved list.') }}</textarea>
-                </div>
-
-                <div id="row_success" class="resp-row">
-                    <div class="resp-toggle">
-                        <label class="toggle-switch"><input type="checkbox" id="sms_response_success" {{ 'checked' if config.get('sms_response_success', False) else '' }} onchange="toggleResp('success')"><span class="toggle-slider"></span></label>
-                        <label for="sms_response_success" style="margin-left:10px;vertical-align:middle;">✅ Success — Send Response</label>
-                    </div>
-                    <textarea id="response_success" rows="2">{{ config.get('response_success', 'Thanks! Your name will appear on our display soon! 🎄') }}</textarea>
                 </div>
 
             </div>
         </div>
-        {% endif %}
 
         <!-- Testing Tab -->
         <div id="tab-testing" class="tab-content">
@@ -3096,12 +4169,12 @@ def index():
                 <h2>🧪 Message Testing</h2>
 
                 <div id="show_not_live_banner" style="display:none; background:#ffecb3; border:1px solid #FF9800; border-radius:6px; padding:10px 14px; margin-bottom:14px; color:#7a4f00; font-size:14px;">
-                    🔴 Show is not live — run <strong>TwilioStart</strong> from the FPP scheduler to activate the display before testing.
+                    🔴 Show is not live — run <strong>Text My Lights Start</strong> from the FPP scheduler to activate the display before testing.
                 </div>
 
                 <div id="test_form_inner">
                     <p style="color: #FF9800; font-size: 14px;">
-                        ⚠️ Use this to test messages without sending actual texts. Works without Twilio credentials.
+                        ⚠️ Use this to test messages without sending actual texts. Works without SMS credentials.
                     </p>
 
                     <label>Test Name:</label>
@@ -3113,32 +4186,6 @@ def index():
                 </div>
             </div>
 
-            {% if sms_responses_enabled %}
-            <div class="section" style="border: 2px solid #FF9800;">
-                <h2>🧪 SMS Response Testing</h2>
-                <p style="color: #FF9800; font-size: 14px;">
-                    ⚠️ Test sending SMS responses to a phone number. Requires Twilio credentials. </p>
-
-                <label>Phone Number:</label>
-                <input type="text" id="test_sms_phone" placeholder="Number to Text">
-
-                <label>Message Type:</label>
-                <select id="test_sms_type">
-                    <option value="success">✅ Success</option>
-                    <option value="profanity">🚫 Profanity</option>
-                    <option value="rate_limited">⛔ Rate Limited</option>
-                    <option value="duplicate">🔄 Duplicate</option>
-                    <option value="invalid_format">❌ Invalid Format</option>
-                    <option value="not_whitelisted">📋 Not Whitelisted</option>
-                    <option value="blocked">🚫 Blocked</option>
-                </select>
-
-                <button class="test-btn" onclick="sendTestSMS()">📤 Send Test SMS</button>
-
-                <div id="test_sms_result" style="margin-top: 10px;"></div>
-            </div>
-            {% endif %}
-
         </div>
 
         <script>
@@ -3148,11 +4195,11 @@ def index():
                 fetch('/api/activate', {method:'POST'})
                 .then(r => r.json())
                 .then(function(d) {
-                    if (d.success === false) { alert('TwilioStart failed: ' + (d.error || 'Unknown error')); }
+                    if (d.success === false) { alert('Text My Lights Start failed: ' + (d.error || 'Unknown error')); }
                     updateLiveStatus();
                 })
-                .catch(function() { alert('TwilioStart request failed.'); })
-                .finally(function() { btn.disabled = false; btn.textContent = '▶ TwilioStart'; });
+                .catch(function() { alert('Text My Lights Start request failed.'); })
+                .finally(function() { btn.disabled = false; btn.textContent = '▶ Text My Lights Start'; });
             }
 
             function twilioStop() {
@@ -3161,8 +4208,8 @@ def index():
                 fetch('/api/deactivate', {method:'POST'})
                 .then(r => r.json())
                 .then(function() { updateLiveStatus(); })
-                .catch(function() { alert('TwilioStop request failed.'); })
-                .finally(function() { btn.disabled = false; btn.textContent = '■ TwilioStop'; });
+                .catch(function() { alert('Text My Lights Stop request failed.'); })
+                .finally(function() { btn.disabled = false; btn.textContent = '■ Text My Lights Stop'; });
             }
 
             function updateLiveStatus() {
@@ -4388,6 +5435,10 @@ def index():
             loadFonts();
             loadFPPData();
             initRespRows();
+            checkWhitelistResponseState();
+            checkRateLimitResponseState();
+            checkDuplicateState();
+            updateWordsPreview();
             setupAutoSave();
             updateLiveStatus();
             setInterval(updateLiveStatus, 5000);
@@ -4598,9 +5649,12 @@ var _saveTimer = null;
                 status.textContent = 'Saving...';
 
                 const data = {
+                    message_source: document.getElementById('message_source').value,
                     twilio_account_sid: document.getElementById('account_sid').value,
                     twilio_auth_token: document.getElementById('auth_token').value,
                     twilio_phone_number: document.getElementById('phone_number').value,
+                    gv_email: document.getElementById('gv_email').value,
+                    gv_app_password: document.getElementById('gv_app_password').value,
                     poll_interval: parseInt(document.getElementById('poll_interval').value),
                     display_duration: parseInt(document.getElementById('display_duration').value),
                     max_messages_per_phone: parseInt(document.getElementById('max_messages').value),
@@ -4634,13 +5688,13 @@ var _saveTimer = null;
                     line_speeds: window._lineSpeeds || [50,50,50,50],
                     line_orientations: window._lineOrientations || ['horizontal','horizontal','horizontal','horizontal'],
                     custom_colors: window._customColors || [],
-                    {% if sms_responses_enabled %}
                     sms_response_show_not_live: document.getElementById('sms_response_show_not_live').checked,
                     sms_response_success: document.getElementById('sms_response_success').checked,
                     sms_response_profanity: document.getElementById('sms_response_profanity').checked,
                     sms_response_rate_limited: document.getElementById('sms_response_rate_limited').checked,
                     sms_response_duplicate: document.getElementById('sms_response_duplicate').checked,
-                    sms_response_invalid_format: !document.getElementById('use_whitelist').checked && document.getElementById('sms_response_invalid_format').checked,
+                    sms_response_invalid_format: document.getElementById('sms_response_invalid_format').checked,
+                    sms_response_too_long: document.getElementById('sms_response_too_long').checked,
                     sms_response_not_whitelisted: document.getElementById('sms_response_not_whitelisted').checked,
                     sms_response_blocked: document.getElementById('sms_response_blocked').checked,
                     response_success: document.getElementById('response_success').value,
@@ -4648,10 +5702,10 @@ var _saveTimer = null;
                     response_rate_limited: document.getElementById('response_rate_limited').value,
                     response_duplicate: document.getElementById('response_duplicate').value,
                     response_invalid_format: document.getElementById('response_invalid_format').value,
+                    response_too_long: document.getElementById('response_too_long').value,
                     response_not_whitelisted: document.getElementById('response_not_whitelisted').value,
                     response_blocked: document.getElementById('response_blocked').value,
-                    response_show_not_live: document.getElementById('response_show_not_live').value,
-                    {% endif %}
+                    response_show_not_live: document.getElementById('response_show_not_live').value
                 };
 
                 fetch('/api/config', {
@@ -4672,23 +5726,59 @@ var _saveTimer = null;
             }
 
             function setupAutoSave() {
-                // enabled has its own handler — saves only itself so it never
-                // clobbers the runtime state set by TwilioStart/TwilioStop
-                var enabledEl = document.getElementById('enabled');
-                if (enabledEl) enabledEl.addEventListener('change', function() {
-                    fetch('/api/config', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({enabled: this.checked})
+                // The show's live state (config.enabled) is owned by the Start/Stop
+                // scheduler commands (api_activate / api_deactivate) — there is no
+                // manual enable toggle, so config saves here never touch it.
+
+                // Turn on the auto-responses that can actually fire under Google
+                // Voice (Twilio keeps them off / hidden). Skips rows locked by another
+                // setting: rate-limited (unlimited), duplicate (dupes allowed),
+                // invalid-format (whitelist on) — those stay off.
+                function enableGvResponses() {
+                    ['show_not_live','blocked','profanity','invalid_format','not_whitelisted','success'].forEach(function(id) {
+                        var cb = document.getElementById('sms_response_' + id);
+                        var row = document.getElementById('row_' + id);
+                        if (cb && !cb.disabled && row && !row.classList.contains('locked')) {
+                            cb.checked = true;
+                            toggleResp(id);
+                        }
                     });
+                }
+                // Message source selector — swap the visible credential block, apply
+                // the source's rate-limit default, and save.
+                var srcEl = document.getElementById('message_source');
+                if (srcEl) srcEl.addEventListener('change', function() {
+                    var isGV = this.value === 'google_voice';
+                    // Google Voice: unlimited (0) + allow duplicate names.
+                    // Twilio: rate limit 5 + disallow duplicates.
+                    var mm = document.getElementById('max_messages');
+                    if (mm) mm.value = isGV ? 0 : 5;
+                    var dup = document.getElementById('allow_duplicate_names');
+                    if (dup) dup.checked = isGV;
+                    updateSourceUI();
+                    checkDuplicateState();          // grey the duplicate response accordingly
+                    checkRateLimitResponseState();  // grey the rate-limited response accordingly
+                    if (isGV) enableGvResponses();  // Google Voice: turn on the usable responses
+                    saveConfig();
                 });
+                // Google Voice credential fields — save on blur (like Twilio creds)
+                ['gv_email','gv_app_password'].forEach(function(id) {
+                    var el = document.getElementById(id);
+                    if (el) el.addEventListener('blur', saveConfig);
+                });
+                // Keep the Rate-Limited response lock in sync when the limit changes
+                var mmEl = document.getElementById('max_messages');
+                if (mmEl) mmEl.addEventListener('input', checkRateLimitResponseState);
+                // Reflect the saved source on initial load
+                updateSourceUI();
 
                 // Checkboxes, selects, color picker — save immediately on change
                 ['profanity_filter','use_whitelist','allow_duplicate_names',
                  'default_playlist','name_display_playlist','overlay_model_name',
                  'one_word_only','two_words_max',
+                 'sms_response_show_not_live',
                  'sms_response_success','sms_response_profanity','sms_response_rate_limited',
-                 'sms_response_duplicate','sms_response_invalid_format',
+                 'sms_response_duplicate','sms_response_invalid_format','sms_response_too_long',
                  'sms_response_not_whitelisted','sms_response_blocked'
                 ].forEach(function(id) {
                     var el = document.getElementById(id);
@@ -4715,7 +5805,7 @@ var _saveTimer = null;
                  'poll_interval','display_duration','max_messages','max_length',
                  'line_1','line_2','line_3','line_4',
                  'response_success','response_profanity','response_rate_limited',
-                 'response_duplicate','response_invalid_format',
+                 'response_duplicate','response_invalid_format','response_too_long',
                  'response_not_whitelisted','response_blocked'
                 ].forEach(function(id) {
                     var el = document.getElementById(id);
@@ -4735,6 +5825,69 @@ var _saveTimer = null;
                         result.innerHTML = '<span style="color:#f44336;">❌ Connection failed: ' + data.error + '</span>';
                     }
                 });
+            }
+
+            // Show the credential block for the selected message source, hide the other.
+            // Also hide the SMS Responses tab for Twilio (untested there for now).
+            function updateSourceUI() {
+                var srcEl = document.getElementById('message_source');
+                if (!srcEl) return;
+                var isGV = srcEl.value === 'google_voice';
+                var tw = document.getElementById('twilio_creds');
+                var gv = document.getElementById('gv_creds');
+                if (tw) tw.style.display = isGV ? 'none' : '';
+                if (gv) gv.style.display = isGV ? '' : 'none';
+
+                // Point the help link at the selected provider's config section.
+                // This page runs inside the plugin's own service (port 5000), so a
+                // relative URL would resolve there instead of the FPP web server —
+                // build an absolute URL to the FPP host (default port) explicitly.
+                var helpLink = document.getElementById('provider_help_link');
+                if (helpLink) {
+                    helpLink.textContent = isGV ? 'View Google Voice Configuration' : 'View Twilio Configuration';
+                    var fppBase = window.location.protocol + '//' + window.location.hostname;
+                    helpLink.href = fppBase + '/plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=help.php#'
+                        + (isGV ? 'google-voice' : 'twilio');
+                }
+
+                // SMS Responses are only exposed for Google Voice right now
+                var smsBtn = document.getElementById('tabbtn-sms');
+                if (smsBtn) {
+                    smsBtn.style.display = isGV ? '' : 'none';
+                    // If Twilio is selected while the SMS tab is open, jump to Settings
+                    if (!isGV && smsBtn.classList.contains('active')) {
+                        var setBtn = document.querySelector('.tab-btn[onclick*="settings"]');
+                        if (setBtn) showTab('settings', setBtn);
+                    }
+                }
+                // Twilio A2P/registration warnings are irrelevant for Google Voice
+                var twWarn = document.getElementById('twilio_sms_warnings');
+                if (twWarn) twWarn.style.display = isGV ? 'none' : '';
+            }
+
+            function testGoogleVoice() {
+                var result = document.getElementById('gv_test_result');
+                result.innerHTML = '<span style="color:#555;">Saving &amp; testing...</span>';
+                // Save first so the server tests the latest credentials, then test.
+                saveConfig();
+                setTimeout(function() {
+                    fetch('/api/test_gv')
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.success) {
+                            var reply = data.reply_ready
+                                ? ' &nbsp;·&nbsp; ✅ replies enabled'
+                                : ' &nbsp;·&nbsp; ⚠️ replies unavailable (outbound SMTP blocked)';
+                            result.innerHTML = '<span style="color:#4CAF50;">✅ Inbox connected!</span>' +
+                                '<span style="color:' + (data.reply_ready ? '#4CAF50' : '#e65100') + ';">' + reply + '</span>';
+                        } else {
+                            result.innerHTML = '<span style="color:#f44336;">❌ ' + data.error + '</span>';
+                        }
+                    })
+                    .catch(function() {
+                        result.innerHTML = '<span style="color:#f44336;">❌ Test request failed.</span>';
+                    });
+                }, 600);
             }
 
             function viewMessages() {
@@ -4770,33 +5923,6 @@ var _saveTimer = null;
                         if (data.reason) {
                             resultDiv.innerHTML += '<p style="font-size: 12px; color: #666;">Reason: ' + data.reason + '</p>';
                         }
-                    }
-                });
-            }
-
-            function sendTestSMS() {
-                const phone = document.getElementById('test_sms_phone').value.trim();
-                const messageType = document.getElementById('test_sms_type').value;
-                const resultDiv = document.getElementById('test_sms_result');
-
-                if (!phone) {
-                    resultDiv.innerHTML = '<p class="error">❌ Please enter a phone number</p>';
-                    return;
-                }
-
-                resultDiv.innerHTML = '<p>📤 Sending test SMS...</p>';
-
-                fetch('/api/test/sms', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({phone: phone, message_type: messageType})
-                })
-                .then(r => r.json())
-                .then(data => {
-                    if (data.success) {
-                        resultDiv.innerHTML = '<p class="success">✅ Test SMS sent successfully to ' + phone + '</p>';
-                    } else {
-                        resultDiv.innerHTML = '<p class="error">❌ Failed to send: ' + data.error + '</p>';
                     }
                 });
             }
@@ -4915,13 +6041,21 @@ var _saveTimer = null;
     </html>
     """
 
-    return render_template_string(html, config=config, sms_responses_enabled=SMS_AUTO_RESPONSES_ENABLED)
+    return render_template_string(html, config=config, secret_sentinel=SECRET_SENTINEL)
 
 @app.route('/api/config', methods=['POST'])
 def update_config():
     global config, twilio_client, polling_thread, stop_polling
     try:
-        new_config = request.json
+        new_config = request.json or {}
+        # Secret fields render with the masked SECRET_SENTINEL when a value is
+        # stored. Interpret the submitted value:
+        #   • unchanged sentinel → keep the stored secret (drop the key)
+        #   • empty              → remove the stored secret (keep '' to clear it)
+        #   • anything else      → update to the new value
+        for _sk in SECRET_KEYS:
+            if str(new_config.get(_sk, '')) == SECRET_SENTINEL:
+                new_config.pop(_sk, None)
         config.update(new_config)
 
         # Normalize phone number to E.164 (strip spaces, dashes, parens — keep + and digits)
@@ -4930,21 +6064,21 @@ def update_config():
 
         save_config()
 
+        # Keep the Twilio client in sync whenever credentials are present, so the
+        # Twilio path works exactly as before regardless of the selected source.
         if config['twilio_account_sid'] and config['twilio_auth_token']:
             twilio_client = Client(
                 config['twilio_account_sid'],
                 config['twilio_auth_token']
             )
-            # Start polling thread if not already running (e.g. credentials entered
-            # after TwilioStart was called, or updated mid-show)
-            if not polling_thread or not polling_thread.is_alive():
-                polling_thread = threading.Thread(target=poll_twilio, daemon=True)
-                polling_thread.start()
-                logging.error("▶️ Polling thread started after credential update")
+
+        # Start the poller for the selected source if not already running (e.g.
+        # credentials entered after Text My Lights Start, or updated mid-show).
+        start_polling_if_needed()
 
         return jsonify({"success": True})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return _client_error("update_config", e)
 
 @app.route('/api/fpp/fonts')
 def fpp_fonts_endpoint():
@@ -5005,7 +6139,7 @@ def get_fpp_data():
         _fpp_data_cache_time = time.time()
         return jsonify(results)
     except Exception as e:
-        return jsonify({"error": str(e)})
+        return _client_error("get_fpp_data", e)
 
 @app.route('/api/fpp/refresh', methods=['POST'])
 def refresh_fpp_data():
@@ -5020,7 +6154,7 @@ def test_fpp_api():
         success, status = test_fpp_connection()
         return jsonify({"success": success, "status": status})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return _client_error("test_fpp_api", e)
 
 @app.route('/api/fseq/debug')
 def fseq_debug():
@@ -5034,6 +6168,7 @@ def fseq_debug():
         return jsonify({'error': 'No sequence specified'}), 400
 
     name     = seq.removeprefix('seq:').removesuffix('.fseq')
+    name     = os.path.basename(name)   # no path traversal — keep filename only
     filepath = os.path.join(FSEQ_SEQUENCE_PATH, name + '.fseq')
     if not os.path.exists(filepath):
         return jsonify({'error': f'Sequence not found: {name}.fseq'}), 404
@@ -5119,6 +6254,7 @@ def fseq_info():
     if not seq:
         return jsonify({'error': 'No sequence specified'}), 400
     name = seq.removeprefix('seq:').removesuffix('.fseq')
+    name = os.path.basename(name)   # no path traversal — keep filename only
     filepath = os.path.join(FSEQ_SEQUENCE_PATH, name + '.fseq')
     if not os.path.exists(filepath):
         return jsonify({'error': f'Sequence not found: {name}.fseq'}), 404
@@ -5137,7 +6273,7 @@ def fseq_info():
             'detected_channel_count':  detected_cc,
         })
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _client_error("fseq_info", e, 500)
 
 @app.route('/api/fseq/frame')
 def fseq_frame():
@@ -5159,6 +6295,7 @@ def fseq_frame():
         return jsonify({'error': 'Overlay model dimensions unknown — select a model first'}), 400
 
     name = seq.removeprefix('seq:').removesuffix('.fseq')
+    name = os.path.basename(name)   # no path traversal — keep filename only
     filepath = os.path.join(FSEQ_SEQUENCE_PATH, name + '.fseq')
     if not os.path.exists(filepath):
         return jsonify({'error': f'Sequence not found: {name}.fseq'}), 404
@@ -5214,7 +6351,7 @@ def fseq_frame():
                         headers={'Cache-Control': 'no-store'})
     except Exception as e:
         logging.error(f"FSEQ frame error: {e}")
-        return jsonify({'error': str(e)}), 500
+        return _client_error("fseq_frame", e, 500)
 
 @app.route('/api/media/preview')
 def media_preview():
@@ -5279,8 +6416,7 @@ def media_preview():
         return Response(buf.read(), mimetype='image/png',
                         headers={'Cache-Control': 'no-store'})
     except Exception as e:
-        logging.error(f"media_preview error: {e}")
-        return jsonify({'error': str(e)}), 500
+        return _client_error("media_preview", e, 500)
 
 
 @app.route('/api/test')
@@ -5288,11 +6424,54 @@ def test_twilio():
     try:
         if not twilio_client:
             return jsonify({"success": False, "error": "Twilio client not initialized"})
-        
+
         account = twilio_client.api.accounts(config['twilio_account_sid']).fetch()
         return jsonify({"success": True, "account": account.friendly_name})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
+
+@app.route('/api/test_gv')
+def test_google_voice_conn():
+    """Verify Google Voice connectivity: IMAP (inbound, required) and SMTP
+    (outbound replies, optional). Used by the config UI."""
+    email_addr = config.get('gv_email', '').strip()
+    app_pw = config.get('gv_app_password', '').strip()
+    if not email_addr or not app_pw:
+        return jsonify({"success": False, "error": "Enter your Gmail address and app password first."})
+
+    # IMAP — required for reading incoming texts
+    try:
+        imap = imaplib.IMAP4_SSL(config.get('gv_imap_host', 'imap.gmail.com'))
+        try:
+            imap.login(email_addr, app_pw)
+            imap.select(config.get('gv_imap_folder', 'INBOX'))
+        finally:
+            try:
+                imap.logout()
+            except Exception:
+                pass
+    except imaplib.IMAP4.error as e:
+        return jsonify({"success": False,
+                        "error": f"Login failed ({e}). Use a Google App Password (not your normal password), "
+                                 "with 2-Step Verification enabled and IMAP turned on in Gmail."})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+    # SMTP — only needed for outbound auto-responses; report but don't fail on it
+    reply_ready = False
+    reply_error = ""
+    try:
+        with smtplib.SMTP(config.get('gv_smtp_host', 'smtp.gmail.com'),
+                          int(config.get('gv_smtp_port', 587)), timeout=15) as s:
+            s.ehlo()
+            s.starttls()
+            s.ehlo()
+            s.login(email_addr, app_pw)
+        reply_ready = True
+    except Exception as e:
+        reply_error = str(e)
+
+    return jsonify({"success": True, "reply_ready": reply_ready, "reply_error": reply_error})
 
 @app.route('/api/messages')
 def get_messages():
@@ -5301,7 +6480,8 @@ def get_messages():
             messages = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         messages = []
-    return jsonify(list(reversed(messages)))
+    today = datetime.now().date().isoformat()
+    return jsonify(redact_messages(list(reversed(messages)), today))
 
 @app.route('/api/messages/clear', methods=['POST'])
 def clear_messages():
@@ -5311,8 +6491,7 @@ def clear_messages():
         logging.info("Message history cleared (today's file)")
         return jsonify({"success": True})
     except Exception as e:
-        logging.error(f"Error clearing messages: {e}")
-        return jsonify({"success": False, "error": str(e)})
+        return _client_error("clear_messages", e)
 
 @app.route('/api/messages/<date_str>')
 def get_messages_by_date(date_str):
@@ -5326,8 +6505,8 @@ def get_messages_by_date(date_str):
     except (FileNotFoundError, json.JSONDecodeError):
         messages = []
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    return jsonify(list(reversed(messages)))
+        return _client_error("get_messages_by_date", e, 500)
+    return jsonify(redact_messages(list(reversed(messages)), date_str))
 
 @app.route('/api/queue/status')
 def queue_status():
@@ -5335,7 +6514,7 @@ def queue_status():
         status = get_queue_status()
         return jsonify(status)
     except Exception as e:
-        return jsonify({"error": str(e)})
+        return _client_error("queue_status", e)
 
 @app.route('/api/test/message', methods=['POST'])
 def test_message_submission():
@@ -5345,16 +6524,18 @@ def test_message_submission():
         test_phone = data.get('phone', 'Local Testing')
         
         if not config.get('enabled', False):
-            return jsonify({"success": False, "error": "Show is not live — run TwilioStart first"})
+            return jsonify({"success": False, "error": "Show is not live — run Text My Lights Start first"})
 
         if not test_name:
             return jsonify({"success": False, "error": "Name is required"})
 
         test_name = extract_name(test_name)
-        is_valid, validation_msg = is_valid_name(test_name)
+        is_valid, reason = is_valid_name(test_name)
 
-        if not is_valid:
-            return jsonify({"success": False, "error": validation_msg, "reason": "invalid_format"})
+        if not is_valid and not config.get('use_whitelist', False):
+            if reason == "too_long":
+                return jsonify({"success": False, "error": "Message exceeds Max Message Length", "reason": "too_long"})
+            return jsonify({"success": False, "error": "Invalid name format", "reason": "invalid_format"})
 
         if not is_on_whitelist(test_name):
             return jsonify({"success": False, "error": "Name not on whitelist", "reason": "not_on_whitelist"})
@@ -5373,54 +6554,52 @@ def test_message_submission():
             return jsonify({"success": False, "error": "Failed to add to queue"})
             
     except Exception as e:
-        logging.error(f"🧪 💥 ERROR in test message submission: {e}")
         import traceback
         logging.error(traceback.format_exc())
-        return jsonify({"success": False, "error": str(e)})
-
-@app.route('/api/test/sms', methods=['POST'])
-def test_sms_response():
-    """Test sending an SMS response — bypasses enabled/disabled toggles so any response can be previewed"""
-    if not SMS_AUTO_RESPONSES_ENABLED:
-        return jsonify({"success": False, "error": "SMS auto-responses are disabled on this branch pending beta testing"})
-
-    try:
-        data = request.json
-        phone = data.get('phone', '').strip()
-        message_type = data.get('message_type', 'success')
-
-        if not phone:
-            return jsonify({"success": False, "error": "Phone number is required"})
-
-        if not twilio_client:
-            return jsonify({"success": False, "error": "Twilio credentials not configured"})
-
-        response_message = config.get(f"response_{message_type}", "")
-        if not response_message:
-            return jsonify({"success": False, "error": f"No message text configured for '{message_type}'"})
-
-        twilio_client.messages.create(
-            body=response_message,
-            from_=config['twilio_phone_number'],
-            to=phone
-        )
-        return jsonify({"success": True, "message": f"Test SMS sent to {phone}"})
-
-    except Exception as e:
-        logging.error(f"Error in test SMS: {e}")
-        return jsonify({"success": False, "error": str(e)})
+        return _client_error("test_message_submission", e)
 
 @app.route('/api/phone/block', methods=['POST'])
 def api_block_phone():
     try:
-        data = request.json
+        data = request.json or {}
         phone = data.get('phone')
+        # Preferred path: block by message reference (date + timestamp). The full
+        # number is resolved from the on-disk log server-side, so the browser only
+        # ever holds the masked value — never the real number.
+        if not phone and data.get('ts'):
+            phone = _phone_from_log_ref(data.get('date'), data.get('ts'))
         if phone:
             success = block_phone(phone)
-            return jsonify({"success": success, "phone": phone})
-        return jsonify({"success": False, "error": "No phone number provided"})
+            # Never echo the full number back to the client.
+            return jsonify({"success": success, "phone": mask_phone(phone)})
+        return jsonify({"success": False, "error": "Could not resolve the number to block"})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return _client_error("api_block_phone", e)
+
+@app.route('/api/respond', methods=['POST'])
+def api_respond():
+    """Send a manual custom reply to a logged message from the queue page.
+
+    Google Voice only — Twilio has no reply path in this plugin. The message is
+    identified by (date, timestamp); its stored reply context is resolved
+    server-side so the real reply-to address never touches the browser."""
+    try:
+        if config.get('message_source') != 'google_voice':
+            return jsonify({"success": False,
+                            "error": "Replies are only available when Google Voice is the active source."}), 400
+        data = request.json or {}
+        text = (data.get('text') or '').strip()
+        if not text:
+            return jsonify({"success": False, "error": "Message text is required."}), 400
+        ctx = _reply_ctx_from_log_ref(data.get('date'), data.get('ts'))
+        if not ctx or not ctx.get('to'):
+            return jsonify({"success": False,
+                            "error": "No reply context stored for this message — it can't be answered."}), 400
+        if send_gv_reply(text, "manual_reply", ctx=ctx):
+            return jsonify({"success": True})
+        return jsonify({"success": False, "error": "Send failed — see the plugin log for details."})
+    except Exception as e:
+        return _client_error("api_respond", e)
 
 @app.route('/api/phone/unblock', methods=['POST'])
 def api_unblock_phone():
@@ -5432,7 +6611,7 @@ def api_unblock_phone():
             return jsonify({"success": success, "phone": phone})
         return jsonify({"success": False, "error": "No phone number provided"})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return _client_error("api_unblock_phone", e)
 
 @app.route('/api/blocklist')
 def api_get_blocklist():
@@ -5440,7 +6619,7 @@ def api_get_blocklist():
         blocklist = load_blocklist()
         return jsonify({"blocklist": blocklist})
     except Exception as e:
-        return jsonify({"error": str(e)})
+        return _client_error("api_get_blocklist", e)
 
 @app.route('/api/blacklist')
 def api_get_blacklist():
@@ -5448,7 +6627,7 @@ def api_get_blacklist():
         words = load_blacklist_words()
         return jsonify({"blacklist": words})
     except Exception as e:
-        return jsonify({"error": str(e)})
+        return _client_error("api_get_blacklist", e)
 
 @app.route('/api/blacklist/add', methods=['POST'])
 def api_add_blacklist():
@@ -5483,7 +6662,7 @@ def api_add_blacklist():
         logging.info(f"Added '{word}' to user blacklist")
         return jsonify({"success": True})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return _client_error("api_add_blacklist", e)
 
 @app.route('/api/blacklist/remove', methods=['POST'])
 def api_remove_blacklist():
@@ -5512,7 +6691,7 @@ def api_remove_blacklist():
         logging.info(f"Removed '{word}' from blacklist")
         return jsonify({"success": True})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return _client_error("api_remove_blacklist", e)
 
 @app.route('/api/whitelist')
 def api_get_whitelist():
@@ -5520,7 +6699,7 @@ def api_get_whitelist():
         names = sorted(load_whitelist())
         return jsonify({"whitelist": names})
     except Exception as e:
-        return jsonify({"error": str(e)})
+        return _client_error("api_get_whitelist", e)
 
 @app.route('/api/whitelist/add', methods=['POST'])
 def api_add_whitelist():
@@ -5566,7 +6745,7 @@ def api_add_whitelist():
         logging.info(f"Added '{name}' to user whitelist")
         return jsonify({"success": True})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return _client_error("api_add_whitelist", e)
 
 @app.route('/api/whitelist/remove', methods=['POST'])
 def api_remove_whitelist():
@@ -5595,7 +6774,7 @@ def api_remove_whitelist():
         logging.info(f"Removed '{name}' from whitelist")
         return jsonify({"success": True})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return _client_error("api_remove_whitelist", e)
 
 @app.route('/whitelist')
 def view_whitelist():
@@ -6113,7 +7292,7 @@ def status_page():
         </style>
     </head>
     <body><script>if('scrollRestoration'in history)history.scrollRestoration='manual';function _toTop(){{window.scrollTo(0,0);document.documentElement.scrollTop=0;document.body.scrollTop=0;try{{window.parent.postMessage({{type:'scrollTop'}},'*');}}catch(e){{}}}}_toTop();document.addEventListener('DOMContentLoaded',_toTop);window.addEventListener('load',_toTop);</script>
-        <h1>🔧 FPP SMS Plugin Status v2.5</h1>
+        <h1>🔧 Text My Lights — Status</h1>
         <button onclick="location.href='/'">← Back</button>
         <button onclick="location.reload()">🔄 Refresh</button>
         
@@ -6168,6 +7347,7 @@ def view_messages():
             .displayed { color: #4CAF50; }
             button { background: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin: 10px 5px 10px 0; }
             .block-btn { background: #f44336; padding: 5px 10px; font-size: 12px; }
+            .respond-btn { background: #1976d2; padding: 4px 10px; font-size: 12px; margin: 0 0 0 8px; }
             .clear-btn { background: #f44336; }
             .info { background: #e3f2fd; padding: 10px; border-radius: 5px; margin: 10px 0; font-size: 14px; border: 1px solid #90caf9; color: #333; }
             .queue-box { background: #f3e5f5; padding: 20px; border-radius: 5px; margin: 20px 0; border: 1px solid #ce93d8; color: #333; }
@@ -6223,7 +7403,7 @@ def view_messages():
                 <p style="color:#333; font-weight:bold; margin-bottom:16px;">What would you like to block?</p>
                 <div style="display:flex; flex-direction:column; gap:10px;">
                     <button style="background:#f44336; color:white; padding:12px; border:none; border-radius:5px; cursor:pointer;"
-                            onclick="blockPhone(document.getElementById('block-modal').dataset.phone)">Block this number from texting again</button>
+                            onclick="blockPhone()">Block this number from texting again</button>
                     <button id="modal-block-name-btn" style="background:#FF9800; color:white; padding:12px; border:none; border-radius:5px; cursor:pointer;"
                             onclick="blockNameFromDisplay()">Block this name from being displayed</button>
                     <p id="whitelist-warning" style="color:#f44336; font-size:12px; margin:0; padding:4px 0; display:none;">
@@ -6235,8 +7415,31 @@ def view_messages():
             </div>
         </div>
 
+        <!-- Respond modal -->
+        <div id="respond-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:1000; align-items:center; justify-content:center;">
+            <div style="background:#fff; border-radius:8px; padding:28px; max-width:460px; width:90%; box-shadow:0 4px 20px rgba(0,0,0,0.3);">
+                <h3 style="margin-top:0; color:#333;">Send a Reply</h3>
+                <p style="color:#555; margin-bottom:12px;">To: <strong id="respond-to"></strong></p>
+                <textarea id="respond-text" rows="4" maxlength="300"
+                          style="width:100%; box-sizing:border-box; padding:10px; border:1px solid #ccc; border-radius:5px; font-size:14px; font-family:inherit; resize:vertical;"
+                          placeholder="Type your reply..."></textarea>
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-top:6px;">
+                    <span id="respond-count" style="color:#999; font-size:12px;">0 / 300</span>
+                    <span id="respond-status" style="font-size:13px;"></span>
+                </div>
+                <div style="display:flex; gap:10px; margin-top:16px;">
+                    <button id="respond-send-btn" style="background:#1976d2; color:white; padding:12px; border:none; border-radius:5px; cursor:pointer; flex:1;"
+                            onclick="sendRespond()">Send Reply</button>
+                    <button style="background:#aaa; color:white; padding:12px 18px; border:none; border-radius:5px; cursor:pointer;"
+                            onclick="closeRespondModal()">Cancel</button>
+                </div>
+            </div>
+        </div>
+
         <script>
             var useWhitelist = {{ config.get('use_whitelist', False) | tojson }};
+            // Manual replies only work over Google Voice (Twilio has no reply path).
+            var canRespond = {{ (config.get('message_source') == 'google_voice') | tojson }};
             var modalOpen = false;
             var refreshTimer = null;
             var prevQueueJson = null;
@@ -6347,12 +7550,23 @@ def view_messages():
                     var label = statusLabel[msg.status] || esc(msg.status);
                     var btn = '';
                     if (showBlock && msg.phone_full !== 'Local Testing') {
-                        btn = '<button class="block-btn" data-phone="' + esc(msg.phone_full) + '" data-name="' + esc(msg.extracted_name) +
-                              '" onclick="showBlockModal(this.dataset.phone,this.dataset.name)">Block</button>';
+                        // Block by reference (timestamp + log date) — the full number
+                        // stays server-side; we only carry the masked value for display.
+                        btn = '<button class="block-btn" data-ts="' + esc(msg.timestamp) + '" data-date="' + esc(msg._log_date || '') +
+                              '" data-masked="' + esc(msg.phone) + '" data-name="' + esc(msg.extracted_name) +
+                              '" onclick="showBlockModal(this.dataset.masked,this.dataset.name,this.dataset.ts,this.dataset.date)">Block</button>';
+                    }
+                    // Respond button sits next to the phone number. Google Voice only,
+                    // and only when this message carries a stored reply context.
+                    var respond = '';
+                    if (canRespond && msg.can_respond) {
+                        respond = '<button class="respond-btn" data-ts="' + esc(msg.timestamp) + '" data-date="' + esc(msg._log_date || '') +
+                                  '" data-masked="' + esc(msg.phone) +
+                                  '" onclick="showRespondModal(this.dataset.masked,this.dataset.ts,this.dataset.date)">Respond</button>';
                     }
                     return '<tr class="' + esc(msg.status) + '">' +
                         '<td>' + fmtTime(msg.timestamp) + '</td>' +
-                        '<td>' + esc(msg.phone) + '</td>' +
+                        '<td>' + esc(msg.phone) + respond + '</td>' +
                         '<td>' + esc(msg.message) + '</td>' +
                         '<td>' + esc(msg.extracted_name) + '</td>' +
                         '<td class="' + esc(msg.status) + '">' + label + '</td>' +
@@ -6361,16 +7575,18 @@ def view_messages():
                 return '<table><tr><th>Timestamp</th><th>Phone</th><th>Message</th><th>Name</th><th>Status</th><th>Action</th></tr>' + rows + '</table>';
             }
 
-            function showBlockModal(phone, name) {
+            function showBlockModal(masked, name, ts, date) {
                 modalOpen = true;
-                document.getElementById('modal-phone').textContent = phone;
+                document.getElementById('modal-phone').textContent = masked;
                 document.getElementById('modal-name-text').textContent = name || '(no name)';
                 document.getElementById('modal-block-name-btn').disabled = !name;
                 document.getElementById('modal-block-name-btn').style.opacity = name ? '1' : '0.4';
                 document.getElementById('whitelist-warning').style.display = useWhitelist ? 'none' : 'block';
-                document.getElementById('block-modal').dataset.phone = phone;
-                document.getElementById('block-modal').dataset.name = name || '';
-                document.getElementById('block-modal').style.display = 'flex';
+                var modal = document.getElementById('block-modal');
+                modal.dataset.ts = ts || '';
+                modal.dataset.date = date || '';
+                modal.dataset.name = name || '';
+                modal.style.display = 'flex';
             }
 
             function closeBlockModal() {
@@ -6379,11 +7595,13 @@ def view_messages():
                 scheduleRefresh();
             }
 
-            function blockPhone(phone) {
+            function blockPhone() {
+                var modal = document.getElementById('block-modal');
+                var ts = modal.dataset.ts, date = modal.dataset.date;
                 closeBlockModal();
-                fetch('/api/phone/block', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({phone:phone}) })
+                fetch('/api/phone/block', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ts:ts, date:date}) })
                     .then(function(r) { return r.json(); })
-                    .then(function(data) { if (data.success) alert('Phone number blocked!'); refreshData(); });
+                    .then(function(data) { alert(data.success ? 'Phone number blocked!' : ('Could not block: ' + (data.error || 'unknown error'))); refreshData(); });
             }
 
             function blockNameFromDisplay() {
@@ -6397,6 +7615,61 @@ def view_messages():
                         refreshData();
                     });
             }
+
+            function showRespondModal(masked, ts, date) {
+                modalOpen = true;
+                var modal = document.getElementById('respond-modal');
+                document.getElementById('respond-to').textContent = masked;
+                var ta = document.getElementById('respond-text');
+                ta.value = '';
+                document.getElementById('respond-count').textContent = '0 / 300';
+                document.getElementById('respond-status').textContent = '';
+                document.getElementById('respond-send-btn').disabled = false;
+                modal.dataset.ts = ts || '';
+                modal.dataset.date = date || '';
+                modal.style.display = 'flex';
+                ta.focus();
+            }
+
+            function closeRespondModal() {
+                modalOpen = false;
+                document.getElementById('respond-modal').style.display = 'none';
+                scheduleRefresh();
+            }
+
+            function sendRespond() {
+                var modal = document.getElementById('respond-modal');
+                var text = document.getElementById('respond-text').value.trim();
+                var status = document.getElementById('respond-status');
+                if (!text) { status.style.color = '#f44336'; status.textContent = 'Enter a message first.'; return; }
+                var btn = document.getElementById('respond-send-btn');
+                btn.disabled = true;
+                status.style.color = '#555'; status.textContent = 'Sending...';
+                fetch('/api/respond', {
+                    method: 'POST', headers: {'Content-Type':'application/json'},
+                    body: JSON.stringify({ ts: modal.dataset.ts, date: modal.dataset.date, text: text })
+                })
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (data.success) {
+                        status.style.color = '#4CAF50'; status.textContent = '✓ Reply sent!';
+                        setTimeout(closeRespondModal, 1000);
+                    } else {
+                        status.style.color = '#f44336'; status.textContent = '✗ ' + (data.error || 'Send failed');
+                        btn.disabled = false;
+                    }
+                })
+                .catch(function() {
+                    status.style.color = '#f44336'; status.textContent = '✗ Send failed';
+                    btn.disabled = false;
+                });
+            }
+
+            document.addEventListener('input', function(e) {
+                if (e.target && e.target.id === 'respond-text') {
+                    document.getElementById('respond-count').textContent = e.target.value.length + ' / 300';
+                }
+            });
 
             function clearHistory() {
                 if (confirm("Clear all of today's messages?")) {
@@ -6421,7 +7694,7 @@ def api_activate():
 
     # Require a default waiting playlist — without one the show has no defined state
     if not config.get('default_playlist', '').strip():
-        msg = "ERROR: No Default Waiting Playlist configured. Set one in the plugin settings before running TwilioStart."
+        msg = "ERROR: No Default Waiting Playlist configured. Set one in the plugin settings before running Text My Lights Start."
         logging.error(msg)
         return jsonify({"success": False, "error": msg}), 400
 
@@ -6429,21 +7702,16 @@ def api_activate():
     stop_polling = False
     save_config()
 
-    # Start polling thread if not already running
-    if twilio_client:
-        if not polling_thread or not polling_thread.is_alive():
-            polling_thread = threading.Thread(target=poll_twilio, daemon=True)
-            polling_thread.start()
-            logging.info("▶️  Activate: SMS polling started")
-    else:
-        logging.warning("⚠️  Activate: Twilio credentials not configured, polling not started")
+    # Start the poller for the selected message source if not already running
+    if not start_polling_if_needed():
+        logging.warning("⚠️  Activate: message source not configured, polling not started")
 
     # Start the default waiting playlist
     result = start_default_playlist()
 
-    logging.info(f"✅ TwilioStart activated — playlist {'started' if result else 'FAILED to start'}")
+    logging.info(f"✅ Text My Lights Start activated — playlist {'started' if result else 'FAILED to start'}")
     return jsonify({"success": True, "playlist_started": result,
-                    "message": "Twilio SMS plugin activated"})
+                    "message": "Text My Lights plugin activated"})
 
 
 @app.route('/api/deactivate', methods=['GET', 'POST'])
@@ -6480,14 +7748,14 @@ def api_deactivate():
     except Exception as e:
         logging.warning(f"Could not stop FPP playback: {e}")
 
-    logging.info("🛑 TwilioStop: disabled, polling stopped, playlist stopped")
-    return jsonify({"success": True, "message": "Twilio SMS plugin deactivated"})
+    logging.info("🛑 Text My Lights Stop: disabled, polling stopped, playlist stopped")
+    return jsonify({"success": True, "message": "Text My Lights plugin deactivated"})
 
 
 if __name__ == '__main__':
     # Migrate files from old scattered paths to the new plugin data directory
     _migrations = [
-        ("/home/fpp/media/config/plugin.fpp-sms-twilio.json", CONFIG_FILE),
+        ("/home/fpp/media/config/plugin.fpp-textmylights.json", CONFIG_FILE),
         ("/home/fpp/media/config/blocked_phones.json",         BLOCKLIST_FILE),
         ("/home/fpp/media/config/last_message_sid.txt",        LAST_SID_FILE),
         ("/home/fpp/media/config/queue_pending.json",          QUEUE_FILE),
@@ -6523,11 +7791,10 @@ if __name__ == '__main__':
     display_thread = threading.Thread(target=display_worker, daemon=True)
     display_thread.start()
 
-    # Polling thread starts if Twilio is configured — runs in standby (show_not_live
-    # replies) when disabled, and processes names normally when enabled
-    if twilio_client:
-        polling_thread = threading.Thread(target=poll_twilio, daemon=True)
-        polling_thread.start()
+    # Polling thread starts if the selected source is configured — runs in
+    # standby (show_not_live replies) when disabled, and processes names normally
+    # when enabled. Picks Twilio or Google Voice based on message_source.
+    start_polling_if_needed()
 
     # Start the default waiting playlist on launch if the plugin is already enabled
     if config['enabled']:
@@ -6537,5 +7804,5 @@ if __name__ == '__main__':
             start_default_playlist()
         threading.Thread(target=_start_default, daemon=True).start()
 
-    logging.info("FPP SMS Plugin v2.5 starting...")
+    logging.info("Text My Lights plugin starting...")
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)

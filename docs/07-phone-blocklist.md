@@ -93,7 +93,7 @@ The block check uses the phone number's **full E.164 format** (e.g., `+155512345
 Blocked phone numbers are stored in:
 
 ```
-/opt/fpp/plugins/fpp-plugin-sms-twilio/blocked_phones.json
+/opt/fpp/plugins/fpp-plugin-textmylights/blocked_phones.json
 ```
 
 This is a JSON file, for example:

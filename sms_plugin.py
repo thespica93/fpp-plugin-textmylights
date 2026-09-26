@@ -429,8 +429,6 @@ def load_config():
         # newest on first poll so the whole inbox isn't replayed)
         last_gv_uid = load_last_gv_uid()
 
-        # Drop responses whose trigger can't fire (limit 0 / duplicates allowed)
-        _apply_source_policy()
         save_config()
 
         logging.info("Configuration loaded successfully")
@@ -484,39 +482,32 @@ def save_config():
         logging.error(f"Error saving config: {e}")
 
 
-def _apply_source_policy():
-    """Keep the saved config self-consistent with the selected message source.
+def _response_is_muted(message_type):
+    """Return True when this auto-response must not send right now because a
+    companion setting has "greyed it out" — WITHOUT touching the stored toggle.
 
-    SMS auto-responses only have a working outbound path over Google Voice
-    (reply-to-email); Twilio has no reply path in this plugin and the config
-    page hides the whole SMS Responses tab under Twilio. So under Twilio we
-    force every response OFF — otherwise a stale toggle left over from Google
-    Voice would imply a reply that can never be sent.
+    The config page disables (greys) a response row when another setting makes
+    it moot, but deliberately never unchecks the toggle, so the user's on/off
+    choice survives the row un-greying. We mirror that on the backend: the send
+    path honors the mute at runtime, while plugin.json keeps the last state. The
+    toggle only ever changes when the user changes it.
 
-    We do NOT force Max Messages Per Phone or Allow Duplicate Names to source
-    defaults here. Those are the user's to set (the config page seeds sensible
-    defaults when the source is switched), and clobbering them on every save is
-    what previously made the Duplicate / Rate-Limited responses impossible to
-    enable under Google Voice.
+      - Any response over Twilio — the plugin has no Twilio reply path, so the
+        SMS Responses tab is hidden and nothing may send.
+      - rate-limited when Max Messages Per Phone is 0 (nobody is ever limited).
+      - duplicate    when Allow Duplicate Names is on (never a duplicate).
 
-    We still drop the two responses whose trigger genuinely can't fire:
-      - rate-limited → off when Max Messages Per Phone is 0 (nobody is limited)
-      - duplicate    → off when duplicate names are allowed (never a duplicate)
-
-    Invalid-format is intentionally not touched: the whitelist only greys it in
-    the UI and the send path already skips it while the whitelist is on, so the
-    user's on/off choice is preserved for when the whitelist is turned back off.
-
-    Mutates `config` in place; caller is responsible for saving."""
+    Invalid-Format / Too-Long / Not-Whitelisted are intentionally NOT muted
+    here: the single-name path greys them under the whitelist, but the
+    grouped-text path reuses the Invalid-Format reply for whitelist rejects,
+    and their single-name triggers can't fire in the greyed case anyway."""
     if config.get('message_source', 'twilio') != 'google_voice':
-        for key in list(config.keys()):
-            if key.startswith('sms_response_'):
-                config[key] = False
-
-    if config.get('max_messages_per_phone', 0) == 0:
-        config['sms_response_rate_limited'] = False
-    if config.get('allow_duplicate_names', False):
-        config['sms_response_duplicate'] = False
+        return True
+    if message_type == 'rate_limited' and config.get('max_messages_per_phone', 0) == 0:
+        return True
+    if message_type == 'duplicate' and config.get('allow_duplicate_names', False):
+        return True
+    return False
 
 _font_path_cache = {}
 
@@ -1595,6 +1586,11 @@ def send_sms_response(to_phone, message_type):
     if not config.get(f'sms_response_{message_type}', False):
         return False
 
+    # Honor the "greyed out" state at send time without ever having persisted
+    # the toggle to off, so the stored on/off choice survives the row un-greying.
+    if _response_is_muted(message_type):
+        return False
+
     # Get the appropriate response message
     response_key = f"response_{message_type}"
     response_message = config.get(response_key, "")
@@ -1650,14 +1646,16 @@ def _sanitize_header(value):
         return ''
     return re.sub(r'[\r\n\x00]+', ' ', str(value)).strip()
 
-def send_gv_reply(text, message_type=""):
+def send_gv_reply(text, message_type="", ctx=None):
     """Send an outbound SMS via Google Voice by replying to the forwarding email.
 
     Replying to the notification email from the same Gmail account causes Google
     Voice to deliver the reply body as an SMS to the original sender. Uses the
-    reply context (target address + threading headers) captured by the poller
-    for the message currently being processed."""
-    ctx = _gv_reply_ctx
+    reply context (target address + threading headers) — an explicit `ctx` when
+    given (e.g. a manual reply from the queue page, resolved from the message
+    log), otherwise the one captured by the poller for the message currently
+    being processed."""
+    ctx = ctx if ctx is not None else _gv_reply_ctx
     if not ctx or not ctx.get('to'):
         logging.warning("GV reply: no reply context for current message; cannot respond")
         return False
@@ -1912,6 +1910,10 @@ def redact_messages(messages, log_date):
         m['phone'] = masked
         m['phone_full'] = masked
         m['_log_date'] = log_date
+        # Expose only whether a reply is possible; the stored reply context
+        # (real reply-to address + threading headers) never leaves the server.
+        m['can_respond'] = bool((m.get('reply_ctx') or {}).get('to'))
+        m.pop('reply_ctx', None)
         out.append(m)
     return out
 
@@ -1931,6 +1933,25 @@ def _phone_from_log_ref(date_str, ts):
                 return m.get('phone_full') or m.get('phone')
     except Exception as e:
         logging.error(f"Block-by-reference resolve failed: {e}")
+    return None
+
+def _reply_ctx_from_log_ref(date_str, ts):
+    """Resolve the stored Google Voice reply context of a logged message by
+    (date, timestamp). Mirrors _phone_from_log_ref: the reply-to address and
+    threading headers stay server-side, so the browser only ever holds the
+    (date, ts) reference — never the real address."""
+    try:
+        if date_str:
+            path = get_day_log_path(datetime.strptime(date_str, "%Y-%m-%d").date())
+        else:
+            path = get_day_log_path()
+        with open(path, 'r') as f:
+            messages = json.load(f)
+        for m in messages:
+            if m.get('timestamp') == ts:
+                return m.get('reply_ctx')
+    except Exception as e:
+        logging.error(f"Reply-context resolve failed: {e}")
     return None
 
 def _client_error(context, exc, status=None):
@@ -2061,7 +2082,7 @@ def log_message(phone, message, name, status, counts=True):
                 logs = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             logs = []
-        logs.append({
+        entry = {
             "timestamp": datetime.now().isoformat(),
             "phone": phone,
             "phone_full": phone,
@@ -2069,7 +2090,14 @@ def log_message(phone, message, name, status, counts=True):
             "extracted_name": name,
             "status": status,
             "counts_toward_limit": counts
-        })
+        }
+        # Under Google Voice, stash how to reply to this exact message (target
+        # address + threading headers) so the queue page's Respond button can
+        # answer it later. Kept server-side only — redact_messages() strips it
+        # before anything reaches the browser.
+        if config.get('message_source') == 'google_voice' and _gv_reply_ctx and _gv_reply_ctx.get('to'):
+            entry["reply_ctx"] = _gv_reply_ctx
+        logs.append(entry)
         with open(log_path, 'w') as f:
             json.dump(logs, f, indent=2)
         logging.info(f"✅ Message logged: {phone[-4:]} | {name} | {status}")
@@ -6034,9 +6062,6 @@ def update_config():
         if config.get('twilio_phone_number'):
             config['twilio_phone_number'] = re.sub(r'[^\d+]', '', config['twilio_phone_number'])
 
-        # Drop responses whose trigger can't fire (limit 0 / duplicates allowed)
-        _apply_source_policy()
-
         save_config()
 
         # Keep the Twilio client in sync whenever credentials are present, so the
@@ -6550,6 +6575,31 @@ def api_block_phone():
         return jsonify({"success": False, "error": "Could not resolve the number to block"})
     except Exception as e:
         return _client_error("api_block_phone", e)
+
+@app.route('/api/respond', methods=['POST'])
+def api_respond():
+    """Send a manual custom reply to a logged message from the queue page.
+
+    Google Voice only — Twilio has no reply path in this plugin. The message is
+    identified by (date, timestamp); its stored reply context is resolved
+    server-side so the real reply-to address never touches the browser."""
+    try:
+        if config.get('message_source') != 'google_voice':
+            return jsonify({"success": False,
+                            "error": "Replies are only available when Google Voice is the active source."}), 400
+        data = request.json or {}
+        text = (data.get('text') or '').strip()
+        if not text:
+            return jsonify({"success": False, "error": "Message text is required."}), 400
+        ctx = _reply_ctx_from_log_ref(data.get('date'), data.get('ts'))
+        if not ctx or not ctx.get('to'):
+            return jsonify({"success": False,
+                            "error": "No reply context stored for this message — it can't be answered."}), 400
+        if send_gv_reply(text, "manual_reply", ctx=ctx):
+            return jsonify({"success": True})
+        return jsonify({"success": False, "error": "Send failed — see the plugin log for details."})
+    except Exception as e:
+        return _client_error("api_respond", e)
 
 @app.route('/api/phone/unblock', methods=['POST'])
 def api_unblock_phone():
@@ -7297,6 +7347,7 @@ def view_messages():
             .displayed { color: #4CAF50; }
             button { background: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin: 10px 5px 10px 0; }
             .block-btn { background: #f44336; padding: 5px 10px; font-size: 12px; }
+            .respond-btn { background: #1976d2; padding: 4px 10px; font-size: 12px; margin: 0 0 0 8px; }
             .clear-btn { background: #f44336; }
             .info { background: #e3f2fd; padding: 10px; border-radius: 5px; margin: 10px 0; font-size: 14px; border: 1px solid #90caf9; color: #333; }
             .queue-box { background: #f3e5f5; padding: 20px; border-radius: 5px; margin: 20px 0; border: 1px solid #ce93d8; color: #333; }
@@ -7364,8 +7415,31 @@ def view_messages():
             </div>
         </div>
 
+        <!-- Respond modal -->
+        <div id="respond-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:1000; align-items:center; justify-content:center;">
+            <div style="background:#fff; border-radius:8px; padding:28px; max-width:460px; width:90%; box-shadow:0 4px 20px rgba(0,0,0,0.3);">
+                <h3 style="margin-top:0; color:#333;">Send a Reply</h3>
+                <p style="color:#555; margin-bottom:12px;">To: <strong id="respond-to"></strong></p>
+                <textarea id="respond-text" rows="4" maxlength="300"
+                          style="width:100%; box-sizing:border-box; padding:10px; border:1px solid #ccc; border-radius:5px; font-size:14px; font-family:inherit; resize:vertical;"
+                          placeholder="Type your reply..."></textarea>
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-top:6px;">
+                    <span id="respond-count" style="color:#999; font-size:12px;">0 / 300</span>
+                    <span id="respond-status" style="font-size:13px;"></span>
+                </div>
+                <div style="display:flex; gap:10px; margin-top:16px;">
+                    <button id="respond-send-btn" style="background:#1976d2; color:white; padding:12px; border:none; border-radius:5px; cursor:pointer; flex:1;"
+                            onclick="sendRespond()">Send Reply</button>
+                    <button style="background:#aaa; color:white; padding:12px 18px; border:none; border-radius:5px; cursor:pointer;"
+                            onclick="closeRespondModal()">Cancel</button>
+                </div>
+            </div>
+        </div>
+
         <script>
             var useWhitelist = {{ config.get('use_whitelist', False) | tojson }};
+            // Manual replies only work over Google Voice (Twilio has no reply path).
+            var canRespond = {{ (config.get('message_source') == 'google_voice') | tojson }};
             var modalOpen = false;
             var refreshTimer = null;
             var prevQueueJson = null;
@@ -7482,9 +7556,17 @@ def view_messages():
                               '" data-masked="' + esc(msg.phone) + '" data-name="' + esc(msg.extracted_name) +
                               '" onclick="showBlockModal(this.dataset.masked,this.dataset.name,this.dataset.ts,this.dataset.date)">Block</button>';
                     }
+                    // Respond button sits next to the phone number. Google Voice only,
+                    // and only when this message carries a stored reply context.
+                    var respond = '';
+                    if (canRespond && msg.can_respond) {
+                        respond = '<button class="respond-btn" data-ts="' + esc(msg.timestamp) + '" data-date="' + esc(msg._log_date || '') +
+                                  '" data-masked="' + esc(msg.phone) +
+                                  '" onclick="showRespondModal(this.dataset.masked,this.dataset.ts,this.dataset.date)">Respond</button>';
+                    }
                     return '<tr class="' + esc(msg.status) + '">' +
                         '<td>' + fmtTime(msg.timestamp) + '</td>' +
-                        '<td>' + esc(msg.phone) + '</td>' +
+                        '<td>' + esc(msg.phone) + respond + '</td>' +
                         '<td>' + esc(msg.message) + '</td>' +
                         '<td>' + esc(msg.extracted_name) + '</td>' +
                         '<td class="' + esc(msg.status) + '">' + label + '</td>' +
@@ -7533,6 +7615,61 @@ def view_messages():
                         refreshData();
                     });
             }
+
+            function showRespondModal(masked, ts, date) {
+                modalOpen = true;
+                var modal = document.getElementById('respond-modal');
+                document.getElementById('respond-to').textContent = masked;
+                var ta = document.getElementById('respond-text');
+                ta.value = '';
+                document.getElementById('respond-count').textContent = '0 / 300';
+                document.getElementById('respond-status').textContent = '';
+                document.getElementById('respond-send-btn').disabled = false;
+                modal.dataset.ts = ts || '';
+                modal.dataset.date = date || '';
+                modal.style.display = 'flex';
+                ta.focus();
+            }
+
+            function closeRespondModal() {
+                modalOpen = false;
+                document.getElementById('respond-modal').style.display = 'none';
+                scheduleRefresh();
+            }
+
+            function sendRespond() {
+                var modal = document.getElementById('respond-modal');
+                var text = document.getElementById('respond-text').value.trim();
+                var status = document.getElementById('respond-status');
+                if (!text) { status.style.color = '#f44336'; status.textContent = 'Enter a message first.'; return; }
+                var btn = document.getElementById('respond-send-btn');
+                btn.disabled = true;
+                status.style.color = '#555'; status.textContent = 'Sending...';
+                fetch('/api/respond', {
+                    method: 'POST', headers: {'Content-Type':'application/json'},
+                    body: JSON.stringify({ ts: modal.dataset.ts, date: modal.dataset.date, text: text })
+                })
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (data.success) {
+                        status.style.color = '#4CAF50'; status.textContent = '✓ Reply sent!';
+                        setTimeout(closeRespondModal, 1000);
+                    } else {
+                        status.style.color = '#f44336'; status.textContent = '✗ ' + (data.error || 'Send failed');
+                        btn.disabled = false;
+                    }
+                })
+                .catch(function() {
+                    status.style.color = '#f44336'; status.textContent = '✗ Send failed';
+                    btn.disabled = false;
+                });
+            }
+
+            document.addEventListener('input', function(e) {
+                if (e.target && e.target.id === 'respond-text') {
+                    document.getElementById('respond-count').textContent = e.target.value.length + ' / 300';
+                }
+            });
 
             function clearHistory() {
                 if (confirm("Clear all of today's messages?")) {

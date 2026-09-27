@@ -74,10 +74,40 @@ FPP_VIDEOS_PATH    = '/home/fpp/media/videos'
 FPP_IMAGES_PATH    = '/home/fpp/media/images'
 FPP_PLAYLISTS_PATH = '/home/fpp/media/playlists'
 FPP_CONFIG_DIR     = '/home/fpp/media/config'
-# FPP stores its Pixel Overlay Model definitions (the "matrix" the plugin draws
-# text onto) in this file. Included in config export so the target Pi resolves
-# the same overlay model name.
-OVERLAY_MODELS_FILE = os.path.join(FPP_CONFIG_DIR, 'model-overlays.json')
+# FPP keeps Pixel Overlay Models (the "matrix" the plugin draws text onto) as
+# "Other" channel outputs, stored in co-other.json — NOT a dedicated
+# model-overlays.json (which doesn't exist on standard installs). Confirmed via
+# the on-device overlay diagnostic. Export finds the file dynamically
+# (_find_overlay_config_file) so it adapts if a setup differs.
+OVERLAY_MODELS_FILE = os.path.join(FPP_CONFIG_DIR, 'co-other.json')
+
+def _find_overlay_config_file():
+    """Return the FPP config file that actually holds the overlay model. Pixel
+    Overlay Models live in co-other.json on standard installs; to be robust we
+    also scan the config dir for the configured model name and prefer whatever
+    file contains it. Returns None if nothing is found."""
+    model = ''
+    try:
+        model = config.get('overlay_model_name', '') or ''
+    except Exception:
+        pass
+    if model:
+        try:
+            for fn in sorted(os.listdir(FPP_CONFIG_DIR)):
+                fp = os.path.join(FPP_CONFIG_DIR, fn)
+                if not os.path.isfile(fp) or not fn.endswith('.json'):
+                    continue
+                if os.path.getsize(fp) > 2_000_000:
+                    continue
+                try:
+                    with open(fp, 'r', errors='ignore') as f:
+                        if model in f.read():
+                            return fp
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return OVERLAY_MODELS_FILE if os.path.isfile(OVERLAY_MODELS_FILE) else None
 
 # Whitelist/blacklist source files stay in the plugin git repo directory
 BLACKLIST_FILE = os.path.join(PLUGIN_DIR, "blacklist.txt")
@@ -3836,41 +3866,69 @@ def index():
                         alert('Export failed: ' + ((err && err.message) || err));
                     });
                 };
+                // Holds the file the user picked, until they confirm the import in
+                // the (parent-owned) modal.
+                var _tmlImportFile = null;
+
+                // POST the chosen bundle to the import endpoint (same-origin, cookie
+                // auth). Returns a Promise resolving to the server's JSON result.
+                function _tmlDoImport(file) {
+                    var fd = new FormData();
+                    fd.append('file', file);
+                    return fetch('/api/config/import', { method: 'POST', body: fd })
+                        .then(function(r) { return r.json(); });
+                }
+
                 window.importConfig = function(input) {
                     var file = input.files && input.files[0];
+                    input.value = '';                 // let the same file be re-picked later
                     if (!file) return;
+                    _tmlImportFile = file;
+                    // Framed (normal case): let the parent show a fixed, centred confirm
+                    // modal and drive the progress UI.
+                    if (window.parent !== window) {
+                        try { window.parent.postMessage({ type: 'tml_openImport', name: file.name }, '*'); return; } catch (e) {}
+                    }
+                    // Fallback (page opened directly): confirm + import inline.
                     if (!confirm('Import configuration from "' + file.name + '"? '
                         + 'This overwrites the plugin settings, block/whitelist, the referenced '
                         + 'content files, and the overlay model on THIS Pi. Your saved credentials '
-                        + 'are kept. Continue?')) {
-                        input.value = '';
-                        return;
-                    }
+                        + 'are kept. Continue?')) { _tmlImportFile = null; return; }
                     var status = document.getElementById('import_status');
-                    status.style.color = '#555';
-                    status.textContent = 'Importing...';
-                    var fd = new FormData();
-                    fd.append('file', file);
-                    fetch('/api/config/import', {method: 'POST', body: fd})
-                        .then(function(r) { return r.json(); })
-                        .then(function(d) {
-                            if (d.success) {
-                                var msg = 'Imported.';
-                                if (d.warnings && d.warnings.length) msg += ' (' + d.warnings.length + ' warning' + (d.warnings.length > 1 ? 's' : '') + ')';
-                                status.style.color = '#2e7d32';
-                                status.textContent = msg + ' Reloading...';
-                                setTimeout(function() { location.reload(); }, 1400);
-                            } else {
-                                status.style.color = '#c62828';
-                                status.textContent = 'Error: ' + (d.error || 'Import failed');
-                            }
-                        })
-                        .catch(function() {
+                    status.style.color = '#555'; status.textContent = 'Importing...';
+                    _tmlDoImport(file).then(function(d) {
+                        if (d.success) {
+                            status.style.color = '#2e7d32';
+                            status.textContent = 'Imported. Reloading...';
+                            setTimeout(function() { location.reload(); }, 1400);
+                        } else {
                             status.style.color = '#c62828';
-                            status.textContent = 'Import request failed.';
-                        })
-                        .finally(function() { input.value = ''; });
+                            status.textContent = 'Error: ' + (d.error || 'Import failed');
+                        }
+                    }).catch(function() {
+                        status.style.color = '#c62828';
+                        status.textContent = 'Import request failed.';
+                    });
                 };
+
+                // Parent modal drives the framed import: it asks us to run it, waits
+                // for tml_importDone, then reloads this iframe on success.
+                window.addEventListener('message', function(e) {
+                    if (!e.data) return;
+                    if (e.data.type === 'tml_doImport' && _tmlImportFile) {
+                        var f = _tmlImportFile; _tmlImportFile = null;
+                        _tmlDoImport(f).then(function(d) {
+                            try { window.parent.postMessage({ type: 'tml_importDone',
+                                success: !!d.success, error: d.error || '',
+                                warnings: (d.warnings || []).length, note: d.note || '' }, '*'); } catch (x) {}
+                        }).catch(function(err) {
+                            try { window.parent.postMessage({ type: 'tml_importDone', success: false,
+                                error: String((err && err.message) || err) }, '*'); } catch (x) {}
+                        });
+                    }
+                    if (e.data.type === 'tml_cancelImport') { _tmlImportFile = null; }
+                    if (e.data.type === 'tml_reloadFrame') { location.reload(); }
+                });
             </script>
 
         </div>
@@ -5778,6 +5836,22 @@ def index():
                         nameSelect.add(ig2);
                     }
 
+                    // If a stored content selection no longer exists in FPP (e.g. the
+                    // Waiting or Name sequence was deleted in the file manager), revert
+                    // it to None and persist that so the plugin stops referencing a file
+                    // that's gone. Guarded by !data.error so a partial FPP fetch can
+                    // never wipe a still-valid choice.
+                    if (!data.error) {
+                        var _hasOpt = function(sel, val) {
+                            if (!val) return true;   // '' (None) is always valid
+                            return Array.prototype.some.call(sel.options, function(o) { return o.value === val; });
+                        };
+                        var _stale = false;
+                        if (!_hasOpt(defaultSelect, currentDefault)) { defaultSelect.value = ''; _stale = true; }
+                        if (!_hasOpt(nameSelect, currentName))       { nameSelect.value = '';    _stale = true; }
+                        if (_stale) { saveConfig(); updateNameDisplayWarning(); }
+                    }
+
                     window._fppSeqList = data.sequences || [];
 
                     const modelSelect = document.getElementById('overlay_model_name');
@@ -6385,13 +6459,9 @@ def export_config():
             for cv in (config.get('default_playlist', ''), config.get('name_display_playlist', '')):
                 content_files.extend(_content_source_files(cv, warnings))
 
-        # Overlay model definition ("matrix").
-        overlay_files = []
-        if inc_overlay:
-            if os.path.isfile(OVERLAY_MODELS_FILE):
-                overlay_files.append(('overlay', OVERLAY_MODELS_FILE))
-            else:
-                warnings.append("Overlay model file not found — overlay model not exported")
+        # Overlay model ("matrix") — just the selected model's entry, not the whole
+        # channel-output config (written to the zip as a small JSON payload below).
+        overlay_payload = _extract_overlay_model(warnings) if inc_overlay else None
 
         # Write to a temp file (FSEQ can be large; avoid holding the whole zip in
         # RAM on a Pi). ZIP_STORED since FSEQ is already compressed.
@@ -6400,7 +6470,7 @@ def export_config():
         seen = set()
         included = []
         with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_STORED) as zf:
-            for arc_dir, path in settings_files + content_files + overlay_files:
+            for arc_dir, path in settings_files + content_files:
                 if not path or not os.path.isfile(path):
                     continue
                 arcname = f"{arc_dir}/{os.path.basename(path)}"
@@ -6410,6 +6480,11 @@ def export_config():
                 zf.write(path, arcname)
                 included.append(arcname)
 
+            # Single-model overlay payload (not a file on disk).
+            if overlay_payload:
+                zf.writestr('overlay/overlay-model.json', overlay_payload)
+                included.append('overlay/overlay-model.json')
+
             manifest = {
                 "bundle": BUNDLE_MARKER,
                 "format": BUNDLE_FORMAT,
@@ -6418,7 +6493,7 @@ def export_config():
                     "settings": inc_settings,
                     "lists": inc_lists,
                     "content": bool(content_files),
-                    "overlay_model": bool(overlay_files),
+                    "overlay_model": bool(overlay_payload),
                     "credentials": False,
                 },
                 "overlay_model_name": config.get('overlay_model_name', ''),
@@ -6451,72 +6526,136 @@ def export_config():
         logging.error(f"export_config failed: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
-def _merge_overlay_models(src_bytes, warnings):
-    """Merge exported overlay models into the target Pi's model-overlays.json by
-    model Name, so the imported model appears without wiping other models the
-    target already has. Backs up the existing file first."""
+def _overlay_items(data):
+    """Return (container_key, list) for the array of outputs/models inside an FPP
+    channel-output config. co-other.json uses 'channelOutputs'; some files use
+    'models'; a few are a bare list. container_key is None for a bare list."""
+    if isinstance(data, dict):
+        for k in ('channelOutputs', 'models'):
+            if isinstance(data.get(k), list):
+                return k, data[k]
+    if isinstance(data, list):
+        return None, data
+    return None, None
+
+def _extract_overlay_model(warnings):
+    """Build a minimal bundle payload containing ONLY the currently-selected
+    overlay model's entry (plus the metadata needed to merge it back), so export
+    never ships the whole channel-output config. Returns bytes, or None if the
+    model can't be located. The matching entry is found by any string field that
+    equals the configured model name (robust to FPP's field naming)."""
+    model = (config.get('overlay_model_name', '') or '').strip()
+    if not model:
+        warnings.append("No overlay model selected — overlay model not exported")
+        return None
+    ovl_file = _find_overlay_config_file()
+    if not ovl_file:
+        warnings.append("Overlay model config not found — overlay model not exported")
+        return None
     try:
-        src = json.loads(src_bytes)
+        with open(ovl_file, 'r') as f:
+            data = json.load(f)
+    except Exception as e:
+        warnings.append(f"Could not read overlay config: {e}")
+        return None
+    container_key, items = _overlay_items(data)
+    if items is None:
+        warnings.append("Overlay config had an unexpected shape — overlay model not exported")
+        return None
+    entry, name_field = None, None
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        for k, v in it.items():
+            if isinstance(v, str) and v == model:
+                entry, name_field = it, k
+                break
+        if entry is not None:
+            break
+    if entry is None:
+        warnings.append(f"Overlay model '{model}' not found in the config — not exported")
+        return None
+    payload = {
+        "__tml_overlay__": 1,
+        "dest_file": os.path.basename(ovl_file),   # e.g. co-other.json
+        "container_key": container_key,            # e.g. channelOutputs (or null=bare list)
+        "name_field": name_field,                  # which field names the model
+        "model": entry,
+    }
+    return json.dumps(payload, indent=2).encode('utf-8')
+
+def _merge_overlay_model(payload_bytes, warnings):
+    """Add (or update) just the one exported overlay model into the target Pi's
+    channel-output config, leaving every other output on that Pi untouched. Backs
+    up the target file first. Falls back to a full replace only for legacy bundles
+    that shipped a whole config file."""
+    try:
+        payload = json.loads(payload_bytes)
     except Exception:
-        warnings.append("Overlay model file in bundle was not valid JSON — skipped")
+        warnings.append("Overlay model in bundle was not valid JSON — skipped")
         return
 
-    def models_of(obj):
-        if isinstance(obj, dict) and isinstance(obj.get('models'), list):
-            return obj['models']
-        if isinstance(obj, list):
-            return obj
-        return None
+    # Legacy bundle (a whole config file, pre single-model export): full replace.
+    if not (isinstance(payload, dict) and payload.get("__tml_overlay__")):
+        dest_path = os.path.join(FPP_CONFIG_DIR, 'co-other.json')
+        os.makedirs(FPP_CONFIG_DIR, exist_ok=True)
+        if os.path.isfile(dest_path):
+            try:
+                shutil.copy2(dest_path, dest_path + '.tml-bak')
+            except OSError:
+                pass
+        with open(dest_path, 'wb') as f:
+            f.write(payload_bytes)
+        warnings.append("Imported a legacy overlay bundle by full replace (previous kept as .tml-bak)")
+        return
 
-    os.makedirs(FPP_CONFIG_DIR, exist_ok=True)
-    # Back up whatever is there now.
-    if os.path.isfile(OVERLAY_MODELS_FILE):
+    dest_file  = os.path.basename(payload.get('dest_file') or 'co-other.json')
+    dest_path  = os.path.join(FPP_CONFIG_DIR, dest_file)
+    key        = payload.get('container_key')
+    name_field = payload.get('name_field') or 'description'
+    entry      = payload.get('model')
+    if not isinstance(entry, dict):
+        warnings.append("Overlay model entry missing from bundle — skipped")
+        return
+    model_name = entry.get(name_field)
+
+    # Load the target config (or start fresh if it doesn't exist yet).
+    dest = None
+    if os.path.isfile(dest_path):
         try:
-            shutil.copy2(OVERLAY_MODELS_FILE, OVERLAY_MODELS_FILE + '.tml-bak')
+            with open(dest_path, 'r') as f:
+                dest = json.load(f)
+        except Exception:
+            warnings.append(f"Target {dest_file} was unreadable — overlay model skipped")
+            return
+
+    if key:
+        if not isinstance(dest, dict):
+            dest = {}
+        items = dest.get(key)
+        if not isinstance(items, list):
+            items = []
+            dest[key] = items
+    else:
+        if not isinstance(dest, list):
+            dest = []
+        items = dest
+
+    # Back up before writing.
+    os.makedirs(FPP_CONFIG_DIR, exist_ok=True)
+    if os.path.isfile(dest_path):
+        try:
+            shutil.copy2(dest_path, dest_path + '.tml-bak')
         except OSError:
             pass
 
-    src_models = models_of(src)
-    dest = {}
-    if os.path.isfile(OVERLAY_MODELS_FILE):
-        try:
-            with open(OVERLAY_MODELS_FILE, 'r') as f:
-                dest = json.load(f)
-        except Exception:
-            dest = {}
-    dest_models = models_of(dest)
+    # Replace an existing entry of the same name (update), else append (add).
+    items[:] = [it for it in items
+                if not (isinstance(it, dict) and it.get(name_field) == model_name)]
+    items.append(entry)
 
-    # If either side has an unrecognized shape, fall back to writing the bundle's
-    # file verbatim (already backed up above).
-    if src_models is None or dest_models is None:
-        with open(OVERLAY_MODELS_FILE, 'wb') as f:
-            f.write(src_bytes)
-        warnings.append("Overlay models merged by full replace (unrecognized schema); previous file kept as .tml-bak")
-        return
-
-    def name_of(m):
-        return m.get('Name') or m.get('name') if isinstance(m, dict) else None
-
-    order, by_name = [], {}
-    for m in dest_models:
-        n = name_of(m)
-        if n is not None and n not in by_name:
-            order.append(n)
-        by_name[n] = m
-    for m in src_models:
-        n = name_of(m)
-        if n not in by_name:
-            order.append(n)
-        by_name[n] = m  # bundle wins for matching names
-    merged = [by_name[n] for n in order]
-
-    if isinstance(dest, dict):
-        dest['models'] = merged
-        out = dest
-    else:
-        out = merged
-    with open(OVERLAY_MODELS_FILE, 'w') as f:
-        json.dump(out, f, indent=2)
+    with open(dest_path, 'w') as f:
+        json.dump(dest, f, indent=2)
 
 @app.route('/api/config/import', methods=['POST'])
 def import_config():
@@ -6605,7 +6744,9 @@ def import_config():
                 summary["content"] += 1
 
             elif arc_dir == 'overlay':
-                _merge_overlay_models(zf.read(entry), warnings)
+                # Add/update just the one exported model in the target's channel-
+                # output config, leaving the target's other outputs untouched.
+                _merge_overlay_model(zf.read(entry), warnings)
                 summary["overlay_model"] = True
 
             else:

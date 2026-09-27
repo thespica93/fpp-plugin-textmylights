@@ -5793,6 +5793,8 @@ def index():
                             sel.innerHTML = '<option value="FreeSans">FreeSans (default)</option>';
                         }
                     }
+                    // Font dropdowns are now populated — safe for autosave to read them.
+                    window._fontsReady = !!(fonts && fonts.length > 0);
                     return Promise.all(currentFonts.map(ensureFontLoaded));
                 })
                 .then(function() {
@@ -5964,10 +5966,6 @@ var _saveTimer = null;
                     default_playlist: document.getElementById('default_playlist').value,
                     name_display_playlist: document.getElementById('name_display_playlist').value,
                     overlay_model_name: document.getElementById('overlay_model_name').value,
-                    line_fonts: [0, 1, 2, 3].map(function(i) {
-                        var el = document.getElementById('line_' + (i + 1) + '_font');
-                        return el && el.value ? el.value : 'FreeSans';
-                    }),
                     overlay_model_width: parseInt(document.getElementById('overlay_model_width').value) || 0,
                     overlay_model_height: parseInt(document.getElementById('overlay_model_height').value) || 0,
                     message_lines: [
@@ -6004,6 +6002,20 @@ var _saveTimer = null;
                     response_blocked: document.getElementById('response_blocked').value,
                     response_show_not_live: document.getElementById('response_show_not_live').value
                 };
+
+                // Only persist the per-line fonts once loadFonts() has actually
+                // populated the font dropdowns. Otherwise an autosave that fires
+                // during page init (e.g. model-dimension sync or the stale-content
+                // reset, both inside loadFPPData) would read empty <select>s and
+                // overwrite the saved/imported fonts with the FreeSans default —
+                // which is exactly why imported fonts appeared to "not transfer".
+                // Omitting the key leaves the server's stored line_fonts untouched.
+                if (window._fontsReady) {
+                    data.line_fonts = [0, 1, 2, 3].map(function(i) {
+                        var el = document.getElementById('line_' + (i + 1) + '_font');
+                        return el && el.value ? el.value : 'FreeSans';
+                    });
+                }
 
                 fetch('/api/config', {
                     method: 'POST',

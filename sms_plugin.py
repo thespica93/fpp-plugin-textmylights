@@ -3737,10 +3737,6 @@ def index():
                     document.body.appendChild(a); a.click(); a.remove();
                     closeExportModal();
                 };
-                // Dismiss the modal when clicking the dimmed backdrop.
-                document.getElementById('export_modal').addEventListener('click', function(e) {
-                    if (e.target === this) closeExportModal();
-                });
 
                 // Backup & Restore: upload a bundle to /api/config/import, then
                 // reload so the imported settings render. Credentials are never
@@ -3799,7 +3795,7 @@ def index():
                  non-scrolling iframe, so position:fixed would not track the parent
                  window's scroll — instead the backdrop is sized to the full document
                  and the dialog is anchored just below the export buttons (in view). -->
-            <div id="export_modal" style="display:none; position:absolute; left:0; top:0; width:100%; background:rgba(0,0,0,0.5); z-index:1000;">
+            <div id="export_modal" onclick="if(event.target===this)closeExportModal()" style="display:none; position:absolute; left:0; top:0; width:100%; background:rgba(0,0,0,0.5); z-index:1000;">
                 <div id="export_dialog" style="position:absolute; left:50%; transform:translateX(-50%); background:#fff; color:#333; max-width:460px; width:92%; border-radius:8px; padding:22px; box-shadow:0 8px 30px rgba(0,0,0,0.35);">
                     <h3 style="margin:0 0 6px; color:#333;">💾 Export Config</h3>
                     <p class="help-text" style="margin:0 0 14px;">Choose what to include. Only the content <strong>this plugin is set to use</strong> is exported — never all of FPP's files. <strong>Credentials are never included.</strong></p>
@@ -4180,7 +4176,9 @@ def index():
                 <script>
                 function toggleResp(id) {
                     var row = document.getElementById('row_' + id);
-                    row.classList.toggle('enabled', document.getElementById('sms_response_' + id).checked);
+                    var cb = document.getElementById('sms_response_' + id);
+                    if (!row || !cb) return;   // never let a missing row abort init
+                    row.classList.toggle('enabled', cb.checked);
                 }
                 function initRespRows() {
                     ['show_not_live','blocked','profanity','duplicate','invalid_format','too_long','rate_limited','not_whitelisted','success'].forEach(function(id) {
@@ -5557,19 +5555,26 @@ def index():
             }
 
             // All DOM elements are above this script block — call init functions directly.
-            try { initCanvasPreview(); } catch(e) { console.error('Canvas init error:', e); }
+            // Each step is isolated: a failure in one (e.g. the FSEQ preview) must not
+            // abort the rest, or the credential-block toggle (setupAutoSave →
+            // updateSourceUI) would never run and the page would show the wrong
+            // provider's fields. Guard every call.
+            function _init(label, fn) {
+                try { fn(); } catch (e) { console.error(label + ' init error:', e); }
+            }
+            _init('canvas', function() { initCanvasPreview(); });
             // Load preview immediately using server-rendered dropdown value, then again after FPP data populates
-            if (window.toggleFseqPreview) window.toggleFseqPreview();
-            updateNameDisplayWarning();
-            loadFonts();
-            loadFPPData();
-            initRespRows();
-            checkWhitelistResponseState();
-            checkRateLimitResponseState();
-            checkDuplicateState();
-            updateWordsPreview();
-            setupAutoSave();
-            updateLiveStatus();
+            _init('fseqPreview', function() { if (window.toggleFseqPreview) window.toggleFseqPreview(); });
+            _init('nameDisplayWarning', updateNameDisplayWarning);
+            _init('fonts', loadFonts);
+            _init('fppData', loadFPPData);
+            _init('respRows', initRespRows);
+            _init('whitelistResp', checkWhitelistResponseState);
+            _init('rateLimitResp', checkRateLimitResponseState);
+            _init('duplicateResp', checkDuplicateState);
+            _init('wordsPreview', updateWordsPreview);
+            _init('autoSave', setupAutoSave);
+            _init('liveStatus', updateLiveStatus);
             setInterval(updateLiveStatus, 5000);
             for (var _li = 0; _li < 4; _li++) { updateLineSpeedRowVisibility(_li); updateLineOrientationRowVisibility(_li); }
             initValignButtons();

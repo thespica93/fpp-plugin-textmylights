@@ -3702,80 +3702,6 @@ def index():
                 checkFiltersState();
                 checkDuplicateState();
                 updateWordsPreview();
-
-                // Export modal: pick which sections to bundle, then trigger the
-                // download with the selection as query params. All boxes default
-                // checked (see markup) so the common case is one extra click.
-                window.openExportModal = function() {
-                    var modal = document.getElementById('export_modal');
-                    var dlg = document.getElementById('export_dialog');
-                    // Reparent to <body> so absolute coords resolve against the
-                    // document (not some positioned ancestor), matching the
-                    // viewport-relative rect below (the iframe has no scroll).
-                    if (modal.parentNode !== document.body) document.body.appendChild(modal);
-                    // Cover the whole document (no iframe scroll of its own).
-                    modal.style.height = document.documentElement.scrollHeight + 'px';
-                    modal.style.display = 'block';
-                    // Anchor the dialog just below the export buttons — where the
-                    // user is looking — since fixed positioning can't be used here.
-                    var rect = document.getElementById('backup_actions').getBoundingClientRect();
-                    dlg.style.top = Math.max(10, rect.bottom + 8) + 'px';
-                };
-                window.closeExportModal = function() {
-                    document.getElementById('export_modal').style.display = 'none';
-                };
-                window.doExport = function() {
-                    var s = document.getElementById('exp_settings').checked ? 1 : 0;
-                    var l = document.getElementById('exp_lists').checked ? 1 : 0;
-                    var c = document.getElementById('exp_content').checked ? 1 : 0;
-                    var o = document.getElementById('exp_overlay').checked ? 1 : 0;
-                    if (!s && !l && !c && !o) { alert('Select at least one thing to export.'); return; }
-                    var url = '/api/config/export?settings=' + s + '&lists=' + l + '&content=' + c + '&overlay=' + o;
-                    // Anchor with download attr streams the .zip without navigating the iframe.
-                    var a = document.createElement('a');
-                    a.href = url; a.download = '';
-                    document.body.appendChild(a); a.click(); a.remove();
-                    closeExportModal();
-                };
-
-                // Backup & Restore: upload a bundle to /api/config/import, then
-                // reload so the imported settings render. Credentials are never
-                // touched by import — this Pi keeps its own.
-                window.importConfig = function(input) {
-                    var file = input.files && input.files[0];
-                    if (!file) return;
-                    if (!confirm('Import configuration from "' + file.name + '"?\n\n'
-                        + 'This overwrites the plugin settings, block/whitelist, the referenced '
-                        + 'content files, and the overlay model on THIS Pi. Your saved credentials '
-                        + 'are kept. Continue?')) {
-                        input.value = '';
-                        return;
-                    }
-                    var status = document.getElementById('import_status');
-                    status.style.color = '#555';
-                    status.textContent = 'Importing…';
-                    var fd = new FormData();
-                    fd.append('file', file);
-                    fetch('/api/config/import', {method: 'POST', body: fd})
-                        .then(function(r) { return r.json(); })
-                        .then(function(d) {
-                            if (d.success) {
-                                var msg = '✅ Imported.';
-                                if (d.warnings && d.warnings.length) msg += ' (' + d.warnings.length + ' warning' + (d.warnings.length > 1 ? 's' : '') + ')';
-                                status.style.color = '#2e7d32';
-                                status.textContent = msg + ' Reloading…';
-                                setTimeout(function() { location.reload(); }, 1400);
-                            } else {
-                                status.style.color = '#c62828';
-                                status.textContent = '❌ ' + (d.error || 'Import failed');
-                            }
-                        })
-                        .catch(function() {
-                            status.style.color = '#c62828';
-                            status.textContent = '❌ Import request failed.';
-                        })
-                        .finally(function() { input.value = ''; });
-                };
             </script>
 
             <!-- Backup & Restore -->
@@ -3817,10 +3743,76 @@ def index():
                     </label>
                     <div style="display:flex; gap:10px; justify-content:flex-end;">
                         <button type="button" onclick="closeExportModal()" style="background:#9e9e9e;">Cancel</button>
-                        <button type="button" class="test-btn" style="background:#4CAF50;" onclick="doExport()">⬇️ Export</button>
+                        <button type="button" class="test-btn" style="background:#4CAF50;" onclick="doExport()">Export</button>
                     </div>
                 </div>
             </div>
+
+            <!-- Backup & Restore JS lives in its OWN script block (never merged with
+                 the settings-init functions above) so that any problem here can never
+                 prevent the credential-block toggle / settings init from running.
+                 Strings are plain ASCII to avoid any encoding edge cases. -->
+            <script>
+                window.openExportModal = function() {
+                    var modal = document.getElementById('export_modal');
+                    var dlg = document.getElementById('export_dialog');
+                    if (modal.parentNode !== document.body) document.body.appendChild(modal);
+                    modal.style.height = document.documentElement.scrollHeight + 'px';
+                    modal.style.display = 'block';
+                    var rect = document.getElementById('backup_actions').getBoundingClientRect();
+                    dlg.style.top = Math.max(10, rect.bottom + 8) + 'px';
+                };
+                window.closeExportModal = function() {
+                    document.getElementById('export_modal').style.display = 'none';
+                };
+                window.doExport = function() {
+                    var s = document.getElementById('exp_settings').checked ? 1 : 0;
+                    var l = document.getElementById('exp_lists').checked ? 1 : 0;
+                    var c = document.getElementById('exp_content').checked ? 1 : 0;
+                    var o = document.getElementById('exp_overlay').checked ? 1 : 0;
+                    if (!s && !l && !c && !o) { alert('Select at least one thing to export.'); return; }
+                    var url = '/api/config/export?settings=' + s + '&lists=' + l + '&content=' + c + '&overlay=' + o;
+                    var a = document.createElement('a');
+                    a.href = url; a.download = '';
+                    document.body.appendChild(a); a.click(); a.remove();
+                    closeExportModal();
+                };
+                window.importConfig = function(input) {
+                    var file = input.files && input.files[0];
+                    if (!file) return;
+                    if (!confirm('Import configuration from "' + file.name + '"? '
+                        + 'This overwrites the plugin settings, block/whitelist, the referenced '
+                        + 'content files, and the overlay model on THIS Pi. Your saved credentials '
+                        + 'are kept. Continue?')) {
+                        input.value = '';
+                        return;
+                    }
+                    var status = document.getElementById('import_status');
+                    status.style.color = '#555';
+                    status.textContent = 'Importing...';
+                    var fd = new FormData();
+                    fd.append('file', file);
+                    fetch('/api/config/import', {method: 'POST', body: fd})
+                        .then(function(r) { return r.json(); })
+                        .then(function(d) {
+                            if (d.success) {
+                                var msg = 'Imported.';
+                                if (d.warnings && d.warnings.length) msg += ' (' + d.warnings.length + ' warning' + (d.warnings.length > 1 ? 's' : '') + ')';
+                                status.style.color = '#2e7d32';
+                                status.textContent = msg + ' Reloading...';
+                                setTimeout(function() { location.reload(); }, 1400);
+                            } else {
+                                status.style.color = '#c62828';
+                                status.textContent = 'Error: ' + (d.error || 'Import failed');
+                            }
+                        })
+                        .catch(function() {
+                            status.style.color = '#c62828';
+                            status.textContent = 'Import request failed.';
+                        })
+                        .finally(function() { input.value = ''; });
+                };
+            </script>
 
         </div>
 

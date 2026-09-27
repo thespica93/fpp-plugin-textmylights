@@ -15,45 +15,47 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
         overflow: hidden;
         min-height: 400px;
     }
-    /* Export modal lives HERE, in the parent (not the iframe), so position:fixed
-       centers on the real browser viewport — it stays put while scrolling. */
-    #tml-export-modal {
+    /* Modals live HERE, in the parent (not the iframe), so position:fixed centers
+       on the real browser viewport — they stay put while scrolling. */
+    .tml-modal {
         display: none; position: fixed; inset: 0; z-index: 100000;
         background: rgba(0,0,0,0.5);
         align-items: center; justify-content: center;
         font-family: Arial, sans-serif;
     }
-    #tml-export-modal .tml-card {
+    .tml-modal .tml-card {
         background: #fff; color: #333; width: 92%; max-width: 460px;
         border-radius: 8px; padding: 22px; box-shadow: 0 8px 30px rgba(0,0,0,0.35);
         max-height: 88vh; overflow-y: auto; box-sizing: border-box;
     }
-    #tml-export-modal h3 { margin: 0 0 6px; color: #333; font-size: 20px; }
-    #tml-export-modal .tml-sub { font-size: 12px; color: #666; margin: 0 0 14px; }
-    #tml-export-modal label.tml-opt {
+    .tml-modal h3 { margin: 0 0 6px; color: #333; font-size: 20px; }
+    .tml-modal .tml-sub { font-size: 13px; color: #555; margin: 0 0 14px; }
+    .tml-modal label.tml-opt {
         display: flex; gap: 10px; align-items: flex-start; margin: 0 0 14px; cursor: pointer;
     }
     /* FPP's global input styles squish checkboxes to slivers — force a real box. */
-    #tml-export-modal label.tml-opt input[type="checkbox"] {
+    .tml-modal label.tml-opt input[type="checkbox"] {
         -webkit-appearance: auto !important; appearance: auto !important;
         width: 18px !important; height: 18px !important; min-width: 18px !important;
         flex: 0 0 18px; margin: 2px 0 0 !important; padding: 0 !important;
         accent-color: #4CAF50; cursor: pointer; box-sizing: border-box;
     }
-    #tml-export-modal .tml-opt strong { font-size: 14px; }
-    #tml-export-modal .tml-opt .tml-desc { font-size: 12px; color: #666; }
-    #tml-export-modal .tml-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 6px; align-items: center; }
-    #tml-export-modal .tml-actions button {
+    .tml-modal .tml-opt strong { font-size: 14px; }
+    .tml-modal .tml-opt .tml-desc { font-size: 12px; color: #666; }
+    .tml-modal .tml-status { font-size: 13px; margin: 0 0 10px; min-height: 18px; }
+    .tml-modal .tml-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 6px; align-items: center; }
+    .tml-modal .tml-actions button {
         padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; color: #fff; font-size: 14px;
     }
-    #tml-export-modal .tml-actions button:disabled { cursor: default; opacity: 0.6; }
-    #tml-export-modal #tml-exp-cancel { background: #9e9e9e; }
-    #tml-export-modal #tml-exp-go { background: #4CAF50; min-width: 110px; }
+    .tml-modal .tml-actions button:disabled { cursor: default; opacity: 0.6; }
+    .tml-modal .tml-cancel { background: #9e9e9e; }
+    .tml-modal .tml-go { background: #4CAF50; min-width: 110px; }
+    #tml-import-modal .tml-go { background: #2196F3; }
 </style>
 <iframe id="sms-plugin-frame" src="<?php echo htmlspecialchars($pluginUrl); ?>" scrolling="no"></iframe>
 
 <!-- Export selection modal (owned by the parent so it is a true fixed overlay). -->
-<div id="tml-export-modal" onclick="if(event.target===this)tmlHideExport()">
+<div id="tml-export-modal" class="tml-modal" onclick="if(event.target===this)tmlHideExport()">
     <div class="tml-card">
         <h3>Export Config</h3>
         <p class="tml-sub">Choose what to include. Only the content <strong>this plugin is set to use</strong> is exported &mdash; never all of FPP's files. <strong>Credentials are never included.</strong></p>
@@ -66,8 +68,21 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
         <label class="tml-opt"><input type="checkbox" id="tml-exp-overlay" checked>
             <span><strong>Overlay model (matrix)</strong><br><span class="tml-desc">The FPP Pixel Overlay Model the names are drawn onto.</span></span></label>
         <div class="tml-actions">
-            <button type="button" id="tml-exp-cancel" onclick="tmlHideExport()">Cancel</button>
-            <button type="button" id="tml-exp-go" onclick="tmlDoExport()">Export</button>
+            <button type="button" id="tml-exp-cancel" class="tml-cancel" onclick="tmlHideExport()">Cancel</button>
+            <button type="button" id="tml-exp-go" class="tml-go" onclick="tmlDoExport()">Export</button>
+        </div>
+    </div>
+</div>
+
+<!-- Import confirmation modal (parent-owned; stays open until the import finishes). -->
+<div id="tml-import-modal" class="tml-modal" onclick="if(event.target===this)tmlHideImport()">
+    <div class="tml-card">
+        <h3>Import Config</h3>
+        <p class="tml-sub">Import <strong id="tml-imp-name">the selected file</strong>? This <strong>overwrites</strong> the plugin settings, block / whitelist, the content this plugin references, and the overlay model on <strong>THIS Pi</strong>. Your saved credentials are kept.</p>
+        <p class="tml-status" id="tml-imp-status"></p>
+        <div class="tml-actions">
+            <button type="button" id="tml-imp-cancel" class="tml-cancel" onclick="tmlHideImport()">Cancel</button>
+            <button type="button" id="tml-imp-go" class="tml-go" onclick="tmlDoImport()">Import</button>
         </div>
     </div>
 </div>
@@ -76,10 +91,10 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
     document.getElementById('sms-plugin-frame').addEventListener('load', function() {
         window.scrollTo(0, 0);
     });
+    function tmlFrame() { return document.getElementById('sms-plugin-frame').contentWindow; }
 
-    var _tmlExporting = false;      // true while a download is in flight
-    var _tmlExportTimer = null;
-
+    /* ---------------- Export ---------------- */
+    var _tmlExporting = false, _tmlExportTimer = null;
     function tmlResetExportBtn() {
         var go = document.getElementById('tml-exp-go');
         go.disabled = false; go.textContent = 'Export';
@@ -91,7 +106,7 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
         document.getElementById('tml-export-modal').style.display = 'flex';
     }
     function tmlHideExport() {
-        if (_tmlExporting) return;   // don't close while a download is running
+        if (_tmlExporting) return;
         document.getElementById('tml-export-modal').style.display = 'none';
     }
     function tmlDoExport() {
@@ -99,46 +114,93 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
         function ck(id) { return document.getElementById(id).checked ? 1 : 0; }
         var sel = { s: ck('tml-exp-settings'), l: ck('tml-exp-lists'),
                     c: ck('tml-exp-content'), o: ck('tml-exp-overlay') };
-        if (!sel.s && !sel.l && !sel.c && !sel.o) {
-            alert('Select at least one thing to export.');
-            return;
-        }
-        // Show progress and lock the modal open until the iframe reports done.
+        if (!sel.s && !sel.l && !sel.c && !sel.o) { alert('Select at least one thing to export.'); return; }
         _tmlExporting = true;
         var go = document.getElementById('tml-exp-go');
         go.disabled = true; go.textContent = 'Exporting...';
         document.getElementById('tml-exp-cancel').disabled = true;
-        // The iframe performs the actual fetch/download (same-origin auth cookie).
-        document.getElementById('sms-plugin-frame').contentWindow
-            .postMessage({ type: 'tml_export', sel: sel }, '*');
-        // Safety net in case the iframe never answers.
+        tmlFrame().postMessage({ type: 'tml_export', sel: sel }, '*');
         _tmlExportTimer = setTimeout(function() {
             if (_tmlExporting) { tmlResetExportBtn(); alert('Export timed out. Please try again.'); }
         }, 120000);
     }
 
+    /* ---------------- Import ---------------- */
+    var _tmlImporting = false, _tmlImportTimer = null;
+    function tmlResetImportBtn() {
+        var go = document.getElementById('tml-imp-go');
+        go.disabled = false; go.textContent = 'Import';
+        document.getElementById('tml-imp-cancel').disabled = false;
+        _tmlImporting = false;
+    }
+    function tmlShowImport(name) {
+        tmlResetImportBtn();
+        document.getElementById('tml-imp-name').textContent = name || 'the selected file';
+        document.getElementById('tml-imp-status').textContent = '';
+        document.getElementById('tml-imp-status').style.color = '#555';
+        document.getElementById('tml-import-modal').style.display = 'flex';
+    }
+    function tmlHideImport() {
+        if (_tmlImporting) return;                 // don't close mid-import
+        document.getElementById('tml-import-modal').style.display = 'none';
+        tmlFrame().postMessage({ type: 'tml_cancelImport' }, '*');
+    }
+    function tmlDoImport() {
+        if (_tmlImporting) return;
+        _tmlImporting = true;
+        var go = document.getElementById('tml-imp-go');
+        go.disabled = true; go.textContent = 'Importing...';
+        document.getElementById('tml-imp-cancel').disabled = true;
+        var st = document.getElementById('tml-imp-status');
+        st.style.color = '#555'; st.textContent = 'Importing... please wait.';
+        tmlFrame().postMessage({ type: 'tml_doImport' }, '*');
+        _tmlImportTimer = setTimeout(function() {
+            if (_tmlImporting) { tmlResetImportBtn(); alert('Import timed out. Please try again.'); }
+        }, 180000);
+    }
+
     window.addEventListener('message', function(e) {
-        if (e.data && e.data.type === 'iframeHeight') {
+        if (!e.data) return;
+        if (e.data.type === 'iframeHeight') {
             document.getElementById('sms-plugin-frame').style.height = (e.data.height + 20) + 'px';
         }
-        if (e.data && e.data.type === 'scrollTop') {
-            window.scrollTo(0, 0);
-        }
-        // The iframe asks us to show the (parent-owned) export modal.
-        if (e.data && e.data.type === 'tml_openExport') {
-            tmlShowExport();
-        }
-        // The iframe finished (or failed) the download.
-        if (e.data && e.data.type === 'tml_exportDone') {
+        if (e.data.type === 'scrollTop') { window.scrollTo(0, 0); }
+
+        if (e.data.type === 'tml_openExport') { tmlShowExport(); }
+        if (e.data.type === 'tml_exportDone') {
             clearTimeout(_tmlExportTimer);
             var go = document.getElementById('tml-exp-go');
             if (e.data.success) {
                 go.textContent = 'Downloaded';
-                _tmlExporting = false;                 // allow closing now
+                _tmlExporting = false;
                 setTimeout(function() { tmlHideExport(); tmlResetExportBtn(); }, 900);
             } else {
                 tmlResetExportBtn();
                 alert('Export failed: ' + (e.data.error || 'unknown error'));
+            }
+        }
+
+        if (e.data.type === 'tml_openImport') { tmlShowImport(e.data.name); }
+        if (e.data.type === 'tml_importDone') {
+            clearTimeout(_tmlImportTimer);
+            var ist = document.getElementById('tml-imp-status');
+            if (e.data.success) {
+                _tmlImporting = false;                 // allow closing now
+                document.getElementById('tml-imp-go').textContent = 'Imported';
+                var msg = 'Imported successfully.';
+                if (e.data.warnings) { msg += ' (' + e.data.warnings + ' warning' + (e.data.warnings > 1 ? 's' : '') + ')'; }
+                if (e.data.note) { msg += ' ' + e.data.note; }
+                ist.style.color = '#2e7d32';
+                ist.textContent = msg + ' Reloading...';
+                setTimeout(function() {
+                    document.getElementById('tml-import-modal').style.display = 'none';
+                    tmlResetImportBtn();
+                    tmlFrame().postMessage({ type: 'tml_reloadFrame' }, '*');
+                }, 1800);
+            } else {
+                tmlResetImportBtn();
+                ist.style.color = '#c62828';
+                ist.textContent = 'Import failed: ' + (e.data.error || 'unknown error');
             }
         }
     });

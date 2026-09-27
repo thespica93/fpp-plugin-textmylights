@@ -3836,41 +3836,69 @@ def index():
                         alert('Export failed: ' + ((err && err.message) || err));
                     });
                 };
+                // Holds the file the user picked, until they confirm the import in
+                // the (parent-owned) modal.
+                var _tmlImportFile = null;
+
+                // POST the chosen bundle to the import endpoint (same-origin, cookie
+                // auth). Returns a Promise resolving to the server's JSON result.
+                function _tmlDoImport(file) {
+                    var fd = new FormData();
+                    fd.append('file', file);
+                    return fetch('/api/config/import', { method: 'POST', body: fd })
+                        .then(function(r) { return r.json(); });
+                }
+
                 window.importConfig = function(input) {
                     var file = input.files && input.files[0];
+                    input.value = '';                 // let the same file be re-picked later
                     if (!file) return;
+                    _tmlImportFile = file;
+                    // Framed (normal case): let the parent show a fixed, centred confirm
+                    // modal and drive the progress UI.
+                    if (window.parent !== window) {
+                        try { window.parent.postMessage({ type: 'tml_openImport', name: file.name }, '*'); return; } catch (e) {}
+                    }
+                    // Fallback (page opened directly): confirm + import inline.
                     if (!confirm('Import configuration from "' + file.name + '"? '
                         + 'This overwrites the plugin settings, block/whitelist, the referenced '
                         + 'content files, and the overlay model on THIS Pi. Your saved credentials '
-                        + 'are kept. Continue?')) {
-                        input.value = '';
-                        return;
-                    }
+                        + 'are kept. Continue?')) { _tmlImportFile = null; return; }
                     var status = document.getElementById('import_status');
-                    status.style.color = '#555';
-                    status.textContent = 'Importing...';
-                    var fd = new FormData();
-                    fd.append('file', file);
-                    fetch('/api/config/import', {method: 'POST', body: fd})
-                        .then(function(r) { return r.json(); })
-                        .then(function(d) {
-                            if (d.success) {
-                                var msg = 'Imported.';
-                                if (d.warnings && d.warnings.length) msg += ' (' + d.warnings.length + ' warning' + (d.warnings.length > 1 ? 's' : '') + ')';
-                                status.style.color = '#2e7d32';
-                                status.textContent = msg + ' Reloading...';
-                                setTimeout(function() { location.reload(); }, 1400);
-                            } else {
-                                status.style.color = '#c62828';
-                                status.textContent = 'Error: ' + (d.error || 'Import failed');
-                            }
-                        })
-                        .catch(function() {
+                    status.style.color = '#555'; status.textContent = 'Importing...';
+                    _tmlDoImport(file).then(function(d) {
+                        if (d.success) {
+                            status.style.color = '#2e7d32';
+                            status.textContent = 'Imported. Reloading...';
+                            setTimeout(function() { location.reload(); }, 1400);
+                        } else {
                             status.style.color = '#c62828';
-                            status.textContent = 'Import request failed.';
-                        })
-                        .finally(function() { input.value = ''; });
+                            status.textContent = 'Error: ' + (d.error || 'Import failed');
+                        }
+                    }).catch(function() {
+                        status.style.color = '#c62828';
+                        status.textContent = 'Import request failed.';
+                    });
                 };
+
+                // Parent modal drives the framed import: it asks us to run it, waits
+                // for tml_importDone, then reloads this iframe on success.
+                window.addEventListener('message', function(e) {
+                    if (!e.data) return;
+                    if (e.data.type === 'tml_doImport' && _tmlImportFile) {
+                        var f = _tmlImportFile; _tmlImportFile = null;
+                        _tmlDoImport(f).then(function(d) {
+                            try { window.parent.postMessage({ type: 'tml_importDone',
+                                success: !!d.success, error: d.error || '',
+                                warnings: (d.warnings || []).length, note: d.note || '' }, '*'); } catch (x) {}
+                        }).catch(function(err) {
+                            try { window.parent.postMessage({ type: 'tml_importDone', success: false,
+                                error: String((err && err.message) || err) }, '*'); } catch (x) {}
+                        });
+                    }
+                    if (e.data.type === 'tml_cancelImport') { _tmlImportFile = null; }
+                    if (e.data.type === 'tml_reloadFrame') { location.reload(); }
+                });
             </script>
 
         </div>
@@ -5776,6 +5804,22 @@ def index():
                         });
                         defaultSelect.add(ig1);
                         nameSelect.add(ig2);
+                    }
+
+                    // If a stored content selection no longer exists in FPP (e.g. the
+                    // Waiting or Name sequence was deleted in the file manager), revert
+                    // it to None and persist that so the plugin stops referencing a file
+                    // that's gone. Guarded by !data.error so a partial FPP fetch can
+                    // never wipe a still-valid choice.
+                    if (!data.error) {
+                        var _hasOpt = function(sel, val) {
+                            if (!val) return true;   // '' (None) is always valid
+                            return Array.prototype.some.call(sel.options, function(o) { return o.value === val; });
+                        };
+                        var _stale = false;
+                        if (!_hasOpt(defaultSelect, currentDefault)) { defaultSelect.value = ''; _stale = true; }
+                        if (!_hasOpt(nameSelect, currentName))       { nameSelect.value = '';    _stale = true; }
+                        if (_stale) { saveConfig(); updateNameDisplayWarning(); }
                     }
 
                     window._fppSeqList = data.sequences || [];

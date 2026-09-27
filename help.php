@@ -223,5 +223,16 @@ function tml_shot($file, $alt) {
             show(t.getAttribute('data-panel'));
         });
     });
+
+    // Open the tab named in the URL hash (e.g. help.php#google-voice), so the
+    // "View … Configuration" links in the config UI land on the right panel
+    // instead of the default (Twilio) tab. Also respond to later hash changes.
+    function showFromHash() {
+        var name = (location.hash || '').replace('#', '');
+        var match = document.getElementById('panel-' + name);
+        if (match) { show(name); }
+    }
+    showFromHash();
+    window.addEventListener('hashchange', showFromHash);
 })();
 </script>

@@ -3320,21 +3320,20 @@ def index():
             <button class="view-btn" onclick="viewMessages()" style="margin:0 0 0 10px; padding:7px 14px; font-size:13px;">📋 View Message Queue</button>
             <span id="autosave_status" style="font-size:13px; margin-left:8px;"></span>
             <div style="margin-left:auto; display:flex; gap:4px; align-items:center;">
-                <button id="btn_twilio_start" onclick="twilioStart()" style="background:#2e7d32; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-size:12px; font-weight:bold; cursor:pointer;">▶ Start</button>
-                <button id="btn_twilio_stop" onclick="twilioStop()" style="background:#c62828; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-size:12px; font-weight:bold; cursor:pointer;">■ Stop</button>
+                <button id="btn_plugin_toggle" onclick="pluginToggle()" style="background:#2e7d32; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-size:12px; font-weight:bold; cursor:pointer;">▶ Start</button>
             </div>
         </div>
 
         <!-- Plugin Live Banner -->
         <div id="plugin_live_banner" style="display:none; background:#1b5e20; color:#fff; padding:10px 16px; border-radius:5px; margin-top:10px; font-size:14px; font-weight:bold; align-items:center; gap:10px;">
             <span style="display:inline-block; width:12px; height:12px; background:#69f0ae; border-radius:50%; box-shadow:0 0 6px #69f0ae;"></span>
-            Plugin is Live
+            Plugin is Live &mdash; Press Stop or run the "Text My Lights Stop" script to stop displaying incoming messages.
         </div>
 
         <!-- Plugin Not Live Banner -->
         <div id="plugin_not_live_banner" style="display:none; background:#b71c1c; color:#fff; padding:10px 16px; border-radius:5px; margin-top:10px; font-size:14px; font-weight:bold; align-items:center; gap:10px;">
             <span style="display:inline-block; width:12px; height:12px; background:#ff8a80; border-radius:50%; box-shadow:0 0 6px #ff8a80;"></span>
-            <span>Plugin is Not Live &mdash; Press Text My Lights Start to display incoming messages.<br>
+            <span>Plugin is Not Live &mdash; Press Start or run the "Text My Lights Start" script to display incoming messages.<br>
             <span style="font-weight:normal; font-size:12px;">Note: Viewers can still send messages, messaging rates will apply, but no messages will be displayed.</span></span>
         </div>
 
@@ -3363,7 +3362,6 @@ def index():
                             <input type="password" id="auth_token" autocomplete="new-password" onfocus="this.select()"
                                    value="{{ secret_sentinel if config.twilio_auth_token else '' }}"
                                    placeholder="Twilio Auth Token">
-                            {% if config.twilio_auth_token %}<p class="help-text">🔒 Saved. Leave the dots to keep it, type a new token to replace it, or clear the field to remove it.</p>{% endif %}
 
                             <label>Twilio Phone Number:</label>
                             <input type="text" id="phone_number" value="{{ config.twilio_phone_number }}" placeholder="+1234567890">
@@ -3382,7 +3380,6 @@ def index():
                             <input type="password" id="gv_app_password" autocomplete="new-password" onfocus="this.select()"
                                    value="{{ secret_sentinel if config.get('gv_app_password') else '' }}"
                                    placeholder="16-character app password">
-                            {% if config.get('gv_app_password') %}<p class="help-text">🔒 Saved. Leave the dots to keep it, type a new password to replace it, or clear the field to remove it.</p>{% endif %}
 
                             <button class="test-btn" onclick="testGoogleVoice()">🔌 Test Google Voice Connection</button>
                             <div id="gv_test_result" style="margin-top: 8px; font-size: 14px;"></div>
@@ -3398,28 +3395,25 @@ def index():
                             🔴 <strong>Plugin is Live</strong> — run Text My Lights Stop to edit
                         </div>
                         <div id="fpp_content_inputs">
-                            <label>Default "Waiting" Content: <span style="color:#f44336;font-size:12px;">* required</span></label>
+                            <label>Default "Waiting" Content: <span style="color:#f44336;font-size:12px;">* required</span> <span class="help-text" style="font-weight:normal;margin-left:6px;">📺 This content loops while waiting for text messages</span></label>
                             <select id="default_playlist">
                                 <option value="">-- Select content --</option>
                             </select>
-                            <p class="help-text">📺 This content loops while waiting for text messages</p>
 
-                            <label>Name Display Content:</label>
+                            <label>Name Display Content: <span class="help-text" style="font-weight:normal;margin-left:6px;">🎬 This content plays when displaying a name</span></label>
                             <select id="name_display_playlist">
                                 <option value="">-- None (Same as "Waiting" Content) --</option>
                                 {% set _np = config.get('name_display_playlist', '') %}
                                 {% if _np %}<option value="{{ _np }}" selected>{{ _np }}</option>{% endif %}
                             </select>
-                            <p class="help-text">🎬 This content plays when displaying a name</p>
                             <div id="name_display_none_warning" style="display:none; background:#3a2f00; border:1px solid #ffc107; color:#ffc107; border-radius:5px; padding:8px 12px; margin-top:6px; font-size:13px;">
                                 ⚠️ Left as None — names will appear directly over the Waiting content.
                             </div>
 
-                            <label>Overlay Model Name: <button type="button" onclick="refreshFPPLists(this)" style="font-size:11px;padding:2px 7px;margin-left:8px;cursor:pointer;">↻ Refresh Lists</button></label>
+                            <label>Overlay Model Name: <button type="button" onclick="refreshFPPLists(this)" style="font-size:11px;padding:2px 7px;margin-left:8px;cursor:pointer;">↻ Refresh Lists</button> <span class="help-text" style="font-weight:normal;margin-left:6px;">📝 The pixel overlay model for text (e.g., "Texting Matrix")</span></label>
                             <select id="overlay_model_name">
                                 <option value="">-- None --</option>
                             </select>
-                            <p class="help-text">📝 The pixel overlay model for text (e.g., "Texting Matrix")</p>
                         </div>
 
                         <hr style="border: none; border-top: 1px solid #ddd; margin: 15px 0;">
@@ -4077,7 +4071,7 @@ def index():
                         <label class="toggle-switch"><input type="checkbox" id="sms_response_show_not_live" {{ 'checked' if config.get('sms_response_show_not_live', False) else '' }} onchange="toggleResp('show_not_live')"><span class="toggle-slider"></span></label>
                         <label for="sms_response_show_not_live" style="margin-left:10px;vertical-align:middle;">🔴 Show Not Live — Send Response</label>
                     </div>
-                    <p class="help-text" style="margin:4px 0 6px;">Sent to anyone who texts while the show is not active (Text My Lights Stop has been called).</p>
+                    <p class="help-text" style="margin:4px 0 6px;">Sent to anyone who texts while the show is not active.</p>
                     <textarea id="response_show_not_live" rows="2">{{ config.get('response_show_not_live', "Ho, Ho, Ho, It looks like our show isn't running now. Try again later.") }}</textarea>
                 </div>
 
@@ -4089,9 +4083,9 @@ def index():
                                onchange="toggleResp('invalid_format')"><span class="toggle-slider"></span></label>
                         <label for="sms_response_invalid_format" style="margin-left:10px;vertical-align:middle;">❌ Invalid Format — Send Response</label>
                     </div>
+                    <p class="help-text">💡 Type <code>{words}</code> anywhere in this message to auto-fill your current word limit — it becomes "<span id="words_preview">2 words</span>" in the reply, based on your <strong>Name Format Rules</strong> (One Word Only → "1 word", Two Words Maximum → "2 words").</p>
                     <p id="invalid_format_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('use_whitelist', False) else 'display:none;' }}">⚠️ Invalid Format responses are disabled when the whitelist is active — all names are validated against the whitelist instead of format rules.</p>
                     <textarea id="response_invalid_format" rows="2">{{ config.get('response_invalid_format', 'Please send only 1 name ({words}, no sentences).') }}</textarea>
-                    <p class="help-text">💡 Type <code>{words}</code> anywhere in this message to auto-fill your current word limit — it becomes "<span id="words_preview">2 words</span>" in the reply, based on your <strong>Name Format Rules</strong> (One Word Only → "1 word", Two Words Maximum → "2 words").</p>
                 </div>
 
                 <div id="row_too_long" class="resp-row{% if config.get('use_whitelist', False) %} locked{% endif %}">
@@ -4102,9 +4096,9 @@ def index():
                                onchange="toggleResp('too_long')"><span class="toggle-slider"></span></label>
                         <label for="sms_response_too_long" style="margin-left:10px;vertical-align:middle;">📏 Message Too Long — Send Response</label>
                     </div>
+                    <p class="help-text">📏 Sent when a message is longer than your <strong>Max Message Length</strong>. Applies whether or not the word-count rules are on.</p>
                     <p id="too_long_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('use_whitelist', False) else 'display:none;' }}">⚠️ Too Long responses are disabled when the whitelist is active — names are validated against the whitelist, not by length.</p>
                     <textarea id="response_too_long" rows="2">{{ config.get('response_too_long', "I'm sorry, your message exceeds our max message length. Please only send your name.") }}</textarea>
-                    <p class="help-text">📏 Sent when a message is longer than your <strong>Max Message Length</strong> (Configuration tab). Applies whether or not the word-count rules are on.</p>
                 </div>
 
                 <div id="row_profanity" class="resp-row">
@@ -4131,7 +4125,7 @@ def index():
                                onchange="toggleResp('rate_limited')"><span class="toggle-slider"></span></label>
                         <label for="sms_response_rate_limited" style="margin-left:10px;vertical-align:middle;">⛔ Rate Limited — Send Response</label>
                     </div>
-                    <p id="rate_limited_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('max_messages_per_phone', 0) == 0 else 'display:none;' }}">⚠️ Rate-Limited responses are disabled when Max Messages Per Phone is 0 (unlimited) — no one is ever rate limited.</p>
+                    <p id="rate_limited_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('max_messages_per_phone', 0) == 0 else 'display:none;' }}">⚠️ Rate-Limited responses are disabled when Max Messages Per Phone is 0 (unlimited).</p>
                     <textarea id="response_rate_limited" rows="2">{{ config.get('response_rate_limited', "You've reached the maximum number of messages allowed. Please try again tomorrow!") }}</textarea>
                 </div>
 
@@ -4143,7 +4137,7 @@ def index():
                                onchange="toggleResp('duplicate')"><span class="toggle-slider"></span></label>
                         <label for="sms_response_duplicate" style="margin-left:10px;vertical-align:middle;">🔄 Duplicate Name — Send Response</label>
                     </div>
-                    <p id="duplicate_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('allow_duplicate_names', False) else 'display:none;' }}">⚠️ <strong>Duplicate response is disabled</strong> — Allow Duplicate Names is on, so this response will never send.</p>
+                    <p id="duplicate_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('allow_duplicate_names', False) else 'display:none;' }}">⚠️ <strong>Allow Duplicate Names is enabled</strong> — This response is disabled.</p>
                     <textarea id="response_duplicate" rows="2">{{ config.get('response_duplicate', "You've already sent this name today!") }}</textarea>
                 </div>
 
@@ -4155,7 +4149,7 @@ def index():
                                onchange="toggleResp('not_whitelisted')"><span class="toggle-slider"></span></label>
                         <label for="sms_response_not_whitelisted" style="margin-left:10px;vertical-align:middle;">📋 Not on Whitelist — Send Response</label>
                     </div>
-                    <p id="not_whitelisted_disabled_warning" class="resp-locked-note" style="{{ '' if not config.get('use_whitelist', False) else 'display:none;' }}">⚠️ Not-on-Whitelist responses only apply when the Name Whitelist is enabled.</p>
+                    <p id="not_whitelisted_disabled_warning" class="resp-locked-note" style="{{ '' if not config.get('use_whitelist', False) else 'display:none;' }}">⚠️ <strong>Name Whitelist is disabled</strong> — This response is disabled.</p>
                     <textarea id="response_not_whitelisted" rows="2">{{ config.get('response_not_whitelisted', 'Sorry, that name is not on our approved list.') }}</textarea>
                 </div>
 
@@ -4169,7 +4163,7 @@ def index():
                 <h2>🧪 Message Testing</h2>
 
                 <div id="show_not_live_banner" style="display:none; background:#ffecb3; border:1px solid #FF9800; border-radius:6px; padding:10px 14px; margin-bottom:14px; color:#7a4f00; font-size:14px;">
-                    🔴 Show is not live — run <strong>Text My Lights Start</strong> from the FPP scheduler to activate the display before testing.
+                    🔴 Show is not live — press <strong>Start</strong> or run the <strong>Text My Lights Start</strong> script to activate the display before testing.
                 </div>
 
                 <div id="test_form_inner">
@@ -4189,32 +4183,36 @@ def index():
         </div>
 
         <script>
-            function twilioStart() {
-                var btn = document.getElementById('btn_twilio_start');
+            // Tracks the last-known live state so the single toggle button knows
+            // whether a click should Start (activate) or Stop (deactivate).
+            var _pluginLive = false;
+
+            function pluginToggle() {
+                var btn = document.getElementById('btn_plugin_toggle');
+                var goingLive = !_pluginLive;
+                var url = goingLive ? '/api/activate' : '/api/deactivate';
                 btn.disabled = true; btn.textContent = '...';
-                fetch('/api/activate', {method:'POST'})
+                fetch(url, {method:'POST'})
                 .then(r => r.json())
                 .then(function(d) {
-                    if (d.success === false) { alert('Text My Lights Start failed: ' + (d.error || 'Unknown error')); }
+                    if (goingLive && d.success === false) { alert('Start failed: ' + (d.error || 'Unknown error')); }
                     updateLiveStatus();
                 })
-                .catch(function() { alert('Text My Lights Start request failed.'); })
-                .finally(function() { btn.disabled = false; btn.textContent = '▶ Text My Lights Start'; });
-            }
-
-            function twilioStop() {
-                var btn = document.getElementById('btn_twilio_stop');
-                btn.disabled = true; btn.textContent = '...';
-                fetch('/api/deactivate', {method:'POST'})
-                .then(r => r.json())
-                .then(function() { updateLiveStatus(); })
-                .catch(function() { alert('Text My Lights Stop request failed.'); })
-                .finally(function() { btn.disabled = false; btn.textContent = '■ Text My Lights Stop'; });
+                .catch(function() { alert((goingLive ? 'Start' : 'Stop') + ' request failed.'); })
+                .finally(function() { btn.disabled = false; });
             }
 
             function updateLiveStatus() {
                 fetch('/api/queue/status').then(r => r.json()).then(data => {
                     const live = data.show_live === true;
+                    _pluginLive = live;
+
+                    // Single Start/Stop toggle reflects current live state
+                    const toggle = document.getElementById('btn_plugin_toggle');
+                    if (toggle) {
+                        toggle.textContent = live ? '■ Stop' : '▶ Start';
+                        toggle.style.background = live ? '#c62828' : '#2e7d32';
+                    }
 
                     // Testing tab banner (show is NOT live warning)
                     const notLiveBanner = document.getElementById('show_not_live_banner');
@@ -6524,7 +6522,7 @@ def test_message_submission():
         test_phone = data.get('phone', 'Local Testing')
         
         if not config.get('enabled', False):
-            return jsonify({"success": False, "error": "Show is not live — run Text My Lights Start first"})
+            return jsonify({"success": False, "error": "Show is not live — press Start or run the Text My Lights Start script first"})
 
         if not test_name:
             return jsonify({"success": False, "error": "Name is required"})

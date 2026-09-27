@@ -30,12 +30,23 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
         }
         // The plugin (inside the non-scrolling iframe) can't see the parent's
         // scroll position, so it can't center a modal in the visible area on its
-        // own. When it asks, reply with the Y (in iframe-document coordinates) of
-        // the centre of what's currently visible in this window.
+        // own. When it asks, reply with the VISIBLE SLICE OF THE IFRAME in
+        // iframe-document coordinates — the intersection of the iframe and this
+        // window's viewport. Centering on the whole viewport would drift into the
+        // FPP footer below the iframe when scrolled to the bottom.
         if (e.data && e.data.type === 'tml_reqpos') {
             var frame = document.getElementById('sms-plugin-frame');
-            var centerDocY = (window.innerHeight / 2) - frame.getBoundingClientRect().top;
-            frame.contentWindow.postMessage({ type: 'tml_pos', centerDocY: centerDocY }, '*');
+            var r = frame.getBoundingClientRect();
+            var topVp = Math.max(0, r.top);
+            var botVp = Math.min(window.innerHeight, r.bottom);
+            var topDocY = topVp - r.top;          // viewport Y -> iframe-doc Y
+            var botDocY = botVp - r.top;
+            frame.contentWindow.postMessage({
+                type: 'tml_pos',
+                topDocY: topDocY,
+                visibleHeight: Math.max(0, botDocY - topDocY),
+                centerDocY: (topDocY + botDocY) / 2
+            }, '*');
         }
     });
 </script>

@@ -3763,28 +3763,39 @@ def index():
                         + '/plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=help.php#backup';
                 })();
 
-                // Latest visible-centre Y (in iframe-document coords) reported by the
-                // parent window; null until the parent answers (or when not framed).
-                var _tmlCenterY = null;
+                // Latest visible-slice info reported by the parent window (the part of
+                // the iframe actually on screen); null until the parent answers or when
+                // not framed. {topDocY, visibleHeight, centerDocY} in iframe-doc coords.
+                var _tmlPos = null;
                 window.addEventListener('message', function(e) {
                     if (e.data && e.data.type === 'tml_pos' && typeof e.data.centerDocY === 'number') {
-                        _tmlCenterY = e.data.centerDocY;
+                        _tmlPos = e.data;
                         var m = document.getElementById('export_modal');
                         if (m && m.style.display === 'block') _tmlPositionDialog();
                     }
                 });
                 function _tmlPositionDialog() {
                     var dlg = document.getElementById('export_dialog');
-                    var y;
-                    if (_tmlCenterY != null) {
-                        y = _tmlCenterY - dlg.offsetHeight / 2;              // centre of parent's visible area
+                    var top;
+                    if (_tmlPos) {
+                        // Cap the dialog to the visible slice so it never overflows the
+                        // fold; it scrolls internally if the checklist is taller.
+                        dlg.style.maxHeight = Math.max(140, _tmlPos.visibleHeight - 20) + 'px';
+                        dlg.style.overflowY = 'auto';
+                        var h = dlg.offsetHeight;
+                        top = (h < _tmlPos.visibleHeight)
+                            ? _tmlPos.centerDocY - h / 2                     // fits: centre it
+                            : _tmlPos.topDocY + 10;                          // taller: pin to top of slice
+                        if (top < _tmlPos.topDocY + 4) top = _tmlPos.topDocY + 4;
                     } else if (window.parent === window) {
-                        y = window.scrollY + window.innerHeight / 2 - dlg.offsetHeight / 2;  // not framed
+                        dlg.style.maxHeight = Math.max(140, window.innerHeight - 20) + 'px';
+                        dlg.style.overflowY = 'auto';
+                        top = window.scrollY + window.innerHeight / 2 - dlg.offsetHeight / 2;  // not framed
                     } else {
                         var rect = document.getElementById('backup_actions').getBoundingClientRect();
-                        y = rect.bottom + 8;                                 // fallback: below the buttons
+                        top = rect.bottom + 8;                               // fallback: below the buttons
                     }
-                    dlg.style.top = Math.max(10, y) + 'px';
+                    dlg.style.top = Math.max(10, top) + 'px';
                 }
                 window.openExportModal = function() {
                     var modal = document.getElementById('export_modal');

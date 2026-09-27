@@ -3743,8 +3743,8 @@ def index():
                         <span><strong>Overlay model (matrix)</strong><br><span class="help-text">The FPP Pixel Overlay Model the names are drawn onto.</span></span>
                     </label>
                     <div style="display:flex; gap:10px; justify-content:flex-end;">
-                        <button type="button" onclick="closeExportModal()" style="background:#9e9e9e;">Cancel</button>
-                        <button type="button" class="test-btn" style="background:#4CAF50;" onclick="doExport()">Export</button>
+                        <button type="button" id="exp_cancel" onclick="closeExportModal()" style="background:#9e9e9e;">Cancel</button>
+                        <button type="button" id="exp_go" class="test-btn" style="background:#4CAF50; min-width:110px;" onclick="doExport()">Export</button>
                     </div>
                 </div>
             </div>
@@ -3763,20 +3763,34 @@ def index():
                         + '/plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=help.php#backup';
                 })();
 
-                // Trigger the actual export download (same-origin, so the auth cookie
-                // is sent). Called both locally and when the parent modal asks.
+                // Fetch the export (same-origin, so the auth cookie is sent), then
+                // save it. Using fetch (not a bare anchor) lets us know when the file
+                // has fully downloaded and surface server errors. Returns a Promise.
                 function _tmlDownload(sel) {
                     var url = '/api/config/export?settings=' + (sel.s ? 1 : 0)
                             + '&lists=' + (sel.l ? 1 : 0) + '&content=' + (sel.c ? 1 : 0)
                             + '&overlay=' + (sel.o ? 1 : 0);
-                    var a = document.createElement('a');
-                    a.href = url; a.download = '';
-                    document.body.appendChild(a); a.click(); a.remove();
+                    return fetch(url).then(function(r) {
+                        if (!r.ok) throw new Error('Server returned ' + r.status);
+                        var cd = r.headers.get('Content-Disposition') || '';
+                        var m = /filename="?([^";]+)"?/.exec(cd);
+                        var name = (m && m[1]) ? m[1] : 'textmylights-config.zip';
+                        return r.blob().then(function(b) { return { blob: b, name: name }; });
+                    }).then(function(o) {
+                        var u = URL.createObjectURL(o.blob);
+                        var a = document.createElement('a');
+                        a.href = u; a.download = o.name;
+                        document.body.appendChild(a); a.click(); a.remove();
+                        setTimeout(function() { URL.revokeObjectURL(u); }, 2000);
+                    });
                 }
-                // The parent-owned modal sends the chosen sections here to download.
+                // The parent-owned modal sends the chosen sections here to download,
+                // and waits for tml_exportDone before it closes.
                 window.addEventListener('message', function(e) {
                     if (e.data && e.data.type === 'tml_export' && e.data.sel) {
-                        _tmlDownload(e.data.sel);
+                        _tmlDownload(e.data.sel)
+                            .then(function() { try { window.parent.postMessage({ type: 'tml_exportDone', success: true }, '*'); } catch (x) {} })
+                            .catch(function(err) { try { window.parent.postMessage({ type: 'tml_exportDone', success: false, error: String((err && err.message) || err) }, '*'); } catch (x) {} });
                     }
                 });
                 window.openExportModal = function() {
@@ -3786,12 +3800,16 @@ def index():
                     if (window.parent !== window) {
                         try { window.parent.postMessage({ type: 'tml_openExport' }, '*'); return; } catch (e) {}
                     }
+                    document.getElementById('exp_go').disabled = false;
+                    document.getElementById('exp_go').textContent = 'Export';
                     document.getElementById('export_modal').style.display = 'flex';
                 };
                 window.closeExportModal = function() {
+                    if (window._tmlExporting) return;   // don't close mid-download
                     document.getElementById('export_modal').style.display = 'none';
                 };
                 window.doExport = function() {
+                    if (window._tmlExporting) return;
                     var sel = {
                         s: document.getElementById('exp_settings').checked,
                         l: document.getElementById('exp_lists').checked,
@@ -3799,8 +3817,24 @@ def index():
                         o: document.getElementById('exp_overlay').checked
                     };
                     if (!sel.s && !sel.l && !sel.c && !sel.o) { alert('Select at least one thing to export.'); return; }
-                    _tmlDownload(sel);
-                    closeExportModal();
+                    var go = document.getElementById('exp_go');
+                    window._tmlExporting = true;
+                    go.disabled = true; go.textContent = 'Exporting...';
+                    document.getElementById('exp_cancel').disabled = true;
+                    _tmlDownload(sel).then(function() {
+                        go.textContent = 'Downloaded';
+                        window._tmlExporting = false;
+                        setTimeout(function() {
+                            closeExportModal();
+                            go.disabled = false; go.textContent = 'Export';
+                            document.getElementById('exp_cancel').disabled = false;
+                        }, 900);
+                    }).catch(function(err) {
+                        window._tmlExporting = false;
+                        go.disabled = false; go.textContent = 'Export';
+                        document.getElementById('exp_cancel').disabled = false;
+                        alert('Export failed: ' + ((err && err.message) || err));
+                    });
                 };
                 window.importConfig = function(input) {
                     var file = input.files && input.files[0];

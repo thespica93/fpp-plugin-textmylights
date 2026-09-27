@@ -31,17 +31,24 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
     #tml-export-modal h3 { margin: 0 0 6px; color: #333; font-size: 20px; }
     #tml-export-modal .tml-sub { font-size: 12px; color: #666; margin: 0 0 14px; }
     #tml-export-modal label.tml-opt {
-        display: flex; gap: 10px; align-items: flex-start; margin: 0 0 12px; cursor: pointer;
+        display: flex; gap: 10px; align-items: flex-start; margin: 0 0 14px; cursor: pointer;
     }
-    #tml-export-modal label.tml-opt input { width: auto; margin: 3px 0 0; }
+    /* FPP's global input styles squish checkboxes to slivers — force a real box. */
+    #tml-export-modal label.tml-opt input[type="checkbox"] {
+        -webkit-appearance: auto !important; appearance: auto !important;
+        width: 18px !important; height: 18px !important; min-width: 18px !important;
+        flex: 0 0 18px; margin: 2px 0 0 !important; padding: 0 !important;
+        accent-color: #4CAF50; cursor: pointer; box-sizing: border-box;
+    }
     #tml-export-modal .tml-opt strong { font-size: 14px; }
     #tml-export-modal .tml-opt .tml-desc { font-size: 12px; color: #666; }
-    #tml-export-modal .tml-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 6px; }
+    #tml-export-modal .tml-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 6px; align-items: center; }
     #tml-export-modal .tml-actions button {
         padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; color: #fff; font-size: 14px;
     }
+    #tml-export-modal .tml-actions button:disabled { cursor: default; opacity: 0.6; }
     #tml-export-modal #tml-exp-cancel { background: #9e9e9e; }
-    #tml-export-modal #tml-exp-go { background: #4CAF50; }
+    #tml-export-modal #tml-exp-go { background: #4CAF50; min-width: 110px; }
 </style>
 <iframe id="sms-plugin-frame" src="<?php echo htmlspecialchars($pluginUrl); ?>" scrolling="no"></iframe>
 
@@ -70,10 +77,25 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
         window.scrollTo(0, 0);
     });
 
+    var _tmlExporting = false;      // true while a download is in flight
+    var _tmlExportTimer = null;
+
+    function tmlResetExportBtn() {
+        var go = document.getElementById('tml-exp-go');
+        go.disabled = false; go.textContent = 'Export';
+        document.getElementById('tml-exp-cancel').disabled = false;
+        _tmlExporting = false;
+    }
+    function tmlShowExport() {
+        tmlResetExportBtn();
+        document.getElementById('tml-export-modal').style.display = 'flex';
+    }
     function tmlHideExport() {
+        if (_tmlExporting) return;   // don't close while a download is running
         document.getElementById('tml-export-modal').style.display = 'none';
     }
     function tmlDoExport() {
+        if (_tmlExporting) return;
         function ck(id) { return document.getElementById(id).checked ? 1 : 0; }
         var sel = { s: ck('tml-exp-settings'), l: ck('tml-exp-lists'),
                     c: ck('tml-exp-content'), o: ck('tml-exp-overlay') };
@@ -81,11 +103,18 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
             alert('Select at least one thing to export.');
             return;
         }
-        // Let the iframe trigger the actual download so it stays same-origin
-        // (the auth cookie belongs to the :5000 service).
-        var frame = document.getElementById('sms-plugin-frame');
-        frame.contentWindow.postMessage({ type: 'tml_export', sel: sel }, '*');
-        tmlHideExport();
+        // Show progress and lock the modal open until the iframe reports done.
+        _tmlExporting = true;
+        var go = document.getElementById('tml-exp-go');
+        go.disabled = true; go.textContent = 'Exporting...';
+        document.getElementById('tml-exp-cancel').disabled = true;
+        // The iframe performs the actual fetch/download (same-origin auth cookie).
+        document.getElementById('sms-plugin-frame').contentWindow
+            .postMessage({ type: 'tml_export', sel: sel }, '*');
+        // Safety net in case the iframe never answers.
+        _tmlExportTimer = setTimeout(function() {
+            if (_tmlExporting) { tmlResetExportBtn(); alert('Export timed out. Please try again.'); }
+        }, 120000);
     }
 
     window.addEventListener('message', function(e) {
@@ -97,7 +126,20 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
         }
         // The iframe asks us to show the (parent-owned) export modal.
         if (e.data && e.data.type === 'tml_openExport') {
-            document.getElementById('tml-export-modal').style.display = 'flex';
+            tmlShowExport();
+        }
+        // The iframe finished (or failed) the download.
+        if (e.data && e.data.type === 'tml_exportDone') {
+            clearTimeout(_tmlExportTimer);
+            var go = document.getElementById('tml-exp-go');
+            if (e.data.success) {
+                go.textContent = 'Downloaded';
+                _tmlExporting = false;                 // allow closing now
+                setTimeout(function() { tmlHideExport(); tmlResetExportBtn(); }, 900);
+            } else {
+                tmlResetExportBtn();
+                alert('Export failed: ' + (e.data.error || 'unknown error'));
+            }
         }
     });
 </script>

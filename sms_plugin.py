@@ -3715,6 +3715,10 @@ def index():
                     <button type="button" class="test-btn" onclick="document.getElementById('import_file').click()">⬆️ Import Config</button>
                     <span id="import_status" style="font-size:13px;"></span>
                 </div>
+                <div style="margin-top:14px;">
+                    <button type="button" onclick="runOverlayDiag()" style="background:#9C27B0; color:#fff; border:none; padding:8px 14px; border-radius:4px; cursor:pointer; font-size:13px;">🔎 Find Overlay Model Storage</button>
+                    <div id="overlay_diag_out" style="display:none; margin-top:10px; padding:10px 12px; background:#f4f4f4; border:1px solid #ddd; border-radius:5px; font-family:monospace; font-size:12px; line-height:1.5; color:#333; overflow-x:auto; white-space:nowrap;"></div>
+                </div>
             </div>
 
             <!-- Local export modal — only used when the page is opened directly
@@ -3899,6 +3903,35 @@ def index():
                     if (e.data.type === 'tml_cancelImport') { _tmlImportFile = null; }
                     if (e.data.type === 'tml_reloadFrame') { location.reload(); }
                 });
+
+                // Diagnostic: find where FPP actually stores the overlay model, so we
+                // can point export/import at the right file. Runs server-side inside
+                // the container (no SSH needed). Output uses <br> (never a JS newline
+                // literal, which the Python template would turn into a real newline).
+                window.runOverlayDiag = function() {
+                    var out = document.getElementById('overlay_diag_out');
+                    out.style.display = 'block';
+                    out.textContent = 'Scanning...';
+                    fetch('/api/config/overlay_diag').then(function(r) { return r.json(); }).then(function(d) {
+                        function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+                        var rows = [];
+                        rows.push('<b>Overlay model name:</b> ' + esc(d.overlay_model_name || '(none set)'));
+                        rows.push('<b>Plugin writes to:</b> ' + esc(d.plugin_writes_to) + (d.plugin_file_exists ? ' [EXISTS]' : ' [MISSING]'));
+                        rows.push('');
+                        rows.push('<b>Files that actually contain your model name:</b>');
+                        if (d.files_containing_model && d.files_containing_model.length) {
+                            d.files_containing_model.forEach(function(f) { rows.push('&nbsp;&nbsp;' + esc(f)); });
+                        } else {
+                            rows.push('&nbsp;&nbsp;(none found in config or plugin data)');
+                        }
+                        rows.push('');
+                        rows.push('<b>Config dir (' + esc(d.config_dir) + '):</b>');
+                        (d.config_dir_listing || []).forEach(function(f) { rows.push('&nbsp;&nbsp;' + esc(f)); });
+                        rows.push('');
+                        rows.push('<b>Overlay models FPP reports via API:</b> ' + esc((d.api_overlay_models || []).join(', ') || '(none)'));
+                        out.innerHTML = rows.join('<br>');
+                    }).catch(function(e) { out.textContent = 'Diagnostic failed: ' + ((e && e.message) || e); });
+                };
             </script>
 
         </div>
@@ -6674,6 +6707,58 @@ def import_config():
     except Exception as e:
         logging.error(f"import_config failed: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/config/overlay_diag')
+def overlay_diag():
+    """Diagnostic: locate where FPP actually stores the overlay model. Runs inside
+    the container (same filesystem as FPP), so it works without shell access —
+    used to confirm the correct model-overlays path for export/import."""
+    model = config.get('overlay_model_name', '') or ''
+    out = {
+        "overlay_model_name": model,
+        "plugin_writes_to": OVERLAY_MODELS_FILE,
+        "plugin_file_exists": os.path.isfile(OVERLAY_MODELS_FILE),
+        "config_dir": FPP_CONFIG_DIR,
+        "config_dir_listing": [],
+        "files_containing_model": [],
+        "api_overlay_models": [],
+    }
+    try:
+        out["config_dir_listing"] = sorted(os.listdir(FPP_CONFIG_DIR))
+    except Exception as e:
+        out["config_dir_listing"] = ["<error: %s>" % e]
+
+    # Content-search the config dir (small, safe) for the model name so we learn
+    # the real filename FPP keeps overlay models in. Only text-like, small files.
+    if model:
+        text_ext = ('.json', '.txt', '.xml', '.cfg', '.conf', '')
+        for root in (FPP_CONFIG_DIR, PLUGIN_DATA_DIR):
+            try:
+                for dirpath, dirs, files in os.walk(root):
+                    if dirpath[len(root):].count(os.sep) > 2:
+                        dirs[:] = []
+                        continue
+                    for fn in files:
+                        fp = os.path.join(dirpath, fn)
+                        if os.path.splitext(fn)[1].lower() not in text_ext:
+                            continue
+                        try:
+                            if os.path.getsize(fp) > 2_000_000:
+                                continue
+                            with open(fp, 'r', errors='ignore') as f:
+                                if model in f.read():
+                                    out["files_containing_model"].append(fp)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+    try:
+        out["api_overlay_models"] = [m.get('name') for m in get_fpp_models()]
+    except Exception:
+        pass
+
+    return jsonify(out)
 
 @app.route('/api/fpp/fonts')
 def fpp_fonts_endpoint():

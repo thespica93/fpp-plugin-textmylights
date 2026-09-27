@@ -225,7 +225,7 @@ function tml_shot($file, $alt) {
         <li>Confirm the prompt. Settings, lists, content files, and the overlay model are restored; the page reloads with everything in place.</li>
         <li>Re-enter your <strong>Auth Token</strong> / <strong>App Password</strong> under <em>Message Source</em>, then test the connection.</li>
     </ol>
-    <div class="note"><strong>Good to know:</strong> Import keeps the target Pi's own saved credentials — it never clears them. The overlay model is part of FPP's channel-output config (<code>co-other.json</code>); import restores that file (keeping the previous one as <code>co-other.json.tml-bak</code>), and it takes effect after an <strong>FPPD restart</strong>.</div>
+    <div class="note"><strong>Good to know:</strong> Import keeps the target Pi's own saved credentials — it never clears them. Only the <strong>one selected overlay model</strong> is exported and it's <strong>added</strong> to the target's channel-output config (<code>co-other.json</code>) without touching that Pi's other outputs (the previous file is kept as <code>co-other.json.tml-bak</code>). It takes effect after an <strong>FPPD restart</strong>.</div>
     <div class="warn"><strong>Matching hardware:</strong> The overlay model maps to channel ranges, but the export does <strong>not</strong> include FPP's channel-output/controller configuration. For the display to light correctly, the new Pi's outputs and wiring must already match — or use FPP's own <em>Backup</em> for a full hardware clone.</div>
     </section>
 

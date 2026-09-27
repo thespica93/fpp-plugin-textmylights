@@ -1,6 +1,6 @@
 #!/bin/bash
 ###############################################################################
-# FPP SMS Twilio Plugin - Installation Script
+# Text My Lights Plugin - Installation Script
 ###############################################################################
 
 # Source FPP common functions and set FPPDIR environment
@@ -18,7 +18,7 @@ log_and_show() {
 }
 
 log_and_show "========================================"
-log_and_show "FPP SMS Twilio Plugin Installer"
+log_and_show "Text My Lights Plugin Installer"
 log_and_show "$(date)"
 log_and_show "========================================"
 log_and_show ""
@@ -93,8 +93,19 @@ pip3 install --break-system-packages --no-cache-dir pillow >> "$LOG" 2>&1
 log_and_show "[6/7] Pillow complete"
 
 log_and_show "[7/7] Installing zstandard (FSEQ zstd decompression)... please wait"
-pip3 install --break-system-packages --no-cache-dir zstandard >> "$LOG" 2>&1
-log_and_show "[7/7] zstandard complete"
+# zstandard is OPTIONAL — only used to preview zstd-compressed FSEQ files; the
+# plugin runs fine without it (ZSTD_AVAILABLE=False). Its pip build is a C
+# extension that can take many minutes or hang/OOM on a Pi with no prebuilt
+# wheel, which would stall the whole installer. So: prefer the prebuilt Debian
+# package, fall back to a time-bounded pip install, and never let this step
+# block the installer from finishing.
+if DEBIAN_FRONTEND=noninteractive apt-get install -y python3-zstandard >> "$LOG" 2>&1; then
+    log_and_show "[7/7] zstandard complete (system package)"
+elif timeout 180 pip3 install --break-system-packages --no-cache-dir zstandard >> "$LOG" 2>&1; then
+    log_and_show "[7/7] zstandard complete (pip)"
+else
+    log_and_show "[7/7] zstandard skipped — optional (zstd FSEQ preview only); plugin works without it"
+fi
 
 # Create config files if they don't exist
 [ ! -f "/home/fpp/media/config/blocked_phones.json" ] && echo "[]" > /home/fpp/media/config/blocked_phones.json

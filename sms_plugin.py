@@ -74,10 +74,40 @@ FPP_VIDEOS_PATH    = '/home/fpp/media/videos'
 FPP_IMAGES_PATH    = '/home/fpp/media/images'
 FPP_PLAYLISTS_PATH = '/home/fpp/media/playlists'
 FPP_CONFIG_DIR     = '/home/fpp/media/config'
-# FPP stores its Pixel Overlay Model definitions (the "matrix" the plugin draws
-# text onto) in this file. Included in config export so the target Pi resolves
-# the same overlay model name.
-OVERLAY_MODELS_FILE = os.path.join(FPP_CONFIG_DIR, 'model-overlays.json')
+# FPP keeps Pixel Overlay Models (the "matrix" the plugin draws text onto) as
+# "Other" channel outputs, stored in co-other.json — NOT a dedicated
+# model-overlays.json (which doesn't exist on standard installs). Confirmed via
+# the on-device overlay diagnostic. Export finds the file dynamically
+# (_find_overlay_config_file) so it adapts if a setup differs.
+OVERLAY_MODELS_FILE = os.path.join(FPP_CONFIG_DIR, 'co-other.json')
+
+def _find_overlay_config_file():
+    """Return the FPP config file that actually holds the overlay model. Pixel
+    Overlay Models live in co-other.json on standard installs; to be robust we
+    also scan the config dir for the configured model name and prefer whatever
+    file contains it. Returns None if nothing is found."""
+    model = ''
+    try:
+        model = config.get('overlay_model_name', '') or ''
+    except Exception:
+        pass
+    if model:
+        try:
+            for fn in sorted(os.listdir(FPP_CONFIG_DIR)):
+                fp = os.path.join(FPP_CONFIG_DIR, fn)
+                if not os.path.isfile(fp) or not fn.endswith('.json'):
+                    continue
+                if os.path.getsize(fp) > 2_000_000:
+                    continue
+                try:
+                    with open(fp, 'r', errors='ignore') as f:
+                        if model in f.read():
+                            return fp
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return OVERLAY_MODELS_FILE if os.path.isfile(OVERLAY_MODELS_FILE) else None
 
 # Whitelist/blacklist source files stay in the plugin git repo directory
 BLACKLIST_FILE = os.path.join(PLUGIN_DIR, "blacklist.txt")
@@ -6462,13 +6492,14 @@ def export_config():
             for cv in (config.get('default_playlist', ''), config.get('name_display_playlist', '')):
                 content_files.extend(_content_source_files(cv, warnings))
 
-        # Overlay model definition ("matrix").
+        # Overlay model definition ("matrix") — the FPP config file that holds it.
         overlay_files = []
         if inc_overlay:
-            if os.path.isfile(OVERLAY_MODELS_FILE):
-                overlay_files.append(('overlay', OVERLAY_MODELS_FILE))
+            ovl = _find_overlay_config_file()
+            if ovl:
+                overlay_files.append(('overlay', ovl))
             else:
-                warnings.append("Overlay model file not found — overlay model not exported")
+                warnings.append("Overlay model config not found — overlay model not exported")
 
         # Write to a temp file (FSEQ can be large; avoid holding the whole zip in
         # RAM on a Pi). ZIP_STORED since FSEQ is already compressed.
@@ -6528,72 +6559,26 @@ def export_config():
         logging.error(f"export_config failed: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
-def _merge_overlay_models(src_bytes, warnings):
-    """Merge exported overlay models into the target Pi's model-overlays.json by
-    model Name, so the imported model appears without wiping other models the
-    target already has. Backs up the existing file first."""
+def _restore_overlay_config(src_bytes, dest_path, warnings):
+    """Restore the FPP channel-output config that holds the overlay model
+    (co-other.json). This file is FPP's 'Other' channel-output configuration, not
+    a simple models list — a partial merge risks corrupting the outputs, so we do
+    a validated full replace and keep the previous file as .tml-bak. Takes effect
+    after an FPPD restart."""
+    # Validate it parses as JSON before we overwrite anything.
     try:
-        src = json.loads(src_bytes)
+        json.loads(src_bytes)
     except Exception:
-        warnings.append("Overlay model file in bundle was not valid JSON — skipped")
+        warnings.append("Overlay config in bundle was not valid JSON — skipped")
         return
-
-    def models_of(obj):
-        if isinstance(obj, dict) and isinstance(obj.get('models'), list):
-            return obj['models']
-        if isinstance(obj, list):
-            return obj
-        return None
-
     os.makedirs(FPP_CONFIG_DIR, exist_ok=True)
-    # Back up whatever is there now.
-    if os.path.isfile(OVERLAY_MODELS_FILE):
+    if os.path.isfile(dest_path):
         try:
-            shutil.copy2(OVERLAY_MODELS_FILE, OVERLAY_MODELS_FILE + '.tml-bak')
+            shutil.copy2(dest_path, dest_path + '.tml-bak')
         except OSError:
             pass
-
-    src_models = models_of(src)
-    dest = {}
-    if os.path.isfile(OVERLAY_MODELS_FILE):
-        try:
-            with open(OVERLAY_MODELS_FILE, 'r') as f:
-                dest = json.load(f)
-        except Exception:
-            dest = {}
-    dest_models = models_of(dest)
-
-    # If either side has an unrecognized shape, fall back to writing the bundle's
-    # file verbatim (already backed up above).
-    if src_models is None or dest_models is None:
-        with open(OVERLAY_MODELS_FILE, 'wb') as f:
-            f.write(src_bytes)
-        warnings.append("Overlay models merged by full replace (unrecognized schema); previous file kept as .tml-bak")
-        return
-
-    def name_of(m):
-        return m.get('Name') or m.get('name') if isinstance(m, dict) else None
-
-    order, by_name = [], {}
-    for m in dest_models:
-        n = name_of(m)
-        if n is not None and n not in by_name:
-            order.append(n)
-        by_name[n] = m
-    for m in src_models:
-        n = name_of(m)
-        if n not in by_name:
-            order.append(n)
-        by_name[n] = m  # bundle wins for matching names
-    merged = [by_name[n] for n in order]
-
-    if isinstance(dest, dict):
-        dest['models'] = merged
-        out = dest
-    else:
-        out = merged
-    with open(OVERLAY_MODELS_FILE, 'w') as f:
-        json.dump(out, f, indent=2)
+    with open(dest_path, 'wb') as f:
+        f.write(src_bytes)
 
 @app.route('/api/config/import', methods=['POST'])
 def import_config():
@@ -6682,7 +6667,10 @@ def import_config():
                 summary["content"] += 1
 
             elif arc_dir == 'overlay':
-                _merge_overlay_models(zf.read(entry), warnings)
+                # Restore to the same-named config file the bundle came from
+                # (co-other.json on standard installs). basename keeps it safe.
+                dest = os.path.join(FPP_CONFIG_DIR, base)
+                _restore_overlay_config(zf.read(entry), dest, warnings)
                 summary["overlay_model"] = True
 
             else:

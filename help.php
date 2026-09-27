@@ -18,8 +18,8 @@ function tml_shot($file, $alt) {
 }
 ?>
 <style>
-    .sms-help { max-width: 860px; margin: 0 auto; font-family: Arial, sans-serif; line-height: 1.5; }
-    .sms-help h2 { color: #4CAF50; border-bottom: 2px solid #4CAF50; padding-bottom: 6px; margin-top: 30px; }
+    .sms-help { max-width: 1100px; margin: 0 auto; font-family: Arial, sans-serif; line-height: 1.5; }
+    .sms-help h2 { color: #4CAF50; border-bottom: 2px solid #4CAF50; padding-bottom: 6px; margin-top: 0; }
     .sms-help h3 { color: #333; margin-top: 18px; }
     .sms-help ol { margin: 10px 0 10px 4px; padding-left: 20px; }
     .sms-help ol li { margin-bottom: 7px; }
@@ -38,17 +38,49 @@ function tml_shot($file, $alt) {
     .ref td:first-child { white-space: nowrap; font-weight: bold; }
     .note { background: #e3f2fd; border: 1px solid #90caf9; color: #0d47a1; border-radius: 5px; padding: 10px 14px; margin: 12px 0; font-size: 13px; }
     .warn { background: #fff3cd; border: 1px solid #ffc107; border-radius: 5px; padding: 10px 14px; margin: 12px 0; font-size: 13px; }
+
+    /* Two-column layout: left menu + content */
+    .sms-help .tml-layout { display: flex; gap: 24px; align-items: flex-start; }
+    .sms-help .tml-nav { flex: 0 0 220px; position: sticky; top: 12px; }
+    .sms-help .tml-nav ul { list-style: none; margin: 0; padding: 0; border: 1px solid #ddd; border-radius: 8px; overflow: hidden; background: #fafafa; }
+    .sms-help .tml-nav li { margin: 0; }
+    .sms-help .tml-nav a { display: block; padding: 12px 16px; text-decoration: none; color: #333; font-weight: bold; font-size: 14px; border-left: 4px solid transparent; border-bottom: 1px solid #eee; }
+    .sms-help .tml-nav li:last-child a { border-bottom: none; }
+    .sms-help .tml-nav a:hover { background: #f0f0f0; color: #333; }
+    .sms-help .tml-nav a.active { background: #fff; color: #4CAF50; border-left-color: #4CAF50; }
+    .sms-help .tml-content { flex: 1 1 auto; min-width: 0; }
+    .sms-help .tml-panel { display: none; }
+    .sms-help .tml-panel.active { display: block; }
+    @media (max-width: 760px) {
+        .sms-help .tml-layout { flex-direction: column; }
+        .sms-help .tml-nav { position: static; flex-basis: auto; width: 100%; }
+    }
 </style>
 
 <div class="sms-help">
 
-    <h2>📱 Text My Lights — Help</h2>
+    <h1 style="color:#333; margin:0 0 6px;">📱 Text My Lights — Help</h1>
     <p>Visitors text their name to your number and it appears on your pixel display. Messages can come from <strong>Twilio</strong> or <strong>Google Voice</strong> — pick one under <em>Settings → Message Source</em>.</p>
 
     <a href="plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=ui.php" target="_top" class="ui-link">🔧 Open Config UI</a>
     <a href="plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=messages.php" target="_top" class="ui-link secondary">📋 View Message Queue</a>
 
+    <div class="tml-layout">
+
+    <!-- ================= LEFT MENU ================= -->
+    <nav class="tml-nav">
+        <ul>
+            <li><a href="#" class="tml-tab active" data-panel="twilio">📞 Twilio Configuration</a></li>
+            <li><a href="#" class="tml-tab" data-panel="google-voice">🟢 Google Voice Configuration</a></li>
+            <li><a href="#" class="tml-tab" data-panel="settings">⚙️ Plugin Settings</a></li>
+            <li><a href="#" class="tml-tab" data-panel="support">🆘 Support</a></li>
+        </ul>
+    </nav>
+
+    <div class="tml-content">
+
     <!-- ================= TWILIO ================= -->
+    <section class="tml-panel active" id="panel-twilio">
     <h2 id="twilio">📞 Configure Twilio</h2>
     <p>Twilio is a paid SMS service (~$1/month for a number, ~$0.01 per text). It supports automatic SMS replies to visitors.</p>
     <ol>
@@ -58,8 +90,10 @@ function tml_shot($file, $alt) {
         <li>Click <strong>Test Twilio Connection</strong> — you should see a success message.</li>
     </ol>
     <div class="warn"><strong>US numbers:</strong> Twilio requires <a href="https://www.twilio.com/docs/messaging/compliance/a2p-10dlc" target="_blank">A2P 10DLC registration</a> before texts (including auto-responses) will actually deliver. Register your number in the Twilio Console.</div>
+    </section>
 
     <!-- ================= GOOGLE VOICE ================= -->
+    <section class="tml-panel" id="panel-google-voice">
     <h2 id="google-voice">🟢 Configure Google Voice</h2>
     <p>Google Voice is <strong>free</strong>. It has no API, so the plugin reads the Gmail inbox that Google Voice forwards texts to. Automatic replies are supported by emailing Google Voice back (best-effort; may be rate-limited).</p>
     <p><strong>How it works:</strong> Google Voice forwards every incoming text to your Gmail inbox, and the plugin logs into that Gmail account (over IMAP, using an App Password) to read them. Use the Google account you want dedicated to the show — its inbox receives all the texts.</p>
@@ -104,8 +138,10 @@ function tml_shot($file, $alt) {
         <li>Click <strong>Test Google Voice Connection</strong> — you should see “inbox connected.”</li>
     </ol>
     <div class="note"><strong>Good to know:</strong> Use the <em>app password</em>, not your normal Google password. Texts from unsaved numbers show the sender's phone number; texts from saved contacts show the contact name. Delivery is a few seconds to ~a minute slower than Twilio.</div>
+    </section>
 
     <!-- ================= SETTINGS ================= -->
+    <section class="tml-panel" id="panel-settings">
     <h2>⚙️ Plugin Settings</h2>
 
     <h3>Settings tab</h3>
@@ -154,9 +190,38 @@ function tml_shot($file, $alt) {
         <tr><td>On whitelist <span style="color:#888;">(if on)</span></td><td>Reply: not on list</td></tr>
         <tr><td>✅ Added to display queue</td><td>Reply: success</td></tr>
     </table></div>
+    </section>
 
+    <!-- ================= SUPPORT ================= -->
+    <section class="tml-panel" id="panel-support">
     <h2>🆘 Support</h2>
+    <p>Found a bug or have a question? Open an issue on GitHub or browse the project source.</p>
     <a href="<?php echo $githubBase; ?>/issues" target="_blank" class="ui-link danger">🐛 Report a Bug</a>
     <a href="<?php echo $githubBase; ?>" target="_blank" class="ui-link secondary">📖 GitHub</a>
+    </section>
+
+    </div><!-- /tml-content -->
+    </div><!-- /tml-layout -->
 
 </div>
+
+<script>
+(function () {
+    var tabs = document.querySelectorAll('.sms-help .tml-tab');
+    var panels = document.querySelectorAll('.sms-help .tml-panel');
+    function show(name) {
+        tabs.forEach(function (t) {
+            t.classList.toggle('active', t.getAttribute('data-panel') === name);
+        });
+        panels.forEach(function (p) {
+            p.classList.toggle('active', p.id === 'panel-' + name);
+        });
+    }
+    tabs.forEach(function (t) {
+        t.addEventListener('click', function (e) {
+            e.preventDefault();
+            show(t.getAttribute('data-panel'));
+        });
+    });
+})();
+</script>

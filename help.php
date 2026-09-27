@@ -18,8 +18,8 @@ function tml_shot($file, $alt) {
 }
 ?>
 <style>
-    .sms-help { max-width: 860px; margin: 0 auto; font-family: Arial, sans-serif; line-height: 1.5; }
-    .sms-help h2 { color: #4CAF50; border-bottom: 2px solid #4CAF50; padding-bottom: 6px; margin-top: 30px; }
+    .sms-help { max-width: 1100px; margin: 0 auto; font-family: Arial, sans-serif; line-height: 1.5; }
+    .sms-help h2 { color: #4CAF50; border-bottom: 2px solid #4CAF50; padding-bottom: 6px; margin-top: 0; }
     .sms-help h3 { color: #333; margin-top: 18px; }
     .sms-help ol { margin: 10px 0 10px 4px; padding-left: 20px; }
     .sms-help ol li { margin-bottom: 7px; }
@@ -38,17 +38,50 @@ function tml_shot($file, $alt) {
     .ref td:first-child { white-space: nowrap; font-weight: bold; }
     .note { background: #e3f2fd; border: 1px solid #90caf9; color: #0d47a1; border-radius: 5px; padding: 10px 14px; margin: 12px 0; font-size: 13px; }
     .warn { background: #fff3cd; border: 1px solid #ffc107; border-radius: 5px; padding: 10px 14px; margin: 12px 0; font-size: 13px; }
+
+    /* Two-column layout: left menu + content */
+    .sms-help .tml-layout { display: flex; gap: 24px; align-items: flex-start; }
+    .sms-help .tml-nav { flex: 0 0 220px; position: sticky; top: 12px; }
+    .sms-help .tml-nav ul { list-style: none; margin: 0; padding: 0; border: 1px solid #ddd; border-radius: 8px; overflow: hidden; background: #fafafa; }
+    .sms-help .tml-nav li { margin: 0; }
+    .sms-help .tml-nav a { display: block; padding: 12px 16px; text-decoration: none; color: #333; font-weight: bold; font-size: 14px; border-left: 4px solid transparent; border-bottom: 1px solid #eee; }
+    .sms-help .tml-nav li:last-child a { border-bottom: none; }
+    .sms-help .tml-nav a:hover { background: #f0f0f0; color: #333; }
+    .sms-help .tml-nav a.active { background: #fff; color: #4CAF50; border-left-color: #4CAF50; }
+    .sms-help .tml-content { flex: 1 1 auto; min-width: 0; }
+    .sms-help .tml-panel { display: none; }
+    .sms-help .tml-panel.active { display: block; }
+    @media (max-width: 760px) {
+        .sms-help .tml-layout { flex-direction: column; }
+        .sms-help .tml-nav { position: static; flex-basis: auto; width: 100%; }
+    }
 </style>
 
 <div class="sms-help">
 
-    <h2>📱 Text My Lights — Help</h2>
+    <h1 style="color:#333; margin:0 0 6px;">📱 Text My Lights — Help</h1>
     <p>Visitors text their name to your number and it appears on your pixel display. Messages can come from <strong>Twilio</strong> or <strong>Google Voice</strong> — pick one under <em>Settings → Message Source</em>.</p>
 
     <a href="plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=ui.php" target="_top" class="ui-link">🔧 Open Config UI</a>
     <a href="plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=messages.php" target="_top" class="ui-link secondary">📋 View Message Queue</a>
 
+    <div class="tml-layout">
+
+    <!-- ================= LEFT MENU ================= -->
+    <nav class="tml-nav">
+        <ul>
+            <li><a href="#" class="tml-tab active" data-panel="twilio">📞 Twilio Configuration</a></li>
+            <li><a href="#" class="tml-tab" data-panel="google-voice">🟢 Google Voice Configuration</a></li>
+            <li><a href="#" class="tml-tab" data-panel="settings">⚙️ Plugin Settings</a></li>
+            <li><a href="#" class="tml-tab" data-panel="backup">💾 Backup &amp; Restore</a></li>
+            <li><a href="#" class="tml-tab" data-panel="support">🆘 Support</a></li>
+        </ul>
+    </nav>
+
+    <div class="tml-content">
+
     <!-- ================= TWILIO ================= -->
+    <section class="tml-panel active" id="panel-twilio">
     <h2 id="twilio">📞 Configure Twilio</h2>
     <p>Twilio is a paid SMS service (~$1/month for a number, ~$0.01 per text). It supports automatic SMS replies to visitors.</p>
     <ol>
@@ -58,8 +91,10 @@ function tml_shot($file, $alt) {
         <li>Click <strong>Test Twilio Connection</strong> — you should see a success message.</li>
     </ol>
     <div class="warn"><strong>US numbers:</strong> Twilio requires <a href="https://www.twilio.com/docs/messaging/compliance/a2p-10dlc" target="_blank">A2P 10DLC registration</a> before texts (including auto-responses) will actually deliver. Register your number in the Twilio Console.</div>
+    </section>
 
     <!-- ================= GOOGLE VOICE ================= -->
+    <section class="tml-panel" id="panel-google-voice">
     <h2 id="google-voice">🟢 Configure Google Voice</h2>
     <p>Google Voice is <strong>free</strong>. It has no API, so the plugin reads the Gmail inbox that Google Voice forwards texts to. Automatic replies are supported by emailing Google Voice back (best-effort; may be rate-limited).</p>
     <p><strong>How it works:</strong> Google Voice forwards every incoming text to your Gmail inbox, and the plugin logs into that Gmail account (over IMAP, using an App Password) to read them. Use the Google account you want dedicated to the show — its inbox receives all the texts.</p>
@@ -104,8 +139,10 @@ function tml_shot($file, $alt) {
         <li>Click <strong>Test Google Voice Connection</strong> — you should see “inbox connected.”</li>
     </ol>
     <div class="note"><strong>Good to know:</strong> Use the <em>app password</em>, not your normal Google password. Texts from unsaved numbers show the sender's phone number; texts from saved contacts show the contact name. Delivery is a few seconds to ~a minute slower than Twilio.</div>
+    </section>
 
     <!-- ================= SETTINGS ================= -->
+    <section class="tml-panel" id="panel-settings">
     <h2>⚙️ Plugin Settings</h2>
 
     <h3>Settings tab</h3>
@@ -154,9 +191,85 @@ function tml_shot($file, $alt) {
         <tr><td>On whitelist <span style="color:#888;">(if on)</span></td><td>Reply: not on list</td></tr>
         <tr><td>✅ Added to display queue</td><td>Reply: success</td></tr>
     </table></div>
+    </section>
 
+    <!-- ================= BACKUP & RESTORE ================= -->
+    <section class="tml-panel" id="panel-backup">
+    <h2 id="backup">💾 Backup &amp; Restore</h2>
+    <p>Export your entire setup to a single file, then import it on another Pi to reproduce this unit — no re-configuring by hand. Both buttons are at the bottom of the <em>Settings</em> tab in the Config UI.</p>
+
+    <div class="warn"><strong>🔒 Credentials are never exported.</strong> Your <strong>Twilio Auth Token</strong> and <strong>Google Voice App Password</strong> are deliberately left out of the export file, so it is safe to store and copy between devices. After importing on a new Pi, re-enter those under <em>Settings → Message Source</em>.</p>
+
+    <h3>What's in the export</h3>
+    <div class="ref"><table>
+        <tr><th>Included</th><th>Details</th></tr>
+        <tr><td>Plugin settings</td><td>Everything in <code>plugin.json</code> — display lines, message rules, response text, filters, poll interval, and the selected content/overlay model. (Your Twilio Account SID, phone number, and Gmail address come along; the auth token / app password do <strong>not</strong>.)</td></tr>
+        <tr><td>Block &amp; name lists</td><td>Blocked phone numbers, and your whitelist / blacklist word files.</td></tr>
+        <tr><td>Content files</td><td>The <strong>Waiting</strong> and <strong>Name Display</strong> content, plus the sequences, images, and videos those playlists actually use — copied file-for-file.</td></tr>
+        <tr><td>Overlay model</td><td>The FPP Pixel Overlay Model definition (the "matrix" the names are drawn onto).</td></tr>
+    </table></div>
+
+    <h3>Export</h3>
+    <ol>
+        <li>Open the Config UI and go to the <em>Settings</em> tab.</li>
+        <li>Under <strong>Backup &amp; Restore</strong>, click <strong>⬇️ Export Config</strong>.</li>
+        <li>A dialog lists what to include — <em>Plugin settings</em>, <em>Blocked numbers &amp; word lists</em>, <em>Content files</em>, and <em>Overlay model</em>. All are checked by default; untick anything you want to leave out (e.g. skip <em>Content files</em> for a small settings-only backup).</li>
+        <li>Click <strong>Export</strong>. A <code>textmylights-config-*.zip</code> downloads to your computer. Keep it somewhere safe.</li>
+    </ol>
+    <div class="note">Only the content <strong>this plugin is set to use</strong> (your Waiting and Name Display selections, and the files they reference) is exported — never all of FPP's sequences or media.</div>
+
+    <h3>Import onto another Pi</h3>
+    <ol>
+        <li>Install this plugin on the new Pi and open its Config UI.</li>
+        <li>On the <em>Settings</em> tab, under <strong>Backup &amp; Restore</strong>, click <strong>⬆️ Import Config</strong> and choose the <code>.zip</code>.</li>
+        <li>Confirm the prompt. Settings, lists, content files, and the overlay model are restored; the page reloads with everything in place.</li>
+        <li>Re-enter your <strong>Auth Token</strong> / <strong>App Password</strong> under <em>Message Source</em>, then test the connection.</li>
+    </ol>
+    <div class="note"><strong>Good to know:</strong> Import keeps the target Pi's own saved credentials — it never clears them. The overlay model change takes effect after an <strong>FPPD restart</strong>. Importing merges the overlay model in by name, so any other models already on that Pi are left alone (the previous file is saved as <code>model-overlays.json.tml-bak</code>).</div>
+    <div class="warn"><strong>Matching hardware:</strong> The overlay model maps to channel ranges, but the export does <strong>not</strong> include FPP's channel-output/controller configuration. For the display to light correctly, the new Pi's outputs and wiring must already match — or use FPP's own <em>Backup</em> for a full hardware clone.</div>
+    </section>
+
+    <!-- ================= SUPPORT ================= -->
+    <section class="tml-panel" id="panel-support">
     <h2>🆘 Support</h2>
+    <p>Found a bug or have a question? Open an issue on GitHub or browse the project source.</p>
     <a href="<?php echo $githubBase; ?>/issues" target="_blank" class="ui-link danger">🐛 Report a Bug</a>
     <a href="<?php echo $githubBase; ?>" target="_blank" class="ui-link secondary">📖 GitHub</a>
+    </section>
+
+    </div><!-- /tml-content -->
+    </div><!-- /tml-layout -->
 
 </div>
+
+<script>
+(function () {
+    var tabs = document.querySelectorAll('.sms-help .tml-tab');
+    var panels = document.querySelectorAll('.sms-help .tml-panel');
+    function show(name) {
+        tabs.forEach(function (t) {
+            t.classList.toggle('active', t.getAttribute('data-panel') === name);
+        });
+        panels.forEach(function (p) {
+            p.classList.toggle('active', p.id === 'panel-' + name);
+        });
+    }
+    tabs.forEach(function (t) {
+        t.addEventListener('click', function (e) {
+            e.preventDefault();
+            show(t.getAttribute('data-panel'));
+        });
+    });
+
+    // Open the tab named in the URL hash (e.g. help.php#google-voice), so the
+    // "View … Configuration" links in the config UI land on the right panel
+    // instead of the default (Twilio) tab. Also respond to later hash changes.
+    function showFromHash() {
+        var name = (location.hash || '').replace('#', '');
+        var match = document.getElementById('panel-' + name);
+        if (match) { show(name); }
+    }
+    showFromHash();
+    window.addEventListener('hashchange', showFromHash);
+})();
+</script>

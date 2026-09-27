@@ -4,7 +4,7 @@ Text My Lights - FPP plugin: viewers text a name that appears on your display.
 Supports Twilio and Google Voice as message sources.
 """
 
-from flask import Flask, request, jsonify, render_template_string, Response, g
+from flask import Flask, request, jsonify, render_template_string, Response, g, send_file
 import logging
 import json
 import secrets as _secrets
@@ -19,6 +19,9 @@ from collections import deque
 import os
 import struct
 import io
+import zipfile
+import tempfile
+import shutil
 import imaplib
 import smtplib
 import email
@@ -69,6 +72,12 @@ BLOCKLIST_FILE  = os.path.join(PLUGIN_DATA_DIR, "blocked_phones.json")
 FSEQ_SEQUENCE_PATH = '/home/fpp/media/sequences'
 FPP_VIDEOS_PATH    = '/home/fpp/media/videos'
 FPP_IMAGES_PATH    = '/home/fpp/media/images'
+FPP_PLAYLISTS_PATH = '/home/fpp/media/playlists'
+FPP_CONFIG_DIR     = '/home/fpp/media/config'
+# FPP stores its Pixel Overlay Model definitions (the "matrix" the plugin draws
+# text onto) in this file. Included in config export so the target Pi resolves
+# the same overlay model name.
+OVERLAY_MODELS_FILE = os.path.join(FPP_CONFIG_DIR, 'model-overlays.json')
 
 # Whitelist/blacklist source files stay in the plugin git repo directory
 BLACKLIST_FILE = os.path.join(PLUGIN_DIR, "blacklist.txt")
@@ -3320,21 +3329,20 @@ def index():
             <button class="view-btn" onclick="viewMessages()" style="margin:0 0 0 10px; padding:7px 14px; font-size:13px;">📋 View Message Queue</button>
             <span id="autosave_status" style="font-size:13px; margin-left:8px;"></span>
             <div style="margin-left:auto; display:flex; gap:4px; align-items:center;">
-                <button id="btn_twilio_start" onclick="twilioStart()" style="background:#2e7d32; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-size:12px; font-weight:bold; cursor:pointer;">▶ Text My Lights Start</button>
-                <button id="btn_twilio_stop" onclick="twilioStop()" style="background:#c62828; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-size:12px; font-weight:bold; cursor:pointer;">■ Text My Lights Stop</button>
+                <button id="btn_plugin_toggle" onclick="pluginToggle()" style="background:#2e7d32; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-size:12px; font-weight:bold; cursor:pointer;">▶ Start</button>
             </div>
         </div>
 
         <!-- Plugin Live Banner -->
         <div id="plugin_live_banner" style="display:none; background:#1b5e20; color:#fff; padding:10px 16px; border-radius:5px; margin-top:10px; font-size:14px; font-weight:bold; align-items:center; gap:10px;">
             <span style="display:inline-block; width:12px; height:12px; background:#69f0ae; border-radius:50%; box-shadow:0 0 6px #69f0ae;"></span>
-            Plugin is Live
+            Plugin is Live &mdash; Press Stop or run the "Text My Lights Stop" script to stop displaying incoming messages.
         </div>
 
         <!-- Plugin Not Live Banner -->
         <div id="plugin_not_live_banner" style="display:none; background:#b71c1c; color:#fff; padding:10px 16px; border-radius:5px; margin-top:10px; font-size:14px; font-weight:bold; align-items:center; gap:10px;">
             <span style="display:inline-block; width:12px; height:12px; background:#ff8a80; border-radius:50%; box-shadow:0 0 6px #ff8a80;"></span>
-            <span>Plugin is Not Live &mdash; Press Text My Lights Start to display incoming messages.<br>
+            <span>Plugin is Not Live &mdash; Press Start or run the "Text My Lights Start" script to display incoming messages.<br>
             <span style="font-weight:normal; font-size:12px;">Note: Viewers can still send messages, messaging rates will apply, but no messages will be displayed.</span></span>
         </div>
 
@@ -3363,7 +3371,6 @@ def index():
                             <input type="password" id="auth_token" autocomplete="new-password" onfocus="this.select()"
                                    value="{{ secret_sentinel if config.twilio_auth_token else '' }}"
                                    placeholder="Twilio Auth Token">
-                            {% if config.twilio_auth_token %}<p class="help-text">🔒 Saved. Leave the dots to keep it, type a new token to replace it, or clear the field to remove it.</p>{% endif %}
 
                             <label>Twilio Phone Number:</label>
                             <input type="text" id="phone_number" value="{{ config.twilio_phone_number }}" placeholder="+1234567890">
@@ -3382,7 +3389,6 @@ def index():
                             <input type="password" id="gv_app_password" autocomplete="new-password" onfocus="this.select()"
                                    value="{{ secret_sentinel if config.get('gv_app_password') else '' }}"
                                    placeholder="16-character app password">
-                            {% if config.get('gv_app_password') %}<p class="help-text">🔒 Saved. Leave the dots to keep it, type a new password to replace it, or clear the field to remove it.</p>{% endif %}
 
                             <button class="test-btn" onclick="testGoogleVoice()">🔌 Test Google Voice Connection</button>
                             <div id="gv_test_result" style="margin-top: 8px; font-size: 14px;"></div>
@@ -3398,28 +3404,25 @@ def index():
                             🔴 <strong>Plugin is Live</strong> — run Text My Lights Stop to edit
                         </div>
                         <div id="fpp_content_inputs">
-                            <label>Default "Waiting" Content: <span style="color:#f44336;font-size:12px;">* required</span></label>
+                            <label>Default "Waiting" Content: <span style="color:#f44336;font-size:12px;">* required</span> <span class="help-text" style="font-weight:normal;margin-left:6px;">📺 This content loops while waiting for text messages</span></label>
                             <select id="default_playlist">
                                 <option value="">-- Select content --</option>
                             </select>
-                            <p class="help-text">📺 This content loops while waiting for text messages</p>
 
-                            <label>Name Display Content:</label>
+                            <label>Name Display Content: <span class="help-text" style="font-weight:normal;margin-left:6px;">🎬 This content plays when displaying a name</span></label>
                             <select id="name_display_playlist">
                                 <option value="">-- None (Same as "Waiting" Content) --</option>
                                 {% set _np = config.get('name_display_playlist', '') %}
                                 {% if _np %}<option value="{{ _np }}" selected>{{ _np }}</option>{% endif %}
                             </select>
-                            <p class="help-text">🎬 This content plays when displaying a name</p>
                             <div id="name_display_none_warning" style="display:none; background:#3a2f00; border:1px solid #ffc107; color:#ffc107; border-radius:5px; padding:8px 12px; margin-top:6px; font-size:13px;">
                                 ⚠️ Left as None — names will appear directly over the Waiting content.
                             </div>
 
-                            <label>Overlay Model Name: <button type="button" onclick="refreshFPPLists(this)" style="font-size:11px;padding:2px 7px;margin-left:8px;cursor:pointer;">↻ Refresh Lists</button></label>
+                            <label>Overlay Model Name: <button type="button" onclick="refreshFPPLists(this)" style="font-size:11px;padding:2px 7px;margin-left:8px;cursor:pointer;">↻ Refresh Lists</button> <span class="help-text" style="font-weight:normal;margin-left:6px;">📝 The pixel overlay model for text (e.g., "Texting Matrix")</span></label>
                             <select id="overlay_model_name">
                                 <option value="">-- None --</option>
                             </select>
-                            <p class="help-text">📝 The pixel overlay model for text (e.g., "Texting Matrix")</p>
                         </div>
 
                         <hr style="border: none; border-top: 1px solid #ddd; margin: 15px 0;">
@@ -3699,6 +3702,175 @@ def index():
                 checkFiltersState();
                 checkDuplicateState();
                 updateWordsPreview();
+            </script>
+
+            <!-- Backup & Restore -->
+            <div class="section">
+                <h2>💾 Backup &amp; Restore</h2>
+                <p class="help-text" style="margin-bottom:12px;">Export all plugin settings, the content it uses (playlists, sequences, images), and the overlay model into one file — then import it on another Pi to reproduce this setup exactly. <strong>Credentials are not included</strong> (Twilio auth token / Google Voice app password); re-enter them after importing. <a id="backup_help_link" href="#" target="_top">Learn more</a></p>
+                <div id="backup_actions" style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+                    <button type="button" class="test-btn" onclick="openExportModal()"
+                       style="background:#4CAF50;">⬇️ Export Config</button>
+                    <input type="file" id="import_file" accept=".zip,application/zip" style="display:none;" onchange="importConfig(this)">
+                    <button type="button" class="test-btn" onclick="document.getElementById('import_file').click()">⬆️ Import Config</button>
+                    <span id="import_status" style="font-size:13px;"></span>
+                </div>
+            </div>
+
+            <!-- Local export modal — only used when the page is opened directly
+                 (not inside the FPP iframe). In the normal framed case the modal is
+                 owned by the parent (ui.php) so it is a true fixed, centred overlay
+                 that ignores scrolling. Here position:fixed works because a directly
+                 opened page is a normal scrolling document. -->
+            <div id="export_modal" onclick="if(event.target===this)closeExportModal()" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:100000; align-items:center; justify-content:center;">
+                <div id="export_dialog" style="background:#fff; color:#333; max-width:460px; width:92%; border-radius:8px; padding:22px; box-shadow:0 8px 30px rgba(0,0,0,0.35); max-height:88vh; overflow-y:auto; box-sizing:border-box;">
+                    <h3 style="margin:0 0 6px; color:#333;">Export Config</h3>
+                    <p class="help-text" style="margin:0 0 14px;">Choose what to include. Only the content <strong>this plugin is set to use</strong> is exported — never all of FPP's files. <strong>Credentials are never included.</strong></p>
+                    <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 12px;">
+                        <input type="checkbox" id="exp_settings" checked style="width:auto; margin:3px 0 0;">
+                        <span><strong>Plugin settings</strong><br><span class="help-text">Display lines, message rules, response text, filters, poll interval, selected content &amp; overlay model.</span></span>
+                    </label>
+                    <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 12px;">
+                        <input type="checkbox" id="exp_lists" checked style="width:auto; margin:3px 0 0;">
+                        <span><strong>Blocked numbers &amp; word lists</strong><br><span class="help-text">Blocked phone numbers and your whitelist / blacklist words.</span></span>
+                    </label>
+                    <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 12px;">
+                        <input type="checkbox" id="exp_content" checked style="width:auto; margin:3px 0 0;">
+                        <span><strong>Content files</strong><br><span class="help-text">The Waiting &amp; Name Display sequences, images, and videos this plugin uses — copied file-for-file. Can be large.</span></span>
+                    </label>
+                    <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 18px;">
+                        <input type="checkbox" id="exp_overlay" checked style="width:auto; margin:3px 0 0;">
+                        <span><strong>Overlay model (matrix)</strong><br><span class="help-text">The FPP Pixel Overlay Model the names are drawn onto.</span></span>
+                    </label>
+                    <div style="display:flex; gap:10px; justify-content:flex-end;">
+                        <button type="button" id="exp_cancel" onclick="closeExportModal()" style="background:#9e9e9e;">Cancel</button>
+                        <button type="button" id="exp_go" class="test-btn" style="background:#4CAF50; min-width:110px;" onclick="doExport()">Export</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Backup & Restore JS lives in its OWN script block (never merged with
+                 the settings-init functions above) so that any problem here can never
+                 prevent the credential-block toggle / settings init from running.
+                 Strings are plain ASCII to avoid any encoding edge cases. -->
+            <script>
+                // Point the "Learn more" link at FPP's own web server (default port),
+                // not this plugin service (:5000) where the page actually runs — a
+                // relative plugin.php link would 404 against :5000.
+                (function() {
+                    var hl = document.getElementById('backup_help_link');
+                    if (hl) hl.href = window.location.protocol + '//' + window.location.hostname
+                        + '/plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=help.php#backup';
+                })();
+
+                // Fetch the export (same-origin, so the auth cookie is sent), then
+                // save it. Using fetch (not a bare anchor) lets us know when the file
+                // has fully downloaded and surface server errors. Returns a Promise.
+                function _tmlDownload(sel) {
+                    var url = '/api/config/export?settings=' + (sel.s ? 1 : 0)
+                            + '&lists=' + (sel.l ? 1 : 0) + '&content=' + (sel.c ? 1 : 0)
+                            + '&overlay=' + (sel.o ? 1 : 0);
+                    return fetch(url).then(function(r) {
+                        if (!r.ok) throw new Error('Server returned ' + r.status);
+                        var cd = r.headers.get('Content-Disposition') || '';
+                        var m = /filename="?([^";]+)"?/.exec(cd);
+                        var name = (m && m[1]) ? m[1] : 'textmylights-config.zip';
+                        return r.blob().then(function(b) { return { blob: b, name: name }; });
+                    }).then(function(o) {
+                        var u = URL.createObjectURL(o.blob);
+                        var a = document.createElement('a');
+                        a.href = u; a.download = o.name;
+                        document.body.appendChild(a); a.click(); a.remove();
+                        setTimeout(function() { URL.revokeObjectURL(u); }, 2000);
+                    });
+                }
+                // The parent-owned modal sends the chosen sections here to download,
+                // and waits for tml_exportDone before it closes.
+                window.addEventListener('message', function(e) {
+                    if (e.data && e.data.type === 'tml_export' && e.data.sel) {
+                        _tmlDownload(e.data.sel)
+                            .then(function() { try { window.parent.postMessage({ type: 'tml_exportDone', success: true }, '*'); } catch (x) {} })
+                            .catch(function(err) { try { window.parent.postMessage({ type: 'tml_exportDone', success: false, error: String((err && err.message) || err) }, '*'); } catch (x) {} });
+                    }
+                });
+                window.openExportModal = function() {
+                    // Framed (normal case): let the parent show a true fixed, centred
+                    // overlay that ignores scrolling. Fall back to the local modal only
+                    // when the page is opened directly (not inside the FPP iframe).
+                    if (window.parent !== window) {
+                        try { window.parent.postMessage({ type: 'tml_openExport' }, '*'); return; } catch (e) {}
+                    }
+                    document.getElementById('exp_go').disabled = false;
+                    document.getElementById('exp_go').textContent = 'Export';
+                    document.getElementById('export_modal').style.display = 'flex';
+                };
+                window.closeExportModal = function() {
+                    if (window._tmlExporting) return;   // don't close mid-download
+                    document.getElementById('export_modal').style.display = 'none';
+                };
+                window.doExport = function() {
+                    if (window._tmlExporting) return;
+                    var sel = {
+                        s: document.getElementById('exp_settings').checked,
+                        l: document.getElementById('exp_lists').checked,
+                        c: document.getElementById('exp_content').checked,
+                        o: document.getElementById('exp_overlay').checked
+                    };
+                    if (!sel.s && !sel.l && !sel.c && !sel.o) { alert('Select at least one thing to export.'); return; }
+                    var go = document.getElementById('exp_go');
+                    window._tmlExporting = true;
+                    go.disabled = true; go.textContent = 'Exporting...';
+                    document.getElementById('exp_cancel').disabled = true;
+                    _tmlDownload(sel).then(function() {
+                        go.textContent = 'Downloaded';
+                        window._tmlExporting = false;
+                        setTimeout(function() {
+                            closeExportModal();
+                            go.disabled = false; go.textContent = 'Export';
+                            document.getElementById('exp_cancel').disabled = false;
+                        }, 900);
+                    }).catch(function(err) {
+                        window._tmlExporting = false;
+                        go.disabled = false; go.textContent = 'Export';
+                        document.getElementById('exp_cancel').disabled = false;
+                        alert('Export failed: ' + ((err && err.message) || err));
+                    });
+                };
+                window.importConfig = function(input) {
+                    var file = input.files && input.files[0];
+                    if (!file) return;
+                    if (!confirm('Import configuration from "' + file.name + '"? '
+                        + 'This overwrites the plugin settings, block/whitelist, the referenced '
+                        + 'content files, and the overlay model on THIS Pi. Your saved credentials '
+                        + 'are kept. Continue?')) {
+                        input.value = '';
+                        return;
+                    }
+                    var status = document.getElementById('import_status');
+                    status.style.color = '#555';
+                    status.textContent = 'Importing...';
+                    var fd = new FormData();
+                    fd.append('file', file);
+                    fetch('/api/config/import', {method: 'POST', body: fd})
+                        .then(function(r) { return r.json(); })
+                        .then(function(d) {
+                            if (d.success) {
+                                var msg = 'Imported.';
+                                if (d.warnings && d.warnings.length) msg += ' (' + d.warnings.length + ' warning' + (d.warnings.length > 1 ? 's' : '') + ')';
+                                status.style.color = '#2e7d32';
+                                status.textContent = msg + ' Reloading...';
+                                setTimeout(function() { location.reload(); }, 1400);
+                            } else {
+                                status.style.color = '#c62828';
+                                status.textContent = 'Error: ' + (d.error || 'Import failed');
+                            }
+                        })
+                        .catch(function() {
+                            status.style.color = '#c62828';
+                            status.textContent = 'Import request failed.';
+                        })
+                        .finally(function() { input.value = ''; });
+                };
             </script>
 
         </div>
@@ -4055,7 +4227,9 @@ def index():
                 <script>
                 function toggleResp(id) {
                     var row = document.getElementById('row_' + id);
-                    row.classList.toggle('enabled', document.getElementById('sms_response_' + id).checked);
+                    var cb = document.getElementById('sms_response_' + id);
+                    if (!row || !cb) return;   // never let a missing row abort init
+                    row.classList.toggle('enabled', cb.checked);
                 }
                 function initRespRows() {
                     ['show_not_live','blocked','profanity','duplicate','invalid_format','too_long','rate_limited','not_whitelisted','success'].forEach(function(id) {
@@ -4077,7 +4251,7 @@ def index():
                         <label class="toggle-switch"><input type="checkbox" id="sms_response_show_not_live" {{ 'checked' if config.get('sms_response_show_not_live', False) else '' }} onchange="toggleResp('show_not_live')"><span class="toggle-slider"></span></label>
                         <label for="sms_response_show_not_live" style="margin-left:10px;vertical-align:middle;">🔴 Show Not Live — Send Response</label>
                     </div>
-                    <p class="help-text" style="margin:4px 0 6px;">Sent to anyone who texts while the show is not active (Text My Lights Stop has been called).</p>
+                    <p class="help-text" style="margin:4px 0 6px;">Sent to anyone who texts while the show is not active.</p>
                     <textarea id="response_show_not_live" rows="2">{{ config.get('response_show_not_live', "Ho, Ho, Ho, It looks like our show isn't running now. Try again later.") }}</textarea>
                 </div>
 
@@ -4089,9 +4263,9 @@ def index():
                                onchange="toggleResp('invalid_format')"><span class="toggle-slider"></span></label>
                         <label for="sms_response_invalid_format" style="margin-left:10px;vertical-align:middle;">❌ Invalid Format — Send Response</label>
                     </div>
+                    <p class="help-text">💡 Type <code>{words}</code> anywhere in this message to auto-fill your current word limit — it becomes "<span id="words_preview">2 words</span>" in the reply, based on your <strong>Name Format Rules</strong> (One Word Only → "1 word", Two Words Maximum → "2 words").</p>
                     <p id="invalid_format_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('use_whitelist', False) else 'display:none;' }}">⚠️ Invalid Format responses are disabled when the whitelist is active — all names are validated against the whitelist instead of format rules.</p>
                     <textarea id="response_invalid_format" rows="2">{{ config.get('response_invalid_format', 'Please send only 1 name ({words}, no sentences).') }}</textarea>
-                    <p class="help-text">💡 Type <code>{words}</code> anywhere in this message to auto-fill your current word limit — it becomes "<span id="words_preview">2 words</span>" in the reply, based on your <strong>Name Format Rules</strong> (One Word Only → "1 word", Two Words Maximum → "2 words").</p>
                 </div>
 
                 <div id="row_too_long" class="resp-row{% if config.get('use_whitelist', False) %} locked{% endif %}">
@@ -4102,9 +4276,9 @@ def index():
                                onchange="toggleResp('too_long')"><span class="toggle-slider"></span></label>
                         <label for="sms_response_too_long" style="margin-left:10px;vertical-align:middle;">📏 Message Too Long — Send Response</label>
                     </div>
+                    <p class="help-text">📏 Sent when a message is longer than your <strong>Max Message Length</strong>. Applies whether or not the word-count rules are on.</p>
                     <p id="too_long_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('use_whitelist', False) else 'display:none;' }}">⚠️ Too Long responses are disabled when the whitelist is active — names are validated against the whitelist, not by length.</p>
                     <textarea id="response_too_long" rows="2">{{ config.get('response_too_long', "I'm sorry, your message exceeds our max message length. Please only send your name.") }}</textarea>
-                    <p class="help-text">📏 Sent when a message is longer than your <strong>Max Message Length</strong> (Configuration tab). Applies whether or not the word-count rules are on.</p>
                 </div>
 
                 <div id="row_profanity" class="resp-row">
@@ -4131,7 +4305,7 @@ def index():
                                onchange="toggleResp('rate_limited')"><span class="toggle-slider"></span></label>
                         <label for="sms_response_rate_limited" style="margin-left:10px;vertical-align:middle;">⛔ Rate Limited — Send Response</label>
                     </div>
-                    <p id="rate_limited_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('max_messages_per_phone', 0) == 0 else 'display:none;' }}">⚠️ Rate-Limited responses are disabled when Max Messages Per Phone is 0 (unlimited) — no one is ever rate limited.</p>
+                    <p id="rate_limited_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('max_messages_per_phone', 0) == 0 else 'display:none;' }}">⚠️ Rate-Limited responses are disabled when Max Messages Per Phone is 0 (unlimited).</p>
                     <textarea id="response_rate_limited" rows="2">{{ config.get('response_rate_limited', "You've reached the maximum number of messages allowed. Please try again tomorrow!") }}</textarea>
                 </div>
 
@@ -4143,7 +4317,7 @@ def index():
                                onchange="toggleResp('duplicate')"><span class="toggle-slider"></span></label>
                         <label for="sms_response_duplicate" style="margin-left:10px;vertical-align:middle;">🔄 Duplicate Name — Send Response</label>
                     </div>
-                    <p id="duplicate_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('allow_duplicate_names', False) else 'display:none;' }}">⚠️ <strong>Duplicate response is disabled</strong> — Allow Duplicate Names is on, so this response will never send.</p>
+                    <p id="duplicate_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('allow_duplicate_names', False) else 'display:none;' }}">⚠️ <strong>Allow Duplicate Names is enabled</strong> — This response is disabled.</p>
                     <textarea id="response_duplicate" rows="2">{{ config.get('response_duplicate', "You've already sent this name today!") }}</textarea>
                 </div>
 
@@ -4155,7 +4329,7 @@ def index():
                                onchange="toggleResp('not_whitelisted')"><span class="toggle-slider"></span></label>
                         <label for="sms_response_not_whitelisted" style="margin-left:10px;vertical-align:middle;">📋 Not on Whitelist — Send Response</label>
                     </div>
-                    <p id="not_whitelisted_disabled_warning" class="resp-locked-note" style="{{ '' if not config.get('use_whitelist', False) else 'display:none;' }}">⚠️ Not-on-Whitelist responses only apply when the Name Whitelist is enabled.</p>
+                    <p id="not_whitelisted_disabled_warning" class="resp-locked-note" style="{{ '' if not config.get('use_whitelist', False) else 'display:none;' }}">⚠️ <strong>Name Whitelist is disabled</strong> — This response is disabled.</p>
                     <textarea id="response_not_whitelisted" rows="2">{{ config.get('response_not_whitelisted', 'Sorry, that name is not on our approved list.') }}</textarea>
                 </div>
 
@@ -4169,7 +4343,7 @@ def index():
                 <h2>🧪 Message Testing</h2>
 
                 <div id="show_not_live_banner" style="display:none; background:#ffecb3; border:1px solid #FF9800; border-radius:6px; padding:10px 14px; margin-bottom:14px; color:#7a4f00; font-size:14px;">
-                    🔴 Show is not live — run <strong>Text My Lights Start</strong> from the FPP scheduler to activate the display before testing.
+                    🔴 Show is not live — press <strong>Start</strong> or run the <strong>Text My Lights Start</strong> script to activate the display before testing.
                 </div>
 
                 <div id="test_form_inner">
@@ -4189,32 +4363,36 @@ def index():
         </div>
 
         <script>
-            function twilioStart() {
-                var btn = document.getElementById('btn_twilio_start');
+            // Tracks the last-known live state so the single toggle button knows
+            // whether a click should Start (activate) or Stop (deactivate).
+            var _pluginLive = false;
+
+            function pluginToggle() {
+                var btn = document.getElementById('btn_plugin_toggle');
+                var goingLive = !_pluginLive;
+                var url = goingLive ? '/api/activate' : '/api/deactivate';
                 btn.disabled = true; btn.textContent = '...';
-                fetch('/api/activate', {method:'POST'})
+                fetch(url, {method:'POST'})
                 .then(r => r.json())
                 .then(function(d) {
-                    if (d.success === false) { alert('Text My Lights Start failed: ' + (d.error || 'Unknown error')); }
+                    if (goingLive && d.success === false) { alert('Start failed: ' + (d.error || 'Unknown error')); }
                     updateLiveStatus();
                 })
-                .catch(function() { alert('Text My Lights Start request failed.'); })
-                .finally(function() { btn.disabled = false; btn.textContent = '▶ Text My Lights Start'; });
-            }
-
-            function twilioStop() {
-                var btn = document.getElementById('btn_twilio_stop');
-                btn.disabled = true; btn.textContent = '...';
-                fetch('/api/deactivate', {method:'POST'})
-                .then(r => r.json())
-                .then(function() { updateLiveStatus(); })
-                .catch(function() { alert('Text My Lights Stop request failed.'); })
-                .finally(function() { btn.disabled = false; btn.textContent = '■ Text My Lights Stop'; });
+                .catch(function() { alert((goingLive ? 'Start' : 'Stop') + ' request failed.'); })
+                .finally(function() { btn.disabled = false; });
             }
 
             function updateLiveStatus() {
                 fetch('/api/queue/status').then(r => r.json()).then(data => {
                     const live = data.show_live === true;
+                    _pluginLive = live;
+
+                    // Single Start/Stop toggle reflects current live state
+                    const toggle = document.getElementById('btn_plugin_toggle');
+                    if (toggle) {
+                        toggle.textContent = live ? '■ Stop' : '▶ Start';
+                        toggle.style.background = live ? '#c62828' : '#2e7d32';
+                    }
 
                     // Testing tab banner (show is NOT live warning)
                     const notLiveBanner = document.getElementById('show_not_live_banner');
@@ -5428,19 +5606,26 @@ def index():
             }
 
             // All DOM elements are above this script block — call init functions directly.
-            try { initCanvasPreview(); } catch(e) { console.error('Canvas init error:', e); }
+            // Each step is isolated: a failure in one (e.g. the FSEQ preview) must not
+            // abort the rest, or the credential-block toggle (setupAutoSave →
+            // updateSourceUI) would never run and the page would show the wrong
+            // provider's fields. Guard every call.
+            function _init(label, fn) {
+                try { fn(); } catch (e) { console.error(label + ' init error:', e); }
+            }
+            _init('canvas', function() { initCanvasPreview(); });
             // Load preview immediately using server-rendered dropdown value, then again after FPP data populates
-            if (window.toggleFseqPreview) window.toggleFseqPreview();
-            updateNameDisplayWarning();
-            loadFonts();
-            loadFPPData();
-            initRespRows();
-            checkWhitelistResponseState();
-            checkRateLimitResponseState();
-            checkDuplicateState();
-            updateWordsPreview();
-            setupAutoSave();
-            updateLiveStatus();
+            _init('fseqPreview', function() { if (window.toggleFseqPreview) window.toggleFseqPreview(); });
+            _init('nameDisplayWarning', updateNameDisplayWarning);
+            _init('fonts', loadFonts);
+            _init('fppData', loadFPPData);
+            _init('respRows', initRespRows);
+            _init('whitelistResp', checkWhitelistResponseState);
+            _init('rateLimitResp', checkRateLimitResponseState);
+            _init('duplicateResp', checkDuplicateState);
+            _init('wordsPreview', updateWordsPreview);
+            _init('autoSave', setupAutoSave);
+            _init('liveStatus', updateLiveStatus);
             setInterval(updateLiveStatus, 5000);
             for (var _li = 0; _li < 4; _li++) { updateLineSpeedRowVisibility(_li); updateLineOrientationRowVisibility(_li); }
             initValignButtons();
@@ -6080,6 +6265,372 @@ def update_config():
     except Exception as e:
         return _client_error("update_config", e)
 
+# ============================================================================
+# Config Export / Import
+# ----------------------------------------------------------------------------
+# Export bundles the plugin settings, the block/whitelist/blacklist files, the
+# FPP content the plugin references (the waiting + name-display playlists and
+# the sequences/images/videos they use), and the FPP overlay-model definition
+# into a single .zip, so another Pi can be brought up identically. Credentials
+# (Twilio auth token, Google Voice app password) are DELIBERATELY excluded —
+# plugin.json on disk never contains them (see save_config), and we re-scrub on
+# import for good measure. Import restores everything and preserves the target
+# Pi's own credentials.
+# ============================================================================
+BUNDLE_MARKER  = "textmylights-config"
+BUNDLE_FORMAT  = 1
+
+def _content_source_files(content_value, warnings):
+    """Resolve a plugin content setting (default_playlist / name_display_playlist)
+    to a list of (arc_subdir, absolute_path) files to include in the export.
+
+    A content value is one of:
+      • ''            -> nothing
+      • 'seq:NAME'    -> a sequence file in the sequences dir
+      • 'img:NAME'    -> an image file in the images dir
+      • 'NAME'        -> an FPP playlist; its .json plus every sequence/media
+                         item it references
+    """
+    files = []
+    if not content_value:
+        return files
+
+    if content_value.startswith('seq:'):
+        name = content_value[4:]
+        if not name.endswith('.fseq'):
+            name += '.fseq'
+        files.append(('content/sequences', os.path.join(FSEQ_SEQUENCE_PATH, name)))
+        return files
+
+    if content_value.startswith('img:'):
+        name = content_value[4:]
+        files.append(('content/images', os.path.join(FPP_IMAGES_PATH, name)))
+        return files
+
+    # Otherwise it's a playlist name.
+    pl_path = os.path.join(FPP_PLAYLISTS_PATH, content_value + '.json')
+    if not os.path.isfile(pl_path):
+        warnings.append(f"Playlist '{content_value}' not found on disk — skipped")
+        return files
+    files.append(('content/playlists', pl_path))
+
+    # Walk the playlist for referenced sequences and media so the target Pi has
+    # the actual files, not just the playlist that names them.
+    try:
+        with open(pl_path, 'r') as f:
+            pl = json.load(f)
+        sections = []
+        for key in ('leadIn', 'mainPlaylist', 'leadOut'):
+            if isinstance(pl.get(key), list):
+                sections.extend(pl[key])
+        for entry in sections:
+            if not isinstance(entry, dict):
+                continue
+            seq = entry.get('sequenceName')
+            if seq:
+                files.append(('content/sequences', os.path.join(FSEQ_SEQUENCE_PATH, seq)))
+            media = entry.get('mediaName')
+            if media:
+                # Media may be a video or an image; include whichever exists.
+                vid = os.path.join(FPP_VIDEOS_PATH, media)
+                img = os.path.join(FPP_IMAGES_PATH, media)
+                if os.path.isfile(vid):
+                    files.append(('content/videos', vid))
+                elif os.path.isfile(img):
+                    files.append(('content/images', img))
+                else:
+                    warnings.append(f"Media '{media}' (in playlist '{content_value}') not found — skipped")
+    except Exception as e:
+        warnings.append(f"Could not read playlist '{content_value}': {e}")
+
+    return files
+
+@app.route('/api/config/export')
+def export_config():
+    """Build and stream a .zip bundle of the selected plugin configuration.
+
+    The export modal sends section flags as query params (settings/lists/content/
+    overlay = 1|0). A section defaults to included when its param is absent, so a
+    plain GET of this URL still exports everything."""
+    tmp = None
+    try:
+        want = lambda k: request.args.get(k, '1') == '1'
+        inc_settings = want('settings')
+        inc_lists    = want('lists')
+        inc_content  = want('content')
+        inc_overlay  = want('overlay')
+
+        warnings = []
+        # Settings (plugin.json on disk is already secrets-free) and the block /
+        # name lists are separate opt-in groups, but share the 'settings/' arc dir
+        # (import maps them to their targets by basename).
+        settings_files = []
+        if inc_settings:
+            settings_files.append(('settings', CONFIG_FILE))
+        if inc_lists:
+            settings_files += [
+                ('settings', BLOCKLIST_FILE),
+                ('settings', WHITELIST_FILE),
+                ('settings', WHITELIST_ADDED_FILE),
+                ('settings', WHITELIST_REMOVED_FILE),
+                ('settings', BLACKLIST_FILE),
+                ('settings', BLACKLIST_ADDED_FILE),
+                ('settings', BLACKLIST_REMOVED_FILE),
+            ]
+
+        # Referenced content ONLY — the Waiting + Name Display content this plugin
+        # is set to use and the files they reference. Never all of FPP's media.
+        content_files = []
+        if inc_content:
+            for cv in (config.get('default_playlist', ''), config.get('name_display_playlist', '')):
+                content_files.extend(_content_source_files(cv, warnings))
+
+        # Overlay model definition ("matrix").
+        overlay_files = []
+        if inc_overlay:
+            if os.path.isfile(OVERLAY_MODELS_FILE):
+                overlay_files.append(('overlay', OVERLAY_MODELS_FILE))
+            else:
+                warnings.append("Overlay model file not found — overlay model not exported")
+
+        # Write to a temp file (FSEQ can be large; avoid holding the whole zip in
+        # RAM on a Pi). ZIP_STORED since FSEQ is already compressed.
+        fd, tmp = tempfile.mkstemp(suffix='.zip', prefix='tml_export_')
+        os.close(fd)
+        seen = set()
+        included = []
+        with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_STORED) as zf:
+            for arc_dir, path in settings_files + content_files + overlay_files:
+                if not path or not os.path.isfile(path):
+                    continue
+                arcname = f"{arc_dir}/{os.path.basename(path)}"
+                if arcname in seen:
+                    continue
+                seen.add(arcname)
+                zf.write(path, arcname)
+                included.append(arcname)
+
+            manifest = {
+                "bundle": BUNDLE_MARKER,
+                "format": BUNDLE_FORMAT,
+                "created": datetime.now(timezone.utc).isoformat(),
+                "includes": {
+                    "settings": inc_settings,
+                    "lists": inc_lists,
+                    "content": bool(content_files),
+                    "overlay_model": bool(overlay_files),
+                    "credentials": False,
+                },
+                "overlay_model_name": config.get('overlay_model_name', ''),
+                "default_playlist": config.get('default_playlist', ''),
+                "name_display_playlist": config.get('name_display_playlist', ''),
+                "files": included,
+                "warnings": warnings,
+            }
+            zf.writestr('manifest.json', json.dumps(manifest, indent=2))
+
+        stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        download_name = f"textmylights-config-{stamp}.zip"
+        # send_file streams the temp file; remove it once the response is sent.
+        resp = send_file(tmp, mimetype='application/zip',
+                         as_attachment=True, download_name=download_name)
+
+        @resp.call_on_close
+        def _cleanup():
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return resp
+    except Exception as e:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        logging.error(f"export_config failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+def _merge_overlay_models(src_bytes, warnings):
+    """Merge exported overlay models into the target Pi's model-overlays.json by
+    model Name, so the imported model appears without wiping other models the
+    target already has. Backs up the existing file first."""
+    try:
+        src = json.loads(src_bytes)
+    except Exception:
+        warnings.append("Overlay model file in bundle was not valid JSON — skipped")
+        return
+
+    def models_of(obj):
+        if isinstance(obj, dict) and isinstance(obj.get('models'), list):
+            return obj['models']
+        if isinstance(obj, list):
+            return obj
+        return None
+
+    os.makedirs(FPP_CONFIG_DIR, exist_ok=True)
+    # Back up whatever is there now.
+    if os.path.isfile(OVERLAY_MODELS_FILE):
+        try:
+            shutil.copy2(OVERLAY_MODELS_FILE, OVERLAY_MODELS_FILE + '.tml-bak')
+        except OSError:
+            pass
+
+    src_models = models_of(src)
+    dest = {}
+    if os.path.isfile(OVERLAY_MODELS_FILE):
+        try:
+            with open(OVERLAY_MODELS_FILE, 'r') as f:
+                dest = json.load(f)
+        except Exception:
+            dest = {}
+    dest_models = models_of(dest)
+
+    # If either side has an unrecognized shape, fall back to writing the bundle's
+    # file verbatim (already backed up above).
+    if src_models is None or dest_models is None:
+        with open(OVERLAY_MODELS_FILE, 'wb') as f:
+            f.write(src_bytes)
+        warnings.append("Overlay models merged by full replace (unrecognized schema); previous file kept as .tml-bak")
+        return
+
+    def name_of(m):
+        return m.get('Name') or m.get('name') if isinstance(m, dict) else None
+
+    order, by_name = [], {}
+    for m in dest_models:
+        n = name_of(m)
+        if n is not None and n not in by_name:
+            order.append(n)
+        by_name[n] = m
+    for m in src_models:
+        n = name_of(m)
+        if n not in by_name:
+            order.append(n)
+        by_name[n] = m  # bundle wins for matching names
+    merged = [by_name[n] for n in order]
+
+    if isinstance(dest, dict):
+        dest['models'] = merged
+        out = dest
+    else:
+        out = merged
+    with open(OVERLAY_MODELS_FILE, 'w') as f:
+        json.dump(out, f, indent=2)
+
+@app.route('/api/config/import', methods=['POST'])
+def import_config():
+    """Restore a configuration bundle produced by /api/config/export.
+    Credentials are never taken from the bundle; the target Pi keeps its own."""
+    global config, twilio_client, _blocklist_cache, _whitelist_cache, _blacklist_cache
+    try:
+        upload = request.files.get('file')
+        if upload is None:
+            return jsonify({"success": False, "error": "No file uploaded"}), 400
+
+        data = upload.read()
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(data))
+        except zipfile.BadZipFile:
+            return jsonify({"success": False, "error": "Not a valid .zip file"}), 400
+
+        names = set(zf.namelist())
+        if 'manifest.json' not in names:
+            return jsonify({"success": False, "error": "Missing manifest.json — not a Text My Lights bundle"}), 400
+        try:
+            manifest = json.loads(zf.read('manifest.json'))
+        except Exception:
+            return jsonify({"success": False, "error": "Corrupt manifest.json"}), 400
+        if manifest.get('bundle') != BUNDLE_MARKER:
+            return jsonify({"success": False, "error": "This .zip is not a Text My Lights config bundle"}), 400
+
+        warnings = []
+        summary = {"settings": False, "content": 0, "overlay_model": False}
+
+        # Map each export subdir to its destination directory on this Pi. basename
+        # is used for every write (zip-slip safe — no attacker-controlled paths).
+        dest_dirs = {
+            'content/playlists':  FPP_PLAYLISTS_PATH,
+            'content/sequences':  FSEQ_SEQUENCE_PATH,
+            'content/images':     FPP_IMAGES_PATH,
+            'content/videos':     FPP_VIDEOS_PATH,
+        }
+        # settings files land at their known individual paths, keyed by basename.
+        settings_targets = {
+            os.path.basename(CONFIG_FILE):            None,  # handled specially below
+            os.path.basename(BLOCKLIST_FILE):         BLOCKLIST_FILE,
+            os.path.basename(WHITELIST_FILE):         WHITELIST_FILE,
+            os.path.basename(WHITELIST_ADDED_FILE):   WHITELIST_ADDED_FILE,
+            os.path.basename(WHITELIST_REMOVED_FILE): WHITELIST_REMOVED_FILE,
+            os.path.basename(BLACKLIST_FILE):         BLACKLIST_FILE,
+            os.path.basename(BLACKLIST_ADDED_FILE):   BLACKLIST_ADDED_FILE,
+            os.path.basename(BLACKLIST_REMOVED_FILE): BLACKLIST_REMOVED_FILE,
+        }
+
+        for entry in names:
+            if entry.endswith('/') or entry == 'manifest.json':
+                continue
+            base = os.path.basename(entry)
+            if not base:
+                continue
+            arc_dir = entry.rsplit('/', 1)[0] if '/' in entry else ''
+
+            if arc_dir == 'settings':
+                if base == os.path.basename(CONFIG_FILE):
+                    # Merge imported settings, but never import credentials and
+                    # never overwrite this Pi's stored ones.
+                    try:
+                        imported = json.loads(zf.read(entry))
+                    except Exception:
+                        warnings.append("plugin.json in bundle was invalid — settings skipped")
+                        continue
+                    for sk in SECRET_KEYS:
+                        imported.pop(sk, None)
+                    config.update(imported)
+                    save_config()
+                    summary["settings"] = True
+                elif base in settings_targets and settings_targets[base]:
+                    target = settings_targets[base]
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with open(target, 'wb') as f:
+                        f.write(zf.read(entry))
+                else:
+                    warnings.append(f"Unknown settings file '{base}' — skipped")
+
+            elif arc_dir in dest_dirs:
+                target_dir = dest_dirs[arc_dir]
+                os.makedirs(target_dir, exist_ok=True)
+                with open(os.path.join(target_dir, base), 'wb') as f:
+                    f.write(zf.read(entry))
+                summary["content"] += 1
+
+            elif arc_dir == 'overlay':
+                _merge_overlay_models(zf.read(entry), warnings)
+                summary["overlay_model"] = True
+
+            else:
+                warnings.append(f"Unrecognized entry '{entry}' — skipped")
+
+        # Refresh in-memory state: force cache reloads and re-sync Twilio client.
+        _blocklist_cache = None
+        _whitelist_cache = None
+        _blacklist_cache = None
+        try:
+            if config.get('twilio_account_sid') and config.get('twilio_auth_token'):
+                twilio_client = Client(config['twilio_account_sid'], config['twilio_auth_token'])
+        except Exception:
+            pass
+
+        return jsonify({
+            "success": True,
+            "summary": summary,
+            "warnings": warnings,
+            "note": "Overlay model changes take effect after an FPPD restart.",
+        })
+    except Exception as e:
+        logging.error(f"import_config failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
 @app.route('/api/fpp/fonts')
 def fpp_fonts_endpoint():
     try:
@@ -6524,7 +7075,7 @@ def test_message_submission():
         test_phone = data.get('phone', 'Local Testing')
         
         if not config.get('enabled', False):
-            return jsonify({"success": False, "error": "Show is not live — run Text My Lights Start first"})
+            return jsonify({"success": False, "error": "Show is not live — press Start or run the Text My Lights Start script first"})
 
         if not test_name:
             return jsonify({"success": False, "error": "Name is required"})

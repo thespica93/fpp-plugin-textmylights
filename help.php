@@ -73,6 +73,7 @@ function tml_shot($file, $alt) {
             <li><a href="#" class="tml-tab active" data-panel="twilio">📞 Twilio Configuration</a></li>
             <li><a href="#" class="tml-tab" data-panel="google-voice">🟢 Google Voice Configuration</a></li>
             <li><a href="#" class="tml-tab" data-panel="settings">⚙️ Plugin Settings</a></li>
+            <li><a href="#" class="tml-tab" data-panel="backup">💾 Backup &amp; Restore</a></li>
             <li><a href="#" class="tml-tab" data-panel="support">🆘 Support</a></li>
         </ul>
     </nav>
@@ -190,6 +191,42 @@ function tml_shot($file, $alt) {
         <tr><td>On whitelist <span style="color:#888;">(if on)</span></td><td>Reply: not on list</td></tr>
         <tr><td>✅ Added to display queue</td><td>Reply: success</td></tr>
     </table></div>
+    </section>
+
+    <!-- ================= BACKUP & RESTORE ================= -->
+    <section class="tml-panel" id="panel-backup">
+    <h2 id="backup">💾 Backup &amp; Restore</h2>
+    <p>Export your entire setup to a single file, then import it on another Pi to reproduce this unit — no re-configuring by hand. Both buttons are at the bottom of the <em>Settings</em> tab in the Config UI.</p>
+
+    <div class="warn"><strong>🔒 Credentials are never exported.</strong> Your <strong>Twilio Auth Token</strong> and <strong>Google Voice App Password</strong> are deliberately left out of the export file, so it is safe to store and copy between devices. After importing on a new Pi, re-enter those under <em>Settings → Message Source</em>.</p>
+
+    <h3>What's in the export</h3>
+    <div class="ref"><table>
+        <tr><th>Included</th><th>Details</th></tr>
+        <tr><td>Plugin settings</td><td>Everything in <code>plugin.json</code> — display lines, message rules, response text, filters, poll interval, and the selected content/overlay model. (Your Twilio Account SID, phone number, and Gmail address come along; the auth token / app password do <strong>not</strong>.)</td></tr>
+        <tr><td>Block &amp; name lists</td><td>Blocked phone numbers, and your whitelist / blacklist word files.</td></tr>
+        <tr><td>Content files</td><td>The <strong>Waiting</strong> and <strong>Name Display</strong> content, plus the sequences, images, and videos those playlists actually use — copied file-for-file.</td></tr>
+        <tr><td>Overlay model</td><td>The FPP Pixel Overlay Model definition (the "matrix" the names are drawn onto).</td></tr>
+    </table></div>
+
+    <h3>Export</h3>
+    <ol>
+        <li>Open the Config UI and go to the <em>Settings</em> tab.</li>
+        <li>Under <strong>Backup &amp; Restore</strong>, click <strong>⬇️ Export Config</strong>.</li>
+        <li>A dialog lists what to include — <em>Plugin settings</em>, <em>Blocked numbers &amp; word lists</em>, <em>Content files</em>, and <em>Overlay model</em>. All are checked by default; untick anything you want to leave out (e.g. skip <em>Content files</em> for a small settings-only backup).</li>
+        <li>Click <strong>Export</strong>. A <code>textmylights-config-*.zip</code> downloads to your computer. Keep it somewhere safe.</li>
+    </ol>
+    <div class="note">Only the content <strong>this plugin is set to use</strong> (your Waiting and Name Display selections, and the files they reference) is exported — never all of FPP's sequences or media.</div>
+
+    <h3>Import onto another Pi</h3>
+    <ol>
+        <li>Install this plugin on the new Pi and open its Config UI.</li>
+        <li>On the <em>Settings</em> tab, under <strong>Backup &amp; Restore</strong>, click <strong>⬆️ Import Config</strong> and choose the <code>.zip</code>.</li>
+        <li>Confirm the prompt. Settings, lists, content files, and the overlay model are restored; the page reloads with everything in place.</li>
+        <li>Re-enter your <strong>Auth Token</strong> / <strong>App Password</strong> under <em>Message Source</em>, then test the connection.</li>
+    </ol>
+    <div class="note"><strong>Good to know:</strong> Import keeps the target Pi's own saved credentials — it never clears them. The overlay model change takes effect after an <strong>FPPD restart</strong>. Importing merges the overlay model in by name, so any other models already on that Pi are left alone (the previous file is saved as <code>model-overlays.json.tml-bak</code>).</div>
+    <div class="warn"><strong>Matching hardware:</strong> The overlay model maps to channel ranges, but the export does <strong>not</strong> include FPP's channel-output/controller configuration. For the display to light correctly, the new Pi's outputs and wiring must already match — or use FPP's own <em>Backup</em> for a full hardware clone.</div>
     </section>
 
     <!-- ================= SUPPORT ================= -->

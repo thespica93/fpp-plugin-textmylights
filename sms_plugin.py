@@ -4,7 +4,7 @@ Text My Lights - FPP plugin: viewers text a name that appears on your display.
 Supports Twilio and Google Voice as message sources.
 """
 
-from flask import Flask, request, jsonify, render_template_string, Response, g
+from flask import Flask, request, jsonify, render_template_string, Response, g, send_file
 import logging
 import json
 import secrets as _secrets
@@ -19,6 +19,9 @@ from collections import deque
 import os
 import struct
 import io
+import zipfile
+import tempfile
+import shutil
 import imaplib
 import smtplib
 import email
@@ -69,6 +72,12 @@ BLOCKLIST_FILE  = os.path.join(PLUGIN_DATA_DIR, "blocked_phones.json")
 FSEQ_SEQUENCE_PATH = '/home/fpp/media/sequences'
 FPP_VIDEOS_PATH    = '/home/fpp/media/videos'
 FPP_IMAGES_PATH    = '/home/fpp/media/images'
+FPP_PLAYLISTS_PATH = '/home/fpp/media/playlists'
+FPP_CONFIG_DIR     = '/home/fpp/media/config'
+# FPP stores its Pixel Overlay Model definitions (the "matrix" the plugin draws
+# text onto) in this file. Included in config export so the target Pi resolves
+# the same overlay model name.
+OVERLAY_MODELS_FILE = os.path.join(FPP_CONFIG_DIR, 'model-overlays.json')
 
 # Whitelist/blacklist source files stay in the plugin git repo directory
 BLACKLIST_FILE = os.path.join(PLUGIN_DIR, "blacklist.txt")
@@ -3693,7 +3702,129 @@ def index():
                 checkFiltersState();
                 checkDuplicateState();
                 updateWordsPreview();
+
+                // Export modal: pick which sections to bundle, then trigger the
+                // download with the selection as query params. All boxes default
+                // checked (see markup) so the common case is one extra click.
+                window.openExportModal = function() {
+                    var modal = document.getElementById('export_modal');
+                    var dlg = document.getElementById('export_dialog');
+                    // Reparent to <body> so absolute coords resolve against the
+                    // document (not some positioned ancestor), matching the
+                    // viewport-relative rect below (the iframe has no scroll).
+                    if (modal.parentNode !== document.body) document.body.appendChild(modal);
+                    // Cover the whole document (no iframe scroll of its own).
+                    modal.style.height = document.documentElement.scrollHeight + 'px';
+                    modal.style.display = 'block';
+                    // Anchor the dialog just below the export buttons — where the
+                    // user is looking — since fixed positioning can't be used here.
+                    var rect = document.getElementById('backup_actions').getBoundingClientRect();
+                    dlg.style.top = Math.max(10, rect.bottom + 8) + 'px';
+                };
+                window.closeExportModal = function() {
+                    document.getElementById('export_modal').style.display = 'none';
+                };
+                window.doExport = function() {
+                    var s = document.getElementById('exp_settings').checked ? 1 : 0;
+                    var l = document.getElementById('exp_lists').checked ? 1 : 0;
+                    var c = document.getElementById('exp_content').checked ? 1 : 0;
+                    var o = document.getElementById('exp_overlay').checked ? 1 : 0;
+                    if (!s && !l && !c && !o) { alert('Select at least one thing to export.'); return; }
+                    var url = '/api/config/export?settings=' + s + '&lists=' + l + '&content=' + c + '&overlay=' + o;
+                    // Anchor with download attr streams the .zip without navigating the iframe.
+                    var a = document.createElement('a');
+                    a.href = url; a.download = '';
+                    document.body.appendChild(a); a.click(); a.remove();
+                    closeExportModal();
+                };
+                // Dismiss the modal when clicking the dimmed backdrop.
+                document.getElementById('export_modal').addEventListener('click', function(e) {
+                    if (e.target === this) closeExportModal();
+                });
+
+                // Backup & Restore: upload a bundle to /api/config/import, then
+                // reload so the imported settings render. Credentials are never
+                // touched by import — this Pi keeps its own.
+                window.importConfig = function(input) {
+                    var file = input.files && input.files[0];
+                    if (!file) return;
+                    if (!confirm('Import configuration from "' + file.name + '"?\n\n'
+                        + 'This overwrites the plugin settings, block/whitelist, the referenced '
+                        + 'content files, and the overlay model on THIS Pi. Your saved credentials '
+                        + 'are kept. Continue?')) {
+                        input.value = '';
+                        return;
+                    }
+                    var status = document.getElementById('import_status');
+                    status.style.color = '#555';
+                    status.textContent = 'Importing…';
+                    var fd = new FormData();
+                    fd.append('file', file);
+                    fetch('/api/config/import', {method: 'POST', body: fd})
+                        .then(function(r) { return r.json(); })
+                        .then(function(d) {
+                            if (d.success) {
+                                var msg = '✅ Imported.';
+                                if (d.warnings && d.warnings.length) msg += ' (' + d.warnings.length + ' warning' + (d.warnings.length > 1 ? 's' : '') + ')';
+                                status.style.color = '#2e7d32';
+                                status.textContent = msg + ' Reloading…';
+                                setTimeout(function() { location.reload(); }, 1400);
+                            } else {
+                                status.style.color = '#c62828';
+                                status.textContent = '❌ ' + (d.error || 'Import failed');
+                            }
+                        })
+                        .catch(function() {
+                            status.style.color = '#c62828';
+                            status.textContent = '❌ Import request failed.';
+                        })
+                        .finally(function() { input.value = ''; });
+                };
             </script>
+
+            <!-- Backup & Restore -->
+            <div class="section">
+                <h2>💾 Backup &amp; Restore</h2>
+                <p class="help-text" style="margin-bottom:12px;">Export all plugin settings, the content it uses (playlists, sequences, images), and the overlay model into one file — then import it on another Pi to reproduce this setup exactly. <strong>Credentials are not included</strong> (Twilio auth token / Google Voice app password); re-enter them after importing. <a href="plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=help.php#backup" target="_top">Learn more</a></p>
+                <div id="backup_actions" style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+                    <button type="button" class="test-btn" onclick="openExportModal()"
+                       style="background:#4CAF50;">⬇️ Export Config</button>
+                    <input type="file" id="import_file" accept=".zip,application/zip" style="display:none;" onchange="importConfig(this)">
+                    <button type="button" class="test-btn" onclick="document.getElementById('import_file').click()">⬆️ Import Config</button>
+                    <span id="import_status" style="font-size:13px;"></span>
+                </div>
+            </div>
+
+            <!-- Export selection modal. The page renders inside an auto-height,
+                 non-scrolling iframe, so position:fixed would not track the parent
+                 window's scroll — instead the backdrop is sized to the full document
+                 and the dialog is anchored just below the export buttons (in view). -->
+            <div id="export_modal" style="display:none; position:absolute; left:0; top:0; width:100%; background:rgba(0,0,0,0.5); z-index:1000;">
+                <div id="export_dialog" style="position:absolute; left:50%; transform:translateX(-50%); background:#fff; color:#333; max-width:460px; width:92%; border-radius:8px; padding:22px; box-shadow:0 8px 30px rgba(0,0,0,0.35);">
+                    <h3 style="margin:0 0 6px; color:#333;">💾 Export Config</h3>
+                    <p class="help-text" style="margin:0 0 14px;">Choose what to include. Only the content <strong>this plugin is set to use</strong> is exported — never all of FPP's files. <strong>Credentials are never included.</strong></p>
+                    <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 12px;">
+                        <input type="checkbox" id="exp_settings" checked style="width:auto; margin:3px 0 0;">
+                        <span><strong>Plugin settings</strong><br><span class="help-text">Display lines, message rules, response text, filters, poll interval, selected content &amp; overlay model.</span></span>
+                    </label>
+                    <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 12px;">
+                        <input type="checkbox" id="exp_lists" checked style="width:auto; margin:3px 0 0;">
+                        <span><strong>Blocked numbers &amp; word lists</strong><br><span class="help-text">Blocked phone numbers and your whitelist / blacklist words.</span></span>
+                    </label>
+                    <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 12px;">
+                        <input type="checkbox" id="exp_content" checked style="width:auto; margin:3px 0 0;">
+                        <span><strong>Content files</strong><br><span class="help-text">The Waiting &amp; Name Display sequences, images, and videos this plugin uses — copied file-for-file. Can be large.</span></span>
+                    </label>
+                    <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 18px;">
+                        <input type="checkbox" id="exp_overlay" checked style="width:auto; margin:3px 0 0;">
+                        <span><strong>Overlay model (matrix)</strong><br><span class="help-text">The FPP Pixel Overlay Model the names are drawn onto.</span></span>
+                    </label>
+                    <div style="display:flex; gap:10px; justify-content:flex-end;">
+                        <button type="button" onclick="closeExportModal()" style="background:#9e9e9e;">Cancel</button>
+                        <button type="button" class="test-btn" style="background:#4CAF50;" onclick="doExport()">⬇️ Export</button>
+                    </div>
+                </div>
+            </div>
 
         </div>
 
@@ -6077,6 +6208,372 @@ def update_config():
         return jsonify({"success": True})
     except Exception as e:
         return _client_error("update_config", e)
+
+# ============================================================================
+# Config Export / Import
+# ----------------------------------------------------------------------------
+# Export bundles the plugin settings, the block/whitelist/blacklist files, the
+# FPP content the plugin references (the waiting + name-display playlists and
+# the sequences/images/videos they use), and the FPP overlay-model definition
+# into a single .zip, so another Pi can be brought up identically. Credentials
+# (Twilio auth token, Google Voice app password) are DELIBERATELY excluded —
+# plugin.json on disk never contains them (see save_config), and we re-scrub on
+# import for good measure. Import restores everything and preserves the target
+# Pi's own credentials.
+# ============================================================================
+BUNDLE_MARKER  = "textmylights-config"
+BUNDLE_FORMAT  = 1
+
+def _content_source_files(content_value, warnings):
+    """Resolve a plugin content setting (default_playlist / name_display_playlist)
+    to a list of (arc_subdir, absolute_path) files to include in the export.
+
+    A content value is one of:
+      • ''            -> nothing
+      • 'seq:NAME'    -> a sequence file in the sequences dir
+      • 'img:NAME'    -> an image file in the images dir
+      • 'NAME'        -> an FPP playlist; its .json plus every sequence/media
+                         item it references
+    """
+    files = []
+    if not content_value:
+        return files
+
+    if content_value.startswith('seq:'):
+        name = content_value[4:]
+        if not name.endswith('.fseq'):
+            name += '.fseq'
+        files.append(('content/sequences', os.path.join(FSEQ_SEQUENCE_PATH, name)))
+        return files
+
+    if content_value.startswith('img:'):
+        name = content_value[4:]
+        files.append(('content/images', os.path.join(FPP_IMAGES_PATH, name)))
+        return files
+
+    # Otherwise it's a playlist name.
+    pl_path = os.path.join(FPP_PLAYLISTS_PATH, content_value + '.json')
+    if not os.path.isfile(pl_path):
+        warnings.append(f"Playlist '{content_value}' not found on disk — skipped")
+        return files
+    files.append(('content/playlists', pl_path))
+
+    # Walk the playlist for referenced sequences and media so the target Pi has
+    # the actual files, not just the playlist that names them.
+    try:
+        with open(pl_path, 'r') as f:
+            pl = json.load(f)
+        sections = []
+        for key in ('leadIn', 'mainPlaylist', 'leadOut'):
+            if isinstance(pl.get(key), list):
+                sections.extend(pl[key])
+        for entry in sections:
+            if not isinstance(entry, dict):
+                continue
+            seq = entry.get('sequenceName')
+            if seq:
+                files.append(('content/sequences', os.path.join(FSEQ_SEQUENCE_PATH, seq)))
+            media = entry.get('mediaName')
+            if media:
+                # Media may be a video or an image; include whichever exists.
+                vid = os.path.join(FPP_VIDEOS_PATH, media)
+                img = os.path.join(FPP_IMAGES_PATH, media)
+                if os.path.isfile(vid):
+                    files.append(('content/videos', vid))
+                elif os.path.isfile(img):
+                    files.append(('content/images', img))
+                else:
+                    warnings.append(f"Media '{media}' (in playlist '{content_value}') not found — skipped")
+    except Exception as e:
+        warnings.append(f"Could not read playlist '{content_value}': {e}")
+
+    return files
+
+@app.route('/api/config/export')
+def export_config():
+    """Build and stream a .zip bundle of the selected plugin configuration.
+
+    The export modal sends section flags as query params (settings/lists/content/
+    overlay = 1|0). A section defaults to included when its param is absent, so a
+    plain GET of this URL still exports everything."""
+    tmp = None
+    try:
+        want = lambda k: request.args.get(k, '1') == '1'
+        inc_settings = want('settings')
+        inc_lists    = want('lists')
+        inc_content  = want('content')
+        inc_overlay  = want('overlay')
+
+        warnings = []
+        # Settings (plugin.json on disk is already secrets-free) and the block /
+        # name lists are separate opt-in groups, but share the 'settings/' arc dir
+        # (import maps them to their targets by basename).
+        settings_files = []
+        if inc_settings:
+            settings_files.append(('settings', CONFIG_FILE))
+        if inc_lists:
+            settings_files += [
+                ('settings', BLOCKLIST_FILE),
+                ('settings', WHITELIST_FILE),
+                ('settings', WHITELIST_ADDED_FILE),
+                ('settings', WHITELIST_REMOVED_FILE),
+                ('settings', BLACKLIST_FILE),
+                ('settings', BLACKLIST_ADDED_FILE),
+                ('settings', BLACKLIST_REMOVED_FILE),
+            ]
+
+        # Referenced content ONLY — the Waiting + Name Display content this plugin
+        # is set to use and the files they reference. Never all of FPP's media.
+        content_files = []
+        if inc_content:
+            for cv in (config.get('default_playlist', ''), config.get('name_display_playlist', '')):
+                content_files.extend(_content_source_files(cv, warnings))
+
+        # Overlay model definition ("matrix").
+        overlay_files = []
+        if inc_overlay:
+            if os.path.isfile(OVERLAY_MODELS_FILE):
+                overlay_files.append(('overlay', OVERLAY_MODELS_FILE))
+            else:
+                warnings.append("Overlay model file not found — overlay model not exported")
+
+        # Write to a temp file (FSEQ can be large; avoid holding the whole zip in
+        # RAM on a Pi). ZIP_STORED since FSEQ is already compressed.
+        fd, tmp = tempfile.mkstemp(suffix='.zip', prefix='tml_export_')
+        os.close(fd)
+        seen = set()
+        included = []
+        with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_STORED) as zf:
+            for arc_dir, path in settings_files + content_files + overlay_files:
+                if not path or not os.path.isfile(path):
+                    continue
+                arcname = f"{arc_dir}/{os.path.basename(path)}"
+                if arcname in seen:
+                    continue
+                seen.add(arcname)
+                zf.write(path, arcname)
+                included.append(arcname)
+
+            manifest = {
+                "bundle": BUNDLE_MARKER,
+                "format": BUNDLE_FORMAT,
+                "created": datetime.now(timezone.utc).isoformat(),
+                "includes": {
+                    "settings": inc_settings,
+                    "lists": inc_lists,
+                    "content": bool(content_files),
+                    "overlay_model": bool(overlay_files),
+                    "credentials": False,
+                },
+                "overlay_model_name": config.get('overlay_model_name', ''),
+                "default_playlist": config.get('default_playlist', ''),
+                "name_display_playlist": config.get('name_display_playlist', ''),
+                "files": included,
+                "warnings": warnings,
+            }
+            zf.writestr('manifest.json', json.dumps(manifest, indent=2))
+
+        stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        download_name = f"textmylights-config-{stamp}.zip"
+        # send_file streams the temp file; remove it once the response is sent.
+        resp = send_file(tmp, mimetype='application/zip',
+                         as_attachment=True, download_name=download_name)
+
+        @resp.call_on_close
+        def _cleanup():
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return resp
+    except Exception as e:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        logging.error(f"export_config failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+def _merge_overlay_models(src_bytes, warnings):
+    """Merge exported overlay models into the target Pi's model-overlays.json by
+    model Name, so the imported model appears without wiping other models the
+    target already has. Backs up the existing file first."""
+    try:
+        src = json.loads(src_bytes)
+    except Exception:
+        warnings.append("Overlay model file in bundle was not valid JSON — skipped")
+        return
+
+    def models_of(obj):
+        if isinstance(obj, dict) and isinstance(obj.get('models'), list):
+            return obj['models']
+        if isinstance(obj, list):
+            return obj
+        return None
+
+    os.makedirs(FPP_CONFIG_DIR, exist_ok=True)
+    # Back up whatever is there now.
+    if os.path.isfile(OVERLAY_MODELS_FILE):
+        try:
+            shutil.copy2(OVERLAY_MODELS_FILE, OVERLAY_MODELS_FILE + '.tml-bak')
+        except OSError:
+            pass
+
+    src_models = models_of(src)
+    dest = {}
+    if os.path.isfile(OVERLAY_MODELS_FILE):
+        try:
+            with open(OVERLAY_MODELS_FILE, 'r') as f:
+                dest = json.load(f)
+        except Exception:
+            dest = {}
+    dest_models = models_of(dest)
+
+    # If either side has an unrecognized shape, fall back to writing the bundle's
+    # file verbatim (already backed up above).
+    if src_models is None or dest_models is None:
+        with open(OVERLAY_MODELS_FILE, 'wb') as f:
+            f.write(src_bytes)
+        warnings.append("Overlay models merged by full replace (unrecognized schema); previous file kept as .tml-bak")
+        return
+
+    def name_of(m):
+        return m.get('Name') or m.get('name') if isinstance(m, dict) else None
+
+    order, by_name = [], {}
+    for m in dest_models:
+        n = name_of(m)
+        if n is not None and n not in by_name:
+            order.append(n)
+        by_name[n] = m
+    for m in src_models:
+        n = name_of(m)
+        if n not in by_name:
+            order.append(n)
+        by_name[n] = m  # bundle wins for matching names
+    merged = [by_name[n] for n in order]
+
+    if isinstance(dest, dict):
+        dest['models'] = merged
+        out = dest
+    else:
+        out = merged
+    with open(OVERLAY_MODELS_FILE, 'w') as f:
+        json.dump(out, f, indent=2)
+
+@app.route('/api/config/import', methods=['POST'])
+def import_config():
+    """Restore a configuration bundle produced by /api/config/export.
+    Credentials are never taken from the bundle; the target Pi keeps its own."""
+    global config, twilio_client, _blocklist_cache, _whitelist_cache, _blacklist_cache
+    try:
+        upload = request.files.get('file')
+        if upload is None:
+            return jsonify({"success": False, "error": "No file uploaded"}), 400
+
+        data = upload.read()
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(data))
+        except zipfile.BadZipFile:
+            return jsonify({"success": False, "error": "Not a valid .zip file"}), 400
+
+        names = set(zf.namelist())
+        if 'manifest.json' not in names:
+            return jsonify({"success": False, "error": "Missing manifest.json — not a Text My Lights bundle"}), 400
+        try:
+            manifest = json.loads(zf.read('manifest.json'))
+        except Exception:
+            return jsonify({"success": False, "error": "Corrupt manifest.json"}), 400
+        if manifest.get('bundle') != BUNDLE_MARKER:
+            return jsonify({"success": False, "error": "This .zip is not a Text My Lights config bundle"}), 400
+
+        warnings = []
+        summary = {"settings": False, "content": 0, "overlay_model": False}
+
+        # Map each export subdir to its destination directory on this Pi. basename
+        # is used for every write (zip-slip safe — no attacker-controlled paths).
+        dest_dirs = {
+            'content/playlists':  FPP_PLAYLISTS_PATH,
+            'content/sequences':  FSEQ_SEQUENCE_PATH,
+            'content/images':     FPP_IMAGES_PATH,
+            'content/videos':     FPP_VIDEOS_PATH,
+        }
+        # settings files land at their known individual paths, keyed by basename.
+        settings_targets = {
+            os.path.basename(CONFIG_FILE):            None,  # handled specially below
+            os.path.basename(BLOCKLIST_FILE):         BLOCKLIST_FILE,
+            os.path.basename(WHITELIST_FILE):         WHITELIST_FILE,
+            os.path.basename(WHITELIST_ADDED_FILE):   WHITELIST_ADDED_FILE,
+            os.path.basename(WHITELIST_REMOVED_FILE): WHITELIST_REMOVED_FILE,
+            os.path.basename(BLACKLIST_FILE):         BLACKLIST_FILE,
+            os.path.basename(BLACKLIST_ADDED_FILE):   BLACKLIST_ADDED_FILE,
+            os.path.basename(BLACKLIST_REMOVED_FILE): BLACKLIST_REMOVED_FILE,
+        }
+
+        for entry in names:
+            if entry.endswith('/') or entry == 'manifest.json':
+                continue
+            base = os.path.basename(entry)
+            if not base:
+                continue
+            arc_dir = entry.rsplit('/', 1)[0] if '/' in entry else ''
+
+            if arc_dir == 'settings':
+                if base == os.path.basename(CONFIG_FILE):
+                    # Merge imported settings, but never import credentials and
+                    # never overwrite this Pi's stored ones.
+                    try:
+                        imported = json.loads(zf.read(entry))
+                    except Exception:
+                        warnings.append("plugin.json in bundle was invalid — settings skipped")
+                        continue
+                    for sk in SECRET_KEYS:
+                        imported.pop(sk, None)
+                    config.update(imported)
+                    save_config()
+                    summary["settings"] = True
+                elif base in settings_targets and settings_targets[base]:
+                    target = settings_targets[base]
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with open(target, 'wb') as f:
+                        f.write(zf.read(entry))
+                else:
+                    warnings.append(f"Unknown settings file '{base}' — skipped")
+
+            elif arc_dir in dest_dirs:
+                target_dir = dest_dirs[arc_dir]
+                os.makedirs(target_dir, exist_ok=True)
+                with open(os.path.join(target_dir, base), 'wb') as f:
+                    f.write(zf.read(entry))
+                summary["content"] += 1
+
+            elif arc_dir == 'overlay':
+                _merge_overlay_models(zf.read(entry), warnings)
+                summary["overlay_model"] = True
+
+            else:
+                warnings.append(f"Unrecognized entry '{entry}' — skipped")
+
+        # Refresh in-memory state: force cache reloads and re-sync Twilio client.
+        _blocklist_cache = None
+        _whitelist_cache = None
+        _blacklist_cache = None
+        try:
+            if config.get('twilio_account_sid') and config.get('twilio_auth_token'):
+                twilio_client = Client(config['twilio_account_sid'], config['twilio_auth_token'])
+        except Exception:
+            pass
+
+        return jsonify({
+            "success": True,
+            "summary": summary,
+            "warnings": warnings,
+            "note": "Overlay model changes take effect after an FPPD restart.",
+        })
+    except Exception as e:
+        logging.error(f"import_config failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/api/fpp/fonts')
 def fpp_fonts_endpoint():

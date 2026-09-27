@@ -3707,7 +3707,7 @@ def index():
             <!-- Backup & Restore -->
             <div class="section">
                 <h2>💾 Backup &amp; Restore</h2>
-                <p class="help-text" style="margin-bottom:12px;">Export all plugin settings, the content it uses (playlists, sequences, images), and the overlay model into one file — then import it on another Pi to reproduce this setup exactly. <strong>Credentials are not included</strong> (Twilio auth token / Google Voice app password); re-enter them after importing. <a href="plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=help.php#backup" target="_top">Learn more</a></p>
+                <p class="help-text" style="margin-bottom:12px;">Export all plugin settings, the content it uses (playlists, sequences, images), and the overlay model into one file — then import it on another Pi to reproduce this setup exactly. <strong>Credentials are not included</strong> (Twilio auth token / Google Voice app password); re-enter them after importing. <a id="backup_help_link" href="#" target="_top">Learn more</a></p>
                 <div id="backup_actions" style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
                     <button type="button" class="test-btn" onclick="openExportModal()"
                        style="background:#4CAF50;">⬇️ Export Config</button>
@@ -3719,8 +3719,9 @@ def index():
 
             <!-- Export selection modal. The page renders inside an auto-height,
                  non-scrolling iframe, so position:fixed would not track the parent
-                 window's scroll — instead the backdrop is sized to the full document
-                 and the dialog is anchored just below the export buttons (in view). -->
+                 window's scroll. The backdrop is sized to the full document and the
+                 dialog is centred on the parent's visible area (the parent reports
+                 that position via postMessage — see openExportModal). -->
             <div id="export_modal" onclick="if(event.target===this)closeExportModal()" style="display:none; position:absolute; left:0; top:0; width:100%; background:rgba(0,0,0,0.5); z-index:1000;">
                 <div id="export_dialog" style="position:absolute; left:50%; transform:translateX(-50%); background:#fff; color:#333; max-width:460px; width:92%; border-radius:8px; padding:22px; box-shadow:0 8px 30px rgba(0,0,0,0.35);">
                     <h3 style="margin:0 0 6px; color:#333;">💾 Export Config</h3>
@@ -3753,14 +3754,47 @@ def index():
                  prevent the credential-block toggle / settings init from running.
                  Strings are plain ASCII to avoid any encoding edge cases. -->
             <script>
+                // Point the "Learn more" link at FPP's own web server (default port),
+                // not this plugin service (:5000) where the page actually runs — a
+                // relative plugin.php link would 404 against :5000.
+                (function() {
+                    var hl = document.getElementById('backup_help_link');
+                    if (hl) hl.href = window.location.protocol + '//' + window.location.hostname
+                        + '/plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=help.php#backup';
+                })();
+
+                // Latest visible-centre Y (in iframe-document coords) reported by the
+                // parent window; null until the parent answers (or when not framed).
+                var _tmlCenterY = null;
+                window.addEventListener('message', function(e) {
+                    if (e.data && e.data.type === 'tml_pos' && typeof e.data.centerDocY === 'number') {
+                        _tmlCenterY = e.data.centerDocY;
+                        var m = document.getElementById('export_modal');
+                        if (m && m.style.display === 'block') _tmlPositionDialog();
+                    }
+                });
+                function _tmlPositionDialog() {
+                    var dlg = document.getElementById('export_dialog');
+                    var y;
+                    if (_tmlCenterY != null) {
+                        y = _tmlCenterY - dlg.offsetHeight / 2;              // centre of parent's visible area
+                    } else if (window.parent === window) {
+                        y = window.scrollY + window.innerHeight / 2 - dlg.offsetHeight / 2;  // not framed
+                    } else {
+                        var rect = document.getElementById('backup_actions').getBoundingClientRect();
+                        y = rect.bottom + 8;                                 // fallback: below the buttons
+                    }
+                    dlg.style.top = Math.max(10, y) + 'px';
+                }
                 window.openExportModal = function() {
                     var modal = document.getElementById('export_modal');
-                    var dlg = document.getElementById('export_dialog');
                     if (modal.parentNode !== document.body) document.body.appendChild(modal);
                     modal.style.height = document.documentElement.scrollHeight + 'px';
                     modal.style.display = 'block';
-                    var rect = document.getElementById('backup_actions').getBoundingClientRect();
-                    dlg.style.top = Math.max(10, rect.bottom + 8) + 'px';
+                    // Ask the parent where the visible centre is (cross-origin safe),
+                    // then position with whatever we know right now as a first pass.
+                    try { window.parent.postMessage({ type: 'tml_reqpos' }, '*'); } catch (e) {}
+                    _tmlPositionDialog();
                 };
                 window.closeExportModal = function() {
                     document.getElementById('export_modal').style.display = 'none';

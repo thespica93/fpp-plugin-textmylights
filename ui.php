@@ -28,5 +28,14 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
         if (e.data && e.data.type === 'scrollTop') {
             window.scrollTo(0, 0);
         }
+        // The plugin (inside the non-scrolling iframe) can't see the parent's
+        // scroll position, so it can't center a modal in the visible area on its
+        // own. When it asks, reply with the Y (in iframe-document coordinates) of
+        // the centre of what's currently visible in this window.
+        if (e.data && e.data.type === 'tml_reqpos') {
+            var frame = document.getElementById('sms-plugin-frame');
+            var centerDocY = (window.innerHeight / 2) - frame.getBoundingClientRect().top;
+            frame.contentWindow.postMessage({ type: 'tml_pos', centerDocY: centerDocY }, '*');
+        }
     });
 </script>

@@ -3717,14 +3717,14 @@ def index():
                 </div>
             </div>
 
-            <!-- Export selection modal. The page renders inside an auto-height,
-                 non-scrolling iframe, so position:fixed would not track the parent
-                 window's scroll. The backdrop is sized to the full document and the
-                 dialog is centred on the parent's visible area (the parent reports
-                 that position via postMessage — see openExportModal). -->
-            <div id="export_modal" onclick="if(event.target===this)closeExportModal()" style="display:none; position:absolute; left:0; top:0; width:100%; background:rgba(0,0,0,0.5); z-index:1000;">
-                <div id="export_dialog" style="position:absolute; left:50%; transform:translateX(-50%); background:#fff; color:#333; max-width:460px; width:92%; border-radius:8px; padding:22px; box-shadow:0 8px 30px rgba(0,0,0,0.35);">
-                    <h3 style="margin:0 0 6px; color:#333;">💾 Export Config</h3>
+            <!-- Local export modal — only used when the page is opened directly
+                 (not inside the FPP iframe). In the normal framed case the modal is
+                 owned by the parent (ui.php) so it is a true fixed, centred overlay
+                 that ignores scrolling. Here position:fixed works because a directly
+                 opened page is a normal scrolling document. -->
+            <div id="export_modal" onclick="if(event.target===this)closeExportModal()" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:100000; align-items:center; justify-content:center;">
+                <div id="export_dialog" style="background:#fff; color:#333; max-width:460px; width:92%; border-radius:8px; padding:22px; box-shadow:0 8px 30px rgba(0,0,0,0.35); max-height:88vh; overflow-y:auto; box-sizing:border-box;">
+                    <h3 style="margin:0 0 6px; color:#333;">Export Config</h3>
                     <p class="help-text" style="margin:0 0 14px;">Choose what to include. Only the content <strong>this plugin is set to use</strong> is exported — never all of FPP's files. <strong>Credentials are never included.</strong></p>
                     <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 12px;">
                         <input type="checkbox" id="exp_settings" checked style="width:auto; margin:3px 0 0;">
@@ -3763,63 +3763,43 @@ def index():
                         + '/plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=help.php#backup';
                 })();
 
-                // Latest visible-slice info reported by the parent window (the part of
-                // the iframe actually on screen); null until the parent answers or when
-                // not framed. {topDocY, visibleHeight, centerDocY} in iframe-doc coords.
-                var _tmlPos = null;
+                // Trigger the actual export download (same-origin, so the auth cookie
+                // is sent). Called both locally and when the parent modal asks.
+                function _tmlDownload(sel) {
+                    var url = '/api/config/export?settings=' + (sel.s ? 1 : 0)
+                            + '&lists=' + (sel.l ? 1 : 0) + '&content=' + (sel.c ? 1 : 0)
+                            + '&overlay=' + (sel.o ? 1 : 0);
+                    var a = document.createElement('a');
+                    a.href = url; a.download = '';
+                    document.body.appendChild(a); a.click(); a.remove();
+                }
+                // The parent-owned modal sends the chosen sections here to download.
                 window.addEventListener('message', function(e) {
-                    if (e.data && e.data.type === 'tml_pos' && typeof e.data.centerDocY === 'number') {
-                        _tmlPos = e.data;
-                        var m = document.getElementById('export_modal');
-                        if (m && m.style.display === 'block') _tmlPositionDialog();
+                    if (e.data && e.data.type === 'tml_export' && e.data.sel) {
+                        _tmlDownload(e.data.sel);
                     }
                 });
-                function _tmlPositionDialog() {
-                    var dlg = document.getElementById('export_dialog');
-                    var top;
-                    if (_tmlPos) {
-                        // Cap the dialog to the visible slice so it never overflows the
-                        // fold; it scrolls internally if the checklist is taller.
-                        dlg.style.maxHeight = Math.max(140, _tmlPos.visibleHeight - 20) + 'px';
-                        dlg.style.overflowY = 'auto';
-                        var h = dlg.offsetHeight;
-                        top = (h < _tmlPos.visibleHeight)
-                            ? _tmlPos.centerDocY - h / 2                     // fits: centre it
-                            : _tmlPos.topDocY + 10;                          // taller: pin to top of slice
-                        if (top < _tmlPos.topDocY + 4) top = _tmlPos.topDocY + 4;
-                    } else if (window.parent === window) {
-                        dlg.style.maxHeight = Math.max(140, window.innerHeight - 20) + 'px';
-                        dlg.style.overflowY = 'auto';
-                        top = window.scrollY + window.innerHeight / 2 - dlg.offsetHeight / 2;  // not framed
-                    } else {
-                        var rect = document.getElementById('backup_actions').getBoundingClientRect();
-                        top = rect.bottom + 8;                               // fallback: below the buttons
-                    }
-                    dlg.style.top = Math.max(10, top) + 'px';
-                }
                 window.openExportModal = function() {
-                    var modal = document.getElementById('export_modal');
-                    if (modal.parentNode !== document.body) document.body.appendChild(modal);
-                    modal.style.height = document.documentElement.scrollHeight + 'px';
-                    modal.style.display = 'block';
-                    // Ask the parent where the visible centre is (cross-origin safe),
-                    // then position with whatever we know right now as a first pass.
-                    try { window.parent.postMessage({ type: 'tml_reqpos' }, '*'); } catch (e) {}
-                    _tmlPositionDialog();
+                    // Framed (normal case): let the parent show a true fixed, centred
+                    // overlay that ignores scrolling. Fall back to the local modal only
+                    // when the page is opened directly (not inside the FPP iframe).
+                    if (window.parent !== window) {
+                        try { window.parent.postMessage({ type: 'tml_openExport' }, '*'); return; } catch (e) {}
+                    }
+                    document.getElementById('export_modal').style.display = 'flex';
                 };
                 window.closeExportModal = function() {
                     document.getElementById('export_modal').style.display = 'none';
                 };
                 window.doExport = function() {
-                    var s = document.getElementById('exp_settings').checked ? 1 : 0;
-                    var l = document.getElementById('exp_lists').checked ? 1 : 0;
-                    var c = document.getElementById('exp_content').checked ? 1 : 0;
-                    var o = document.getElementById('exp_overlay').checked ? 1 : 0;
-                    if (!s && !l && !c && !o) { alert('Select at least one thing to export.'); return; }
-                    var url = '/api/config/export?settings=' + s + '&lists=' + l + '&content=' + c + '&overlay=' + o;
-                    var a = document.createElement('a');
-                    a.href = url; a.download = '';
-                    document.body.appendChild(a); a.click(); a.remove();
+                    var sel = {
+                        s: document.getElementById('exp_settings').checked,
+                        l: document.getElementById('exp_lists').checked,
+                        c: document.getElementById('exp_content').checked,
+                        o: document.getElementById('exp_overlay').checked
+                    };
+                    if (!sel.s && !sel.l && !sel.c && !sel.o) { alert('Select at least one thing to export.'); return; }
+                    _tmlDownload(sel);
                     closeExportModal();
                 };
                 window.importConfig = function(input) {

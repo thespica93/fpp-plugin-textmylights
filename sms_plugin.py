@@ -2586,6 +2586,34 @@ def return_to_default_playlist():
         logging.error(f"Error in return_to_default_playlist: {e}")
 
 
+def stop_show_playback():
+    """Stop the waiting content and any current sequence/playlist/overlay text.
+    This is the 'lights off' action shared by Stop and the end of a graceful
+    drain — it does NOT touch config['enabled'] (the caller owns that)."""
+    try:
+        import urllib.parse
+        default = config.get('default_playlist', '')
+        if default.startswith('seq:'):
+            # FSEQ Effect Stop uses the display name without .fseq
+            seq_name = default[4:].removesuffix('.fseq')
+            effect_stop_url = f"{FPP_HOST}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(seq_name)}"
+            r = requests.get(effect_stop_url, timeout=3)
+            logging.info(f"🛑 FSEQ Effect Stop: {r.status_code} - {r.text}")
+
+        # Stop Now catches playlists, videos, and foreground sequences
+        r2 = requests.get(f"{FPP_HOST}/api/command/{urllib.parse.quote('Stop Now')}", timeout=3)
+        logging.info(f"🛑 Stop Now: {r2.status_code} - {r2.text}")
+
+        # Clear the text/image overlay so nothing is left on the model
+        overlay_model = config.get('overlay_model_name', '')
+        if overlay_model:
+            encoded = urllib.parse.quote(overlay_model)
+            requests.put(f"{FPP_HOST}/api/overlays/model/{encoded}/state", json={"State": 0}, timeout=3)
+            logging.info("🛑 Overlay cleared")
+    except Exception as e:
+        logging.warning(f"Could not stop FPP playback: {e}")
+
+
 def display_worker():
     """Background worker that displays messages from the queue"""
     global currently_displaying, message_queue, stop_display
@@ -2655,11 +2683,21 @@ def display_worker():
             except Exception as e:
                 logging.error(f"💥 Error during display: {e}")
             
+            # Graceful stop: if the show was stopped (enabled=False) while names were
+            # still displaying/queued, keep showing each one, but once this was the
+            # LAST queued name, stop the waiting content instead of resuming it.
             try:
-                logging.info(f"🔄 Returning to default playlist...")
-                return_to_default_playlist()
+                stopping = not config.get('enabled', False)
+                with queue_lock:
+                    more_queued = len(message_queue) > 0
+                if stopping and not more_queued:
+                    logging.info("🛑 Graceful stop: last name shown — stopping waiting content")
+                    stop_show_playback()
+                else:
+                    logging.info(f"🔄 Returning to default playlist...")
+                    return_to_default_playlist()
             except Exception as e:
-                logging.error(f"💥 Error returning to default: {e}")
+                logging.error(f"💥 Error returning to default / stopping: {e}")
             
             logging.info(f"✅ FINISHED DISPLAYING: {name}")
             
@@ -8408,39 +8446,27 @@ def api_activate():
 
 @app.route('/api/deactivate', methods=['GET', 'POST'])
 def api_deactivate():
-    """FPP scheduler hook: disable plugin and stop the current playlist/sequence.
-    Polling thread keeps running in standby to send show_not_live replies."""
-    config['enabled'] = False
+    """FPP scheduler hook: disable the plugin and stop the show. If names are
+    still displaying or queued, let them finish first (the display worker stops
+    the waiting content once the queue drains); only stop immediately when the
+    queue is idle. The polling thread keeps running to send show_not_live replies."""
+    config['enabled'] = False    # stop accepting new names right away
     save_config()
 
-    # Stop the current sequence/playlist and any background FSEQ effect
-    try:
-        import urllib.parse
+    # Is anything still on screen or waiting to be shown?
+    with queue_lock:
+        pending = len(message_queue) > 0
+    draining = pending or (currently_displaying is not None)
 
-        default = config.get('default_playlist', '')
-        if default.startswith('seq:'):
-            # FSEQ Effect Stop also uses display name without .fseq
-            seq_name = default[4:].removesuffix('.fseq')
-            effect_stop_url = f"{FPP_HOST}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(seq_name)}"
-            r = requests.get(effect_stop_url, timeout=3)
-            logging.info(f"🛑 FSEQ Effect Stop: {r.status_code} - {r.text}")
+    if draining:
+        logging.info("🛑 Text My Lights Stop: draining — names still playing/queued; "
+                     "waiting content will stop after they finish")
+        return jsonify({"success": True, "draining": True,
+                        "message": "Stopping after current names finish"})
 
-        # Stop Now catches playlists, videos, and foreground sequences
-        command_url = f"{FPP_HOST}/api/command/{urllib.parse.quote('Stop Now')}"
-        r2 = requests.get(command_url, timeout=3)
-        logging.info(f"🛑 Stop Now: {r2.status_code} - {r2.text}")
-
-        # Image content renders via overlay model (State 2 Opaque) — must clear explicitly
-        overlay_model = config.get('overlay_model_name', '')
-        if default.startswith('img:') and overlay_model:
-            encoded = urllib.parse.quote(overlay_model)
-            state_url = f"{FPP_HOST}/api/overlays/model/{encoded}/state"
-            requests.put(state_url, json={"State": 0}, timeout=3)
-            logging.info(f"🛑 Overlay cleared (img content stopped)")
-    except Exception as e:
-        logging.warning(f"Could not stop FPP playback: {e}")
-
-    logging.info("🛑 Text My Lights Stop: disabled, polling stopped, playlist stopped")
+    # Nothing queued or displaying — stop the waiting content now.
+    stop_show_playback()
+    logging.info("🛑 Text My Lights Stop: disabled and playback stopped")
     return jsonify({"success": True, "message": "Text My Lights plugin deactivated"})
 
 

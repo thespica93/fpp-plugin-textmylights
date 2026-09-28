@@ -12,6 +12,7 @@ import requests
 from datetime import datetime, timedelta, timezone
 import re
 import time
+import random
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from twilio.rest import Client
@@ -295,6 +296,13 @@ DEFAULT_CONFIG = {
     "fpp_host": "http://127.0.0.1",
     "default_playlist": "",
     "name_display_playlist": "",
+    # Names content list (v2.7+): each name picks one of these items as its background,
+    # each item carrying its OWN text layout + duration. Authoritative when non-empty;
+    # empty list falls back to name_display_playlist + the flat line_*/message_lines below
+    # (the pre-list behavior). See select_names_content_item() and _names_item_defaults().
+    "names_content_list": [],
+    "names_content_mode": "roundrobin",   # "roundrobin" | "random"
+    "names_content_rr_index": -1,          # persisted round-robin cursor (index last shown)
     "overlay_model_name": "",
     "text_color": "#FF0000",
     "text_font": "FreeSans",
@@ -356,6 +364,100 @@ stop_display = False
 message_queue = deque()
 currently_displaying = None
 queue_lock = threading.Lock()
+
+# The names-content item actually chosen for the display in progress (set by send_to_fpp),
+# so the return/stop paths stop the right content and the worker uses its duration. None
+# means the flat-config fallback (name over waiting) is in use.
+_active_name_content = None       # e.g. "seq:Foo" / "img:bar.png" / ""
+_active_display_duration = None   # int seconds for the current display
+
+
+def _coerce_len(seq, n, fill):
+    """Return a list of exactly n items from seq, truncating or padding with `fill`
+    (dicts are copied so padded entries never share a reference)."""
+    out = list(seq) if isinstance(seq, (list, tuple)) else []
+    out = out[:n]
+    while len(out) < n:
+        out.append(dict(fill) if isinstance(fill, dict) else fill)
+    return out
+
+
+def _names_item_defaults():
+    """A fresh names-content item with a default (blank, centered) text layout."""
+    return {
+        "content": "",
+        "display_duration": 30,
+        "message_lines": ["", "", "", ""],
+        "line_boxes": [{"x": -1, "y": -1, "w": 300, "h": 60} for _ in range(4)],
+        "line_colors": ["", "", "", ""],
+        "line_movements": ["Center", "Center", "Center", "Center"],
+        "line_speeds": [50, 50, 50, 50],
+        "line_fonts": ["FreeSans", "FreeSans", "FreeSans", "FreeSans"],
+        "line_orientations": ["horizontal", "horizontal", "horizontal", "horizontal"],
+    }
+
+
+def _names_item_from_flat_config():
+    """Build a names-content item from the current flat config keys (the single
+    name_display_playlist + global message_lines/line_*/display_duration). Used once to
+    migrate the pre-list config into names_content_list[0]."""
+    item = _names_item_defaults()
+    item["content"] = config.get("name_display_playlist", "")
+    try:
+        item["display_duration"] = max(1, int(config.get("display_duration", 30) or 30))
+    except (TypeError, ValueError):
+        item["display_duration"] = 30
+    item["message_lines"]     = _coerce_len(config.get("message_lines", []), 4, "")
+    item["line_boxes"]        = _coerce_len(config.get("line_boxes", []), 4, {"x": -1, "y": -1, "w": 300, "h": 60})
+    item["line_colors"]       = _coerce_len(config.get("line_colors", []), 4, "")
+    item["line_movements"]    = _coerce_len(config.get("line_movements", []), 4, "Center")
+    item["line_speeds"]       = _coerce_len(config.get("line_speeds", []), 4, 50)
+    item["line_fonts"]        = _coerce_len(config.get("line_fonts", []), 4, "FreeSans")
+    item["line_orientations"] = _coerce_len(config.get("line_orientations", []), 4, "horizontal")
+    return item
+
+
+def _sanitize_names_item(raw):
+    """Coerce a client-supplied names item into the canonical shape (arrays length 4, sane
+    defaults). Never trusts lengths/types from the request."""
+    d = _names_item_defaults()
+    if not isinstance(raw, dict):
+        return d
+    d["content"] = str(raw.get("content", "") or "")
+    try:
+        d["display_duration"] = max(1, int(raw.get("display_duration", 30) or 30))
+    except (TypeError, ValueError):
+        d["display_duration"] = 30
+    d["message_lines"]     = _coerce_len(raw.get("message_lines", []), 4, "")
+    d["line_boxes"]        = _coerce_len(raw.get("line_boxes", []), 4, {"x": -1, "y": -1, "w": 300, "h": 60})
+    d["line_colors"]       = _coerce_len(raw.get("line_colors", []), 4, "")
+    d["line_movements"]    = _coerce_len(raw.get("line_movements", []), 4, "Center")
+    d["line_speeds"]       = _coerce_len(raw.get("line_speeds", []), 4, 50)
+    d["line_fonts"]        = _coerce_len(raw.get("line_fonts", []), 4, "FreeSans")
+    d["line_orientations"] = _coerce_len(raw.get("line_orientations", []), 4, "horizontal")
+    return d
+
+
+def select_names_content_item():
+    """Pick the names-content item for the incoming name, or None to fall back to the flat
+    config (name over the waiting content). Round-robin advances and persists a cursor;
+    random avoids an immediate repeat. Returns the stored dict (callers read only)."""
+    lst = config.get("names_content_list", []) or []
+    if not lst:
+        return None
+    if len(lst) == 1:
+        return lst[0]
+    mode = config.get("names_content_mode", "roundrobin")
+    prev = config.get("names_content_rr_index", -1)
+    if mode == "random":
+        choices = [i for i in range(len(lst)) if i != prev] or list(range(len(lst)))
+        idx = random.choice(choices)
+    else:
+        idx = (prev + 1) % len(lst)
+    config["names_content_rr_index"] = idx
+    save_config()
+    return lst[idx]
+
 
 def load_config():
     """Load configuration from file, merging with defaults so new settings survive updates"""
@@ -464,6 +566,15 @@ def load_config():
             config['line_boxes'] = boxes
             save_config()
             logging.info("Migrated line_positions/line_font_sizes to line_boxes")
+
+        # names_content_list (v2.7) starts EMPTY on upgrade. While empty, send_to_fpp
+        # falls back to the flat name_display_playlist + global text layout — identical to
+        # the pre-list behavior, and the existing UI keeps working. The list is seeded from
+        # the flat config (via _names_item_from_flat_config) the first time the new
+        # per-content UI loads with content configured, at which point it becomes
+        # authoritative. The new-default-key backfill above already ensures the key exists.
+        if config.get('names_content_mode') not in ('roundrobin', 'random'):
+            config['names_content_mode'] = 'roundrobin'
 
         if config['twilio_account_sid'] and config['twilio_auth_token']:
             twilio_client = Client(
@@ -2314,17 +2425,34 @@ def send_to_fpp(name):
     """Send name to FPP - Start name sequence and display text overlay"""
     try:
         fpp_host = FPP_HOST
-        name_playlist = config.get('name_display_playlist', '')
+        # Pick which names content (with its OWN text layout + duration) to use for THIS
+        # name. None => no list configured; fall back to the flat config (name over the
+        # waiting content), exactly as before. The chosen content + duration are stashed in
+        # module globals for display_worker() and the return/stop paths.
+        global _active_name_content, _active_display_duration
+        _item = select_names_content_item()
+        if _item is not None:
+            name_playlist         = _item.get('content', '')
+            message_lines         = _item.get('message_lines', ['', '', '', ''])
+            line_boxes_cfg        = _item.get('line_boxes', [])
+            line_colors_cfg       = _item.get('line_colors', [])
+            line_movements_cfg    = _item.get('line_movements', [])
+            line_speeds_cfg       = _item.get('line_speeds', [])
+            line_fonts_cfg        = _item.get('line_fonts', [])
+            line_orientations_cfg = _item.get('line_orientations', [])
+            _active_display_duration = int(_item.get('display_duration', config.get('display_duration', 30)) or 30)
+        else:
+            name_playlist         = config.get('name_display_playlist', '')
+            message_lines         = config.get('message_lines', ['Merry Christmas', '{name}!', '', ''])
+            line_boxes_cfg        = config.get('line_boxes', [])
+            line_colors_cfg       = config.get('line_colors', [])
+            line_movements_cfg    = config.get('line_movements', [])
+            line_speeds_cfg       = config.get('line_speeds', [])
+            line_fonts_cfg        = config.get('line_fonts', [])
+            line_orientations_cfg = config.get('line_orientations', [])
+            _active_display_duration = int(config.get('display_duration', 30) or 30)
+        _active_name_content = name_playlist
         overlay_model = config.get('overlay_model_name', 'Texting Matrix')
-        
-        # Build per-line rendered items from message_lines config
-        message_lines = config.get('message_lines', ['Merry Christmas', '{name}!', '', ''])
-        line_boxes_cfg = config.get('line_boxes', [])
-        line_colors_cfg = config.get('line_colors', [])
-        line_movements_cfg = config.get('line_movements', [])
-        line_speeds_cfg = config.get('line_speeds', [])
-        line_fonts_cfg = config.get('line_fonts', [])
-        line_orientations_cfg = config.get('line_orientations', [])
 
         global_text_color = config.get('text_color', '#FF0000')
         if not global_text_color.startswith('#'):
@@ -2500,7 +2628,8 @@ def send_to_fpp(name):
                                 line_items, overlay_model, mw, mh
                             )
                     else:
-                        duration = config.get('display_duration', 30)
+                        # Per-content duration (fit-to-time scroll windows use it too).
+                        duration = _active_display_duration or config.get('display_duration', 30)
                         # Pace the overlay animation to the background sequence's fps
                         # (from its FSEQ header) so scrolling motion is locked to the same
                         # clock FPP outputs the sequence at. The background is the names
@@ -2657,7 +2786,9 @@ def return_to_default_playlist():
             logging.info(f"📋 Queue has {queue_length} more names — skipping return-to-default")
             return
 
-        name_playlist   = config.get('name_display_playlist', '')
+        # Stop whatever names content was ACTUALLY shown for this name (round-robin/random
+        # picks per name), not the static config key. Falls back to the flat key.
+        name_playlist   = _active_name_content if _active_name_content is not None else config.get('name_display_playlist', '')
         default_content = config.get('default_playlist', '')
         returning_to_image = default_content.startswith('img:')
 
@@ -2744,8 +2875,11 @@ def stop_show_playback():
         # buffer after we clear it below.
         _stop_scroll_thread()
 
-        # Stop the plugin's own background FSEQ effects (waiting + names sequences).
-        for content in (config.get('default_playlist', ''), config.get('name_display_playlist', '')):
+        # Stop the plugin's own background FSEQ effects: the waiting content, the flat
+        # name content, and every seq: item in the names list (any could be the one
+        # currently looping). FSEQ Effect Stop on a non-running seq is harmless.
+        _names_seq = [it.get('content', '') for it in (config.get('names_content_list', []) or [])]
+        for content in [config.get('default_playlist', ''), config.get('name_display_playlist', ''), *_names_seq]:
             if content.startswith('seq:'):
                 seq_name = content[4:].removesuffix('.fseq')
                 r = requests.get(f"{FPP_HOST}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(seq_name)}", timeout=3)
@@ -2811,11 +2945,12 @@ def display_worker():
             except Exception as e:
                 logging.error(f"💥 Error sending to FPP: {e}")
             
-            display_duration = int(config.get('display_duration', 30))
+            # Per-content duration chosen by send_to_fpp for the item actually shown.
+            display_duration = int(_active_display_duration or config.get('display_duration', 30))
             logging.info(f"⏱️  Displaying for {display_duration} seconds...")
 
             try:
-                name_playlist_chk = config.get('name_display_playlist', '')
+                name_playlist_chk = _active_name_content or ''
                 overlay_model_chk = config.get('overlay_model_name', '')
                 if not name_playlist_chk and overlay_model_chk:
                     # No names content — FPP can reset the overlay state while the waiting
@@ -6534,6 +6669,19 @@ def update_config():
                 new_config.pop(_sk, None)
         config.update(new_config)
 
+        # Sanitize the names content list — never trust client array shapes/lengths.
+        if 'names_content_list' in new_config:
+            raw_list = new_config.get('names_content_list')
+            if not isinstance(raw_list, list):
+                raw_list = []
+            config['names_content_list'] = [_sanitize_names_item(it) for it in raw_list]
+        if config.get('names_content_mode') not in ('roundrobin', 'random'):
+            config['names_content_mode'] = 'roundrobin'
+        # Keep the round-robin cursor valid if the list changed/shrank.
+        _lst_len = len(config.get('names_content_list', []) or [])
+        if _lst_len == 0 or int(config.get('names_content_rr_index', -1) or -1) >= _lst_len:
+            config['names_content_rr_index'] = -1
+
         # Normalize phone number to E.164 (strip spaces, dashes, parens — keep + and digits)
         if config.get('twilio_phone_number'):
             config['twilio_phone_number'] = re.sub(r'[^\d+]', '', config['twilio_phone_number'])
@@ -6673,8 +6821,12 @@ def export_config():
         # is set to use and the files they reference. Never all of FPP's media.
         content_files = []
         if inc_content:
-            for cv in (config.get('default_playlist', ''), config.get('name_display_playlist', '')):
-                content_files.extend(_content_source_files(cv, warnings))
+            _list_content = [it.get('content', '') for it in (config.get('names_content_list', []) or [])]
+            _seen_cv = set()
+            for cv in [config.get('default_playlist', ''), config.get('name_display_playlist', ''), *_list_content]:
+                if cv and cv not in _seen_cv:
+                    _seen_cv.add(cv)
+                    content_files.extend(_content_source_files(cv, warnings))
 
         # Overlay model ("matrix") — just the selected model's entry, not the whole
         # channel-output config (written to the zip as a small JSON payload below).

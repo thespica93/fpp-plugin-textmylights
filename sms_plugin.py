@@ -2284,18 +2284,12 @@ def send_to_fpp(name):
         if name_playlist:
             try:
                 import urllib.parse
-                # The plugin runs as a BACKGROUND layer: never stop the foreground, so
-                # a coexisting house sequence (pixels) keeps playing. Stop only the
-                # plugin's OWN waiting FSEQ effect so the names content shows cleanly on
-                # the projector; return_to_default_playlist() restarts it afterward.
-                default_wait = config.get('default_playlist', '')
-                if default_wait.startswith('seq:'):
-                    wait_seq = default_wait[4:].removesuffix('.fseq')
-                    requests.get(f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(wait_seq)}", timeout=3)
-                    logging.info(f"⏸️  Stopped waiting effect ({wait_seq}) for name display")
-                time.sleep(0.1)
-
-                logging.info(f"▶️  STEP 2: Starting name display content: {name_playlist}")
+                # Experiment: DON'T stop the waiting effect. The waiting FSEQ effect
+                # keeps looping and the names content starts as its own FSEQ effect
+                # that plays ON TOP of it (overlay text renders above both). Nothing
+                # foreground is touched. return_to_default_playlist() later stops just
+                # the names effect, leaving the waiting effect running underneath.
+                logging.info(f"▶️  STEP 2: Starting name display content OVER waiting: {name_playlist}")
                 if name_playlist.startswith('seq:'):
                     # FSEQ Effect (loop=true, background=true): plays as background so
                     # overlay model renders on top with correct text colors.

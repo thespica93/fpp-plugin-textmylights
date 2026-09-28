@@ -5835,9 +5835,15 @@ def index():
                     const currentDefault = "{{ config.get('default_playlist', '') }}";
                     const currentName = "{{ config.get('name_display_playlist', '') }}";
 
-                    defaultSelect.innerHTML = '<option value="">-- Select a playlist --</option>';
-                    nameSelect.innerHTML = '<option value="">-- None (No Playlist Change) --</option>';
+                    defaultSelect.innerHTML = '<option value="">-- Select a sequence --</option>';
+                    nameSelect.innerHTML = '<option value="">-- None (No Change) --</option>';
 
+                    // TEMPORARILY DISABLED (2026-09-27): only sequences (.fseq) run as
+                    // background FSEQ effects, which is what we want right now. Playlists,
+                    // videos, and images run FOREGROUND (they take over the output), so
+                    // they're commented out until we decide how to handle them. See the
+                    // memory note "background_effects_only_content".
+                    /* PLAYLISTS — foreground, disabled for now
                     if (data.playlists && data.playlists.length > 0) {
                         const pg1 = document.createElement('optgroup');
                         pg1.label = '📋 Playlists';
@@ -5850,6 +5856,7 @@ def index():
                         defaultSelect.add(pg1);
                         nameSelect.add(pg2);
                     }
+                    */
 
                     if (data.sequences && data.sequences.length > 0) {
                         const sg1 = document.createElement('optgroup');
@@ -5865,6 +5872,7 @@ def index():
                         nameSelect.add(sg2);
                     }
 
+                    /* VIDEOS — foreground, disabled for now (background effects only)
                     if (data.videos && data.videos.length > 0) {
                         const vg1 = document.createElement('optgroup');
                         vg1.label = '🎥 Videos';
@@ -5878,7 +5886,9 @@ def index():
                         defaultSelect.add(vg1);
                         nameSelect.add(vg2);
                     }
+                    */
 
+                    /* IMAGES — overlay layer, disabled for now (background effects only)
                     if (data.images && data.images.length > 0) {
                         const ig1 = document.createElement('optgroup');
                         ig1.label = '🖼️ Images';
@@ -5892,6 +5902,7 @@ def index():
                         defaultSelect.add(ig1);
                         nameSelect.add(ig2);
                     }
+                    */
 
                     // If a stored content selection no longer exists in FPP (e.g. the
                     // Waiting or Name sequence was deleted in the file manager), revert

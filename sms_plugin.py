@@ -879,7 +879,7 @@ def _fseq_fps_for_content(content, default=30.0):
         return default
 
 
-def animate_lines_via_shm(items, model_name, width, height, duration, fps=None):
+def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, bg_image_path=None):
     """Animate independently-moving/colored/fitted text lines together in FPP shared memory.
     Runs in a background thread for `duration` seconds then stops.
 
@@ -1018,6 +1018,19 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None):
         logging.info(f"🎬 animate_lines_via_shm: model={model_name} size={width}x{height} "
                      f"lines={len(prepared)} duration={duration}s")
 
+        # Base frame the moving text is composited onto each frame: the (resized) image
+        # background if one was supplied, otherwise black. Loaded ONCE here so scrolling
+        # text can now ride over an image (previously image + movement fell back to black).
+        base_frame = None
+        if bg_image_path:
+            try:
+                base_frame = Image.open(bg_image_path).convert('RGB').resize((width, height), Image.LANCZOS)
+            except Exception as ex:
+                logging.warning(f"animate bg image load failed ({bg_image_path}): {ex}")
+                base_frame = None
+        if base_frame is None:
+            base_frame = Image.new('RGB', (width, height), (0, 0, 0))
+
         def _clip_paste(frame, strip, src_x, src_y, dst_x, dst_y, vis_w, vis_h, clip):
             # Intersect the paste rect with the line's own box, so scrolling text is only
             # visible while inside it — entering/exiting at the box edges instead of the
@@ -1030,15 +1043,25 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None):
             crop_x0, crop_y0 = src_x + (x0 - dst_x), src_y + (y0 - dst_y)
             frame.paste(strip.crop((crop_x0, crop_y0, crop_x0 + (x1 - x0), crop_y0 + (y1 - y0))), (x0, y0))
 
+        def _pos_at(e, t):
+            # Closed-form scroll position at elapsed time `t` (seconds). Motion is a pure
+            # function of wall-clock time, NOT an accumulator advanced per frame, so a slow
+            # or dropped render frame never causes stutter or drift — the text is always
+            # exactly where it belongs for time t. Velocity (px/sec) = per-frame step * fps.
+            loop_len = abs(e['loop_end'] - e['loop_start']) or 1.0
+            dist = e['step_px'] * fps * t            # total distance travelled by time t
+            passes_done = int(dist // loop_len)
+            within = dist - passes_done * loop_len   # distance into the current pass
+            if e.get('fit') and passes_done >= e['fit_passes']:
+                return e['loop_end']                 # fit-to-time: hold fully exited after N passes
+            return e['loop_start'] + e['dir'] * within
+
         def _animate():
             import time as _time
-            # Motion is driven off the frame index `n` (one step per frame), and the frame
-            # index is paced against an ABSOLUTE clock (start + n/fps) rather than a fixed
-            # post-work sleep. This removes the cumulative drift that made the old loop
-            # jittery: previously the real period was render_time + 1/fps, and since
-            # render_time varied (GC, GIL contention, disk I/O), the cadence was irregular.
-            # If a frame runs long we shorten (or skip) the next sleep to catch back up to
-            # the wall clock, so motion stays locked to real time. The shm handle is opened
+            # Frames are RENDERED on an absolute-deadline clock (start + n/fps) so cadence
+            # is steady, and each line's POSITION is computed from elapsed wall time via
+            # _pos_at, so even when the Pi can't keep up and frames land late/dropped, the
+            # motion stays correct and smooth instead of juddering. The shm handle is opened
             # ONCE and reused (seek(0)+write) instead of open/close per frame.
             try:
                 shm = open(shm_path, 'r+b')
@@ -1049,17 +1072,21 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None):
             start = _time.time()
             n = 0
             try:
-                while _time.time() - start < duration:
-                    frame = Image.new('RGB', (width, height), (0, 0, 0))
+                while True:
+                    t = _time.time() - start
+                    if t >= duration:
+                        break
+                    frame = base_frame.copy()
                     for e in prepared:
-                        if e['movement'] in ('L2R', 'R2L'):
-                            ix = int(e['pos'])
+                        mv = e['movement']
+                        if mv in ('L2R', 'R2L'):
+                            ix = int(_pos_at(e, t))
                             src_x = max(0, -ix); dst_x = max(0, ix)
                             vis_w = min(e['tw'] - src_x, width - dst_x)
                             if vis_w > 0:
                                 _clip_paste(frame, e['strip'], src_x, 0, dst_x, e['dy'], vis_w, e['th'], e['clip'])
-                        elif e['movement'] in ('T2B', 'B2T'):
-                            iy = int(e['pos'])
+                        elif mv in ('T2B', 'B2T'):
+                            iy = int(_pos_at(e, t))
                             src_y = max(0, -iy); dst_y = max(0, iy)
                             vis_h = min(e['th'] - src_y, height - dst_y)
                             if vis_h > 0:
@@ -1076,25 +1103,6 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None):
                         shm.flush()
                     except Exception:
                         pass
-                    for e in prepared:
-                        if e['movement'] in ('L2R', 'R2L', 'T2B', 'B2T'):
-                            if e.get('done'):
-                                continue  # fit passes all completed -- hold fully exited
-                            e['pos'] += e['dir'] * e['step_px']
-                            overshot = (e['dir'] < 0 and e['pos'] < e['loop_end']) or (e['dir'] > 0 and e['pos'] > e['loop_end'])
-                            if overshot:
-                                # A pass just completed. Fixed-speed loops forever (snap back
-                                # and repeat for the rest of the window). Fit-to-time snaps back
-                                # for passes 1..N-1, then on the Nth pass holds fully exited at
-                                # loop_end (no jarring snap-back flash at the very end).
-                                if e.get('fit'):
-                                    e['wraps'] += 1
-                                    if e['wraps'] >= e['fit_passes']:
-                                        e['pos'] = e['loop_end']; e['done'] = True
-                                    else:
-                                        e['pos'] = e['loop_start']
-                                else:
-                                    e['pos'] = e['loop_start']
                     # Absolute-deadline pacing: sleep until the next frame's scheduled time
                     # instead of a fixed 1/fps after the work. No cumulative drift; a late
                     # frame is absorbed by a shorter next sleep.
@@ -2423,8 +2431,9 @@ def send_to_fpp(name):
                 # For img: names content, composite text onto the image (State 2 = Opaque).
                 # When no Names content is configured, fall back to an img: Default Waiting
                 # content so the name displays over it instead of wiping it with plain text.
-                # Image backgrounds only work with the static (no per-line movement) path —
-                # scrolling text has never supported compositing onto an image background.
+                # Both static AND scrolling text composite over the image background now
+                # (static via render_image_to_shm, scrolling via animate_lines_via_shm's
+                # bg_image_path).
                 img_source = name_playlist if name_playlist else config.get('default_playlist', '')
                 img_bg_path = None
                 if img_source.startswith('img:'):
@@ -2447,9 +2456,6 @@ def send_to_fpp(name):
                             )
                     else:
                         duration = config.get('display_duration', 30)
-                        if img_bg_path:
-                            logging.warning("⚠️ Image background does not support per-line movement — "
-                                            "animating over a black background instead.")
                         # Pace the overlay animation to the background sequence's fps
                         # (from its FSEQ header) so scrolling motion is locked to the same
                         # clock FPP outputs the sequence at. The background is the names
@@ -2457,9 +2463,13 @@ def send_to_fpp(name):
                         bg_content = (name_playlist if (name_playlist and name_playlist.startswith('seq:'))
                                       else config.get('default_playlist', ''))
                         anim_fps = _fseq_fps_for_content(bg_content)
-                        logging.info(f"🎞️  Overlay animation fps={anim_fps} (from background: {bg_content or 'none'})")
+                        logging.info(f"🎞️  Overlay animation fps={anim_fps} (bg={bg_content or 'none'}, "
+                                     f"img={'yes' if img_bg_path else 'no'})")
+                        # Scrolling text now composites over the image background too
+                        # (img_bg_path is None → black background, unchanged behavior).
                         scroll_started = animate_lines_via_shm(
-                            all_items, overlay_model, mw, mh, duration, fps=anim_fps
+                            all_items, overlay_model, mw, mh, duration,
+                            fps=anim_fps, bg_image_path=img_bg_path
                         )
                         if scroll_started:
                             time.sleep(0.05)  # let first frame land before enabling overlay
@@ -2486,9 +2496,11 @@ def send_to_fpp(name):
                 else:
                     logging.info(f"✅ PIL {'scroll' if scroll_started else 'static'} render active")
 
-                # State 2 (Opaque) for image background so it covers the display fully.
-                # State 3 (Transparent RGB) for normal/FSEQ background (black = transparent).
-                overlay_state = 2 if (img_bg_path and shm_rendered) else 3
+                # State 2 (Opaque) for image background so it covers the display fully —
+                # for both the static composite (shm_rendered) and the scroll composite
+                # (scroll_started) paths. State 3 (Transparent RGB) for normal/FSEQ
+                # background (black = transparent).
+                overlay_state = 2 if (img_bg_path and (shm_rendered or scroll_started)) else 3
                 state_resp = requests.put(state_url, json={"State": overlay_state}, timeout=3)
                 logging.info(f"   Overlay state={overlay_state}: {state_resp.status_code}")
 

@@ -3768,28 +3768,44 @@ def index():
                             </select>
 
                             <label>Name Display Content: <span class="help-text" style="font-weight:normal;margin-left:6px;">🎬 Background(s) shown when a name appears. Add one or more — each gets its own text layout on the Display tab.</span></label>
-                            <div id="names_content_list_box" style="border:1px solid #555; border-radius:5px; padding:8px; background:#333;">
+                            <div id="names_content_list_box" style="border:1px solid #ddd; border-radius:5px; padding:10px; background:#fff;">
                                 <div id="names_content_items"></div>
-                                <button type="button" onclick="openAddContentModal()" style="margin-top:6px; font-size:13px; padding:5px 12px; cursor:pointer;">➕ Add Content</button>
-                                <div id="names_mode_row" style="display:none; margin-top:10px; padding-top:8px; border-top:1px solid #555;">
-                                    <span class="line-mini-label" style="margin-right:8px;">When a name arrives, pick:</span>
-                                    <label style="margin-right:12px; cursor:pointer;"><input type="radio" name="names_mode" value="roundrobin" onchange="onNamesModeChange('roundrobin')" style="width:auto;margin:0 4px 0 0;">Round Robin</label>
-                                    <label style="cursor:pointer;"><input type="radio" name="names_mode" value="random" onchange="onNamesModeChange('random')" style="width:auto;margin:0 4px 0 0;">Random</label>
+                                <button type="button" onclick="openManageContentModal()" style="margin-top:8px; font-size:13px; padding:6px 14px; cursor:pointer; background:#1976d2; color:#fff; border:none; border-radius:4px;">🗂️ Add / Arrange Content</button>
+                                <div id="names_mode_row" style="display:none; margin-top:12px; padding-top:10px; border-top:1px solid #eee;">
+                                    <span style="font-size:13px; color:#555; margin-right:10px;">When a name arrives, pick:</span>
+                                    <label style="margin-right:14px; cursor:pointer; color:#333; font-size:13px;"><input type="radio" name="names_mode" value="roundrobin" onchange="onNamesModeChange('roundrobin')" style="width:auto;margin:0 5px 0 0;vertical-align:middle;">Round Robin</label>
+                                    <label style="cursor:pointer; color:#333; font-size:13px;"><input type="radio" name="names_mode" value="random" onchange="onNamesModeChange('random')" style="width:auto;margin:0 5px 0 0;vertical-align:middle;">Random</label>
                                 </div>
                             </div>
-                            <div id="name_display_none_warning" style="display:none; background:#3a2f00; border:1px solid #ffc107; color:#ffc107; border-radius:5px; padding:8px 12px; margin-top:6px; font-size:13px;">
+                            <div id="name_display_none_warning" style="display:none; background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:5px; padding:8px 12px; margin-top:6px; font-size:13px;">
                                 ⚠️ No Names content — names will appear directly over the Waiting content (using the Display-tab text layout).
                             </div>
 
-                            <!-- Add Content modal -->
-                            <div id="add_content_modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:1000; align-items:center; justify-content:center;">
-                                <div style="background:#2a2a2a; border:1px solid #666; border-radius:8px; padding:20px; width:90%; max-width:440px; box-shadow:0 6px 24px rgba(0,0,0,0.6);">
-                                    <h3 style="margin-top:0;">Add Names Content</h3>
-                                    <label>Content <span class="help-text" style="font-weight:normal;">(sequences/images loaded via the FPP file manager)</span></label>
-                                    <select id="add_content_select"><option value="">-- Select content --</option></select>
-                                    <div style="margin-top:14px; display:flex; gap:8px; justify-content:flex-end;">
-                                        <button type="button" onclick="closeAddContentModal()" style="padding:6px 14px; background:#555;">Cancel</button>
-                                        <button type="button" onclick="addContentConfirm()" style="padding:6px 14px; background:#2e7d32;">Add</button>
+                            <!-- Manage Names Content modal: Available (left) → Names list (right), with arrows -->
+                            <div id="manage_content_modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:1000; align-items:center; justify-content:center;">
+                                <div style="background:#fff; color:#333; border-radius:8px; padding:22px; width:94%; max-width:740px; box-shadow:0 8px 30px rgba(0,0,0,0.35); max-height:90vh; overflow:auto; box-sizing:border-box;">
+                                    <h3 style="margin-top:0;">Manage Names Content</h3>
+                                    <p class="help-text" style="margin-top:4px;">Select content on the left and click ▶ to add it to your Names list. Reorder the list with ▲ / ▼ (order matters for Round Robin). Remove with ◀.</p>
+                                    <div style="display:flex; gap:10px; align-items:stretch;">
+                                        <div style="flex:1; min-width:0;">
+                                            <label style="font-size:13px;">Available Content</label>
+                                            <select id="mng_available" multiple size="12" style="width:100%; height:280px; box-sizing:border-box;"></select>
+                                        </div>
+                                        <div style="display:flex; flex-direction:column; justify-content:center; gap:10px;">
+                                            <button type="button" onclick="mngAdd()" title="Add to Names list" style="padding:6px 10px; cursor:pointer;">▶</button>
+                                            <button type="button" onclick="mngRemove()" title="Remove from Names list" style="padding:6px 10px; cursor:pointer;">◀</button>
+                                        </div>
+                                        <div style="flex:1; min-width:0;">
+                                            <label style="font-size:13px;">Names List (in order)</label>
+                                            <select id="mng_selected" multiple size="12" style="width:100%; height:280px; box-sizing:border-box;"></select>
+                                        </div>
+                                        <div style="display:flex; flex-direction:column; justify-content:center; gap:10px;">
+                                            <button type="button" onclick="mngMoveUp()" title="Move up" style="padding:6px 10px; cursor:pointer;">▲</button>
+                                            <button type="button" onclick="mngMoveDown()" title="Move down" style="padding:6px 10px; cursor:pointer;">▼</button>
+                                        </div>
+                                    </div>
+                                    <div style="margin-top:16px; display:flex; justify-content:flex-end; gap:8px;">
+                                        <button type="button" onclick="closeManageContentModal()" style="background:#2e7d32; color:#fff; padding:8px 20px; border:none; border-radius:4px; cursor:pointer;">Done</button>
                                     </div>
                                 </div>
                             </div>
@@ -5241,7 +5257,8 @@ def index():
                     return pos;
                 }
                 function getDisplayDuration() {
-                    var el = document.getElementById('display_duration');
+                    // Per-content duration field (falls back to the hidden global field).
+                    var el = document.getElementById('content_duration') || document.getElementById('display_duration');
                     return (el && parseInt(el.value, 10)) || 10;
                 }
 
@@ -5920,19 +5937,20 @@ def index():
                     if (box) {
                         box.innerHTML='';
                         if (lst.length===0) {
-                            box.innerHTML='<div style="font-size:13px;color:#aaa;">No content added — names show over the Waiting content.</div>';
+                            box.innerHTML='<div style="font-size:13px;color:#777;">No content added — names show over the Waiting content.</div>';
                         } else {
                             lst.forEach(function(it, i){
                                 var row=document.createElement('div');
-                                row.style.cssText='display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid #444;';
+                                var isSel=(i===window._namesSelectedIndex);
+                                row.style.cssText='display:flex;align-items:center;gap:8px;padding:5px 6px;border-bottom:1px solid #eee;border-radius:3px;'+(isSel?'background:#e3f2fd;':'');
                                 var label=document.createElement('span');
-                                label.style.cssText='flex:1;font-size:13px;color:#eee;cursor:pointer;';
-                                label.textContent=(i+1)+'. '+(it.content||'(none)');
+                                label.style.cssText='flex:1;font-size:13px;color:#333;cursor:pointer;';
+                                label.textContent=(i+1)+'. '+(it.content||'(none)')+(isSel?'  ✏️':'');
                                 label.title='Edit this content’s text on the Display tab';
                                 label.onclick=function(){ selectNamesItem(i); };
                                 var del=document.createElement('button');
                                 del.type='button'; del.textContent='✕'; del.title='Remove';
-                                del.style.cssText='background:#5a2a2a;border:none;color:#fbb;padding:2px 8px;border-radius:3px;cursor:pointer;';
+                                del.style.cssText='background:#f44336;border:none;color:#fff;padding:2px 9px;border-radius:3px;cursor:pointer;font-size:12px;';
                                 del.onclick=function(){ removeNamesItem(i); };
                                 row.appendChild(label); row.appendChild(del);
                                 box.appendChild(row);
@@ -5955,23 +5973,73 @@ def index():
                     if (scope) scope.textContent=(lst.length>0)?('— for content '+(window._namesSelectedIndex+1)):'— shown over waiting content';
                 }
 
-                function openAddContentModal(){ var m=document.getElementById('add_content_modal'); if(m) m.style.display='flex'; }
-                function closeAddContentModal(){ var m=document.getElementById('add_content_modal'); if(m) m.style.display='none'; }
-                function addContentConfirm() {
-                    var sel=document.getElementById('add_content_select'); var val=sel?sel.value:'';
-                    if (!val) { closeAddContentModal(); return; }
-                    flushEditorToSelected();
-                    var lst=window._namesContentList; var newItem;
-                    if (lst.length===0) { newItem=collectEditorLayout(); newItem.content=val; } // seed 1st from flat editor
-                    else { newItem=_blankLayout(); newItem.content=val; }
-                    lst.push(newItem);
-                    window._namesSelectedIndex=lst.length-1;
-                    if (sel) sel.value='';
-                    closeAddContentModal();
+                // ---- Manage Content modal (Available <-> Names list, with arrows) ----
+                function _mngAvailableOptions() {
+                    var out=[];
+                    (window._fppSeqList||[]).forEach(function(s){ out.push({val:'seq:'+s, label:'🎬 '+s}); });
+                    (window._fppImgList||[]).forEach(function(im){ out.push({val:'img:'+im, label:'🖼️ '+im}); });
+                    return out;
+                }
+                function _mngRenderAvailable() {
+                    var sel=document.getElementById('mng_available'); if(!sel) return;
+                    sel.innerHTML='';
+                    _mngAvailableOptions().forEach(function(o){ sel.appendChild(new Option(o.label, o.val)); });
+                }
+                function _mngRenderSelected(keepIdx) {
+                    var sel=document.getElementById('mng_selected'); if(!sel) return;
+                    sel.innerHTML='';
+                    (window._namesContentList||[]).forEach(function(it,i){ sel.appendChild(new Option((i+1)+'. '+(it.content||'(none)'), i)); });
+                    if (keepIdx!=null && keepIdx>=0 && keepIdx<sel.options.length) sel.options[keepIdx].selected=true;
+                }
+                function openManageContentModal() {
+                    flushEditorToSelected();          // don't lose current edits
+                    _mngRenderAvailable();
+                    _mngRenderSelected();
+                    var m=document.getElementById('manage_content_modal'); if(m) m.style.display='flex';
+                }
+                function closeManageContentModal() {
+                    var m=document.getElementById('manage_content_modal'); if(m) m.style.display='none';
+                    var lst=window._namesContentList||[];
+                    if (window._namesSelectedIndex>=lst.length) window._namesSelectedIndex=lst.length-1;
+                    if (lst.length>0 && window._namesSelectedIndex<0) window._namesSelectedIndex=0;
                     renderNamesList();
-                    applyLayoutToEditor(newItem);
+                    if (window._namesSelectedIndex>=0) applyLayoutToEditor(lst[window._namesSelectedIndex]);
                     if (typeof window.toggleFseqPreview==='function') window.toggleFseqPreview();
                     saveConfig();
+                }
+                function mngAdd() {
+                    var av=document.getElementById('mng_available'); if(!av) return;
+                    var chosen=Array.prototype.filter.call(av.options,function(o){return o.selected;}).map(function(o){return o.value;});
+                    if (!chosen.length) return;
+                    var lst=window._namesContentList;
+                    chosen.forEach(function(val){
+                        var item;
+                        if (lst.length===0) { item=collectEditorLayout(); item.content=val; }  // seed first from current editor
+                        else { item=_blankLayout(); item.content=val; }
+                        lst.push(item);
+                    });
+                    _mngRenderSelected(lst.length-1);
+                }
+                function mngRemove() {
+                    var sel=document.getElementById('mng_selected'); if(!sel) return;
+                    var idxs=Array.prototype.filter.call(sel.options,function(o){return o.selected;}).map(function(o){return parseInt(o.value);});
+                    if (!idxs.length) return;
+                    idxs.sort(function(a,b){return b-a;}).forEach(function(i){ window._namesContentList.splice(i,1); });
+                    _mngRenderSelected();
+                }
+                function mngMoveUp() {
+                    var sel=document.getElementById('mng_selected'); if(!sel) return;
+                    var i=sel.selectedIndex; if(i<=0) return;
+                    var lst=window._namesContentList;
+                    var tmp=lst[i-1]; lst[i-1]=lst[i]; lst[i]=tmp;
+                    _mngRenderSelected(i-1);
+                }
+                function mngMoveDown() {
+                    var sel=document.getElementById('mng_selected'); if(!sel) return;
+                    var i=sel.selectedIndex; var lst=window._namesContentList;
+                    if(i<0||i>=lst.length-1) return;
+                    var tmp=lst[i+1]; lst[i+1]=lst[i]; lst[i]=tmp;
+                    _mngRenderSelected(i+1);
                 }
                 function removeNamesItem(i) {
                     var lst=window._namesContentList; if (i<0||i>=lst.length) return;
@@ -5995,7 +6063,14 @@ def index():
                 }
                 function onPreviewContentChange(){ var sel=document.getElementById('preview_content_select'); if(sel) selectNamesItem(parseInt(sel.value)); }
                 function onNamesModeChange(mode){ window._namesMode=(mode==='random')?'random':'roundrobin'; saveConfig(); }
-                function onContentDurationChange(){ flushEditorToSelected(); saveConfig(); }
+                function onContentDurationChange(){
+                    flushEditorToSelected();
+                    // Re-cap the background scrubber and re-fit "Fit to time" scroll lines to
+                    // the new duration.
+                    if (typeof window.toggleFseqPreview==='function') window.toggleFseqPreview();
+                    else if (typeof window.renderCanvasPreview==='function') window.renderCanvasPreview();
+                    saveConfig();
+                }
 
                 function initNamesUI() {
                     var lst=window._namesContentList||[];
@@ -6022,9 +6097,12 @@ def index():
                     renderNamesList();
                 }
 
-                window.openAddContentModal=openAddContentModal;
-                window.closeAddContentModal=closeAddContentModal;
-                window.addContentConfirm=addContentConfirm;
+                window.openManageContentModal=openManageContentModal;
+                window.closeManageContentModal=closeManageContentModal;
+                window.mngAdd=mngAdd;
+                window.mngRemove=mngRemove;
+                window.mngMoveUp=mngMoveUp;
+                window.mngMoveDown=mngMoveDown;
                 window.removeNamesItem=removeNamesItem;
                 window.selectNamesItem=selectNamesItem;
                 window.onPreviewContentChange=onPreviewContentChange;
@@ -6096,7 +6174,7 @@ def index():
                                 // send_to_fpp/display loop) -- anything past that point in the
                                 // FSEQ is never actually seen behind a message, so cap the
                                 // scrubber there instead of the file's full length.
-                                var displayDur = parseInt(document.getElementById('display_duration').value) || 30;
+                                var displayDur = getDisplayDuration();
                                 var totalSec = Math.min(displayDur, Math.max(1, Math.floor(data.duration_ms / 1000)));
                                 var scrubber = document.getElementById('fseq_scrubber');
                                 scrubber.max = totalSec;
@@ -6120,7 +6198,7 @@ def index():
                         // Capped to display_duration, not the video's own length -- playback
                         // always restarts from 0 and is cut off after display_duration seconds
                         // each time a message shows, so nothing past that point is ever seen.
-                        scrubber.max = parseInt(document.getElementById('display_duration').value) || 30;
+                        scrubber.max = getDisplayDuration();
                         scrubber.value = 0;
                         window._scrubSeconds = 0;
                         document.getElementById('fseq_scrubber_row').style.display = '';
@@ -6358,99 +6436,47 @@ def index():
                 .then(data => {
                     if (data.error) console.warn('FPP data partial error:', data.error);
                     const defaultSelect = document.getElementById('default_playlist');
-                    // "nameSelect" is now the Add-Content modal's picker (the single Name
-                    // dropdown was replaced by the names content list).
-                    const nameSelect = document.getElementById('add_content_select');
                     const currentDefault = "{{ config.get('default_playlist', '') }}";
-                    const currentName = '';  // add-modal has no pre-selected value
 
                     defaultSelect.innerHTML = '<option value="">-- Select a sequence --</option>';
-                    if (nameSelect) nameSelect.innerHTML = '<option value="">-- Select content --</option>';
 
                     // Content types: sequences (.fseq, background FSEQ effect) and images
-                    // (static overlay) are enabled. Playlists and videos run FOREGROUND
-                    // (they take over the output and would fight the main scheduler), so
-                    // they stay commented out until we decide how to handle them.
-                    /* PLAYLISTS — foreground, disabled for now
-                    if (data.playlists && data.playlists.length > 0) {
-                        const pg1 = document.createElement('optgroup');
-                        pg1.label = '📋 Playlists';
-                        const pg2 = document.createElement('optgroup');
-                        pg2.label = '📋 Playlists';
-                        data.playlists.forEach(playlist => {
-                            pg1.appendChild(new Option(playlist, playlist, false, playlist === currentDefault));
-                            pg2.appendChild(new Option(playlist, playlist, false, playlist === currentName));
-                        });
-                        defaultSelect.add(pg1);
-                        nameSelect.add(pg2);
-                    }
-                    */
-
+                    // (static overlay) are enabled for BOTH the Waiting dropdown and the
+                    // Names content list (built from _fppSeqList/_fppImgList in the Manage
+                    // Content modal). Playlists/videos remain disabled (foreground).
                     if (data.sequences && data.sequences.length > 0) {
                         const sg1 = document.createElement('optgroup');
                         sg1.label = '🎬 Sequences (.fseq)';
-                        const sg2 = document.createElement('optgroup');
-                        sg2.label = '🎬 Sequences (.fseq)';
                         data.sequences.forEach(seq => {
                             const val = 'seq:' + seq;
                             sg1.appendChild(new Option(seq, val, false, val === currentDefault));
-                            sg2.appendChild(new Option(seq, val, false, val === currentName));
                         });
                         defaultSelect.add(sg1);
-                        nameSelect.add(sg2);
                     }
 
-                    /* VIDEOS — foreground, disabled for now (background effects only)
-                    if (data.videos && data.videos.length > 0) {
-                        const vg1 = document.createElement('optgroup');
-                        vg1.label = '🎥 Videos';
-                        const vg2 = document.createElement('optgroup');
-                        vg2.label = '🎥 Videos';
-                        data.videos.forEach(vid => {
-                            const val = 'vid:' + vid;
-                            vg1.appendChild(new Option(vid, val, false, val === currentDefault));
-                            vg2.appendChild(new Option(vid, val, false, val === currentName));
-                        });
-                        defaultSelect.add(vg1);
-                        nameSelect.add(vg2);
-                    }
-                    */
-
-                    // IMAGES — static overlay content. An image is written once to the
-                    // overlay model and shown Opaque (it owns those pixels), so it's the
-                    // cheapest content type (no per-frame CPU) and never touches the main
-                    // scheduler. Available for both Waiting and Names content.
                     if (data.images && data.images.length > 0) {
                         const ig1 = document.createElement('optgroup');
                         ig1.label = '🖼️ Images';
-                        const ig2 = document.createElement('optgroup');
-                        ig2.label = '🖼️ Images';
                         data.images.forEach(img => {
                             const val = 'img:' + img;
                             ig1.appendChild(new Option(img, val, false, val === currentDefault));
-                            ig2.appendChild(new Option(img, val, false, val === currentName));
                         });
                         defaultSelect.add(ig1);
-                        nameSelect.add(ig2);
                     }
 
-                    // If a stored content selection no longer exists in FPP (e.g. the
-                    // Waiting or Name sequence was deleted in the file manager), revert
-                    // it to None and persist that so the plugin stops referencing a file
-                    // that's gone. Guarded by !data.error so a partial FPP fetch can
-                    // never wipe a still-valid choice.
+                    // If the stored Waiting selection no longer exists in FPP (deleted in
+                    // the file manager), revert it to None so we stop referencing a gone
+                    // file. Guarded by !data.error so a partial fetch can't wipe a valid one.
                     if (!data.error) {
                         var _hasOpt = function(sel, val) {
-                            if (!val) return true;   // '' (None) is always valid
+                            if (!val) return true;
                             return Array.prototype.some.call(sel.options, function(o) { return o.value === val; });
                         };
-                        var _stale = false;
-                        if (!_hasOpt(defaultSelect, currentDefault)) { defaultSelect.value = ''; _stale = true; }
-                        if (!_hasOpt(nameSelect, currentName))       { nameSelect.value = '';    _stale = true; }
-                        if (_stale) { saveConfig(); updateNameDisplayWarning(); }
+                        if (!_hasOpt(defaultSelect, currentDefault)) { defaultSelect.value = ''; saveConfig(); }
                     }
 
                     window._fppSeqList = data.sequences || [];
+                    window._fppImgList = data.images || [];
 
                     const modelSelect = document.getElementById('overlay_model_name');
                     const currentModel = "{{ config.get('overlay_model_name', 'Texting Matrix') }}";

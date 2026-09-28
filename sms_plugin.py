@@ -3767,14 +3767,31 @@ def index():
                                 <option value="">-- Select content --</option>
                             </select>
 
-                            <label>Name Display Content: <span class="help-text" style="font-weight:normal;margin-left:6px;">🎬 This content plays when displaying a name</span></label>
-                            <select id="name_display_playlist">
-                                <option value="">-- None (Same as "Waiting" Content) --</option>
-                                {% set _np = config.get('name_display_playlist', '') %}
-                                {% if _np %}<option value="{{ _np }}" selected>{{ _np }}</option>{% endif %}
-                            </select>
+                            <label>Name Display Content: <span class="help-text" style="font-weight:normal;margin-left:6px;">🎬 Background(s) shown when a name appears. Add one or more — each gets its own text layout on the Display tab.</span></label>
+                            <div id="names_content_list_box" style="border:1px solid #555; border-radius:5px; padding:8px; background:#333;">
+                                <div id="names_content_items"></div>
+                                <button type="button" onclick="openAddContentModal()" style="margin-top:6px; font-size:13px; padding:5px 12px; cursor:pointer;">➕ Add Content</button>
+                                <div id="names_mode_row" style="display:none; margin-top:10px; padding-top:8px; border-top:1px solid #555;">
+                                    <span class="line-mini-label" style="margin-right:8px;">When a name arrives, pick:</span>
+                                    <label style="margin-right:12px; cursor:pointer;"><input type="radio" name="names_mode" value="roundrobin" onchange="onNamesModeChange('roundrobin')" style="width:auto;margin:0 4px 0 0;">Round Robin</label>
+                                    <label style="cursor:pointer;"><input type="radio" name="names_mode" value="random" onchange="onNamesModeChange('random')" style="width:auto;margin:0 4px 0 0;">Random</label>
+                                </div>
+                            </div>
                             <div id="name_display_none_warning" style="display:none; background:#3a2f00; border:1px solid #ffc107; color:#ffc107; border-radius:5px; padding:8px 12px; margin-top:6px; font-size:13px;">
-                                ⚠️ Left as None — names will appear directly over the Waiting content.
+                                ⚠️ No Names content — names will appear directly over the Waiting content (using the Display-tab text layout).
+                            </div>
+
+                            <!-- Add Content modal -->
+                            <div id="add_content_modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:1000; align-items:center; justify-content:center;">
+                                <div style="background:#2a2a2a; border:1px solid #666; border-radius:8px; padding:20px; width:90%; max-width:440px; box-shadow:0 6px 24px rgba(0,0,0,0.6);">
+                                    <h3 style="margin-top:0;">Add Names Content</h3>
+                                    <label>Content <span class="help-text" style="font-weight:normal;">(sequences/images loaded via the FPP file manager)</span></label>
+                                    <select id="add_content_select"><option value="">-- Select content --</option></select>
+                                    <div style="margin-top:14px; display:flex; gap:8px; justify-content:flex-end;">
+                                        <button type="button" onclick="closeAddContentModal()" style="padding:6px 14px; background:#555;">Cancel</button>
+                                        <button type="button" onclick="addContentConfirm()" style="padding:6px 14px; background:#2e7d32;">Add</button>
+                                    </div>
+                                </div>
                             </div>
 
                             <label>Overlay Model Name: <button type="button" onclick="refreshFPPLists(this)" style="font-size:11px;padding:2px 7px;margin-left:8px;cursor:pointer;">↻ Refresh Lists</button> <span class="help-text" style="font-weight:normal;margin-left:6px;">📝 The pixel overlay model for text (e.g., "Texting Matrix")</span></label>
@@ -3786,10 +3803,10 @@ def index():
                         <hr style="border: none; border-top: 1px solid #ddd; margin: 15px 0;">
                         <h2 style="margin-top: 0;">Message Settings</h2>
 
-                        <label>Display Duration (seconds):</label>
-                        <input type="number" id="display_duration" value="{{ config.display_duration }}" min="5" max="300" onchange="if(window.renderCanvasPreview)window.renderCanvasPreview();">
-                        <p class="help-text">⏱️ Each message displays for this many seconds before moving to the next</p>
-                        <p class="help-text">💡 Scrolling lines set to "Fit to time" use this as their scroll window.</p>
+                        <!-- Display Duration moved to the Display tab (it is now per Names
+                             content). This hidden field holds the fallback used when no Names
+                             content is configured, and keeps import/export compatible. -->
+                        <input type="hidden" id="display_duration" value="{{ config.display_duration }}">
 
                         <label>Max Messages Per Phone (0 = unlimited):</label>
                         <input type="number" id="max_messages" value="{{ config.max_messages_per_phone }}" min="0" max="100">
@@ -4299,18 +4316,23 @@ def index():
                             .line-speed-auto input[type="checkbox"] { width:auto; margin:0; cursor:pointer; }
                             .line-speed-sub { display:inline-flex; align-items:center; gap:6px; }
                         </style>
-                        {% set ml = config.get('message_lines') or ['Merry Christmas', '{name}!', '', ''] %}
-                        {% set lc = config.get('line_colors') or ['', '', '', ''] %}
-                        {% set lm = config.get('line_movements') or ['Center', 'Center', 'Center', 'Center'] %}
-                        {% set ls = config.get('line_speeds') or [50, 50, 50, 50] %}
+                        {# The editor renders the ACTIVE names-content item (item 0 when a
+                           list exists) or the flat config when the list is empty. JS handles
+                           switching to other items after fonts have loaded. #}
+                        {% set _ncl = config.get('names_content_list') or [] %}
+                        {% set _active = _ncl[0] if _ncl else config %}
+                        {% set ml = _active.get('message_lines') or ['Merry Christmas', '{name}!', '', ''] %}
+                        {% set lc = _active.get('line_colors') or ['', '', '', ''] %}
+                        {% set lm = _active.get('line_movements') or ['Center', 'Center', 'Center', 'Center'] %}
+                        {% set ls = _active.get('line_speeds') or [50, 50, 50, 50] %}
                         {# Per-line speed value with a safe fallback. speed <= 0 encodes
                            fit-to-time: 0/-1 = 1 pass, -N = N passes. #}
                         {% set s0 = ls[0] if ls|length > 0 else 50 %}
                         {% set s1 = ls[1] if ls|length > 1 else 50 %}
                         {% set s2 = ls[2] if ls|length > 2 else 50 %}
                         {% set s3 = ls[3] if ls|length > 3 else 50 %}
-                        {% set lf = config.get('line_fonts') or ['FreeSans', 'FreeSans', 'FreeSans', 'FreeSans'] %}
-                        {% set lo = config.get('line_orientations') or ['horizontal', 'horizontal', 'horizontal', 'horizontal'] %}
+                        {% set lf = _active.get('line_fonts') or ['FreeSans', 'FreeSans', 'FreeSans', 'FreeSans'] %}
+                        {% set lo = _active.get('line_orientations') or ['horizontal', 'horizontal', 'horizontal', 'horizontal'] %}
                         <div id="message_lines_section">
                             <div class="line-card">
                                 <div class="line-row">
@@ -4541,6 +4563,19 @@ def index():
                                 <span id="pos_display" style="font-size:12px; color:#888;"></span>
                             </div>
 
+                            <!-- Per-content editor: pick which Names content's text you are
+                                 arranging/previewing. Shown only when >1 content is configured. -->
+                            <div id="preview_content_row" style="display:none; margin-top:10px; padding:8px; background:#3a3a3a; border:1px solid #555; border-radius:4px;">
+                                <label style="margin-bottom:4px;">✏️ Editing text for content:</label>
+                                <select id="preview_content_select" onchange="onPreviewContentChange()"></select>
+                            </div>
+                            <div style="margin-top:10px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                                <label style="margin:0;">Display Duration (seconds):</label>
+                                <input type="number" id="content_duration" min="1" max="600" style="width:90px; margin:0;" onchange="onContentDurationChange()">
+                                <span class="help-text" id="content_duration_scope" style="margin:0;"></span>
+                            </div>
+                            <p class="help-text" style="margin:6px 0 0;">💡 Scrolling lines set to "Fit to time" use this as their scroll window.</p>
+
                             <!-- Canvas background preview (FSEQ / video / image) -->
                             <div style="margin-top:10px; padding:10px; background:#616161; border:1px solid #777; border-radius:4px;">
                                 <span style="font-size:13px; font-weight:bold; color:#eee;">Background Preview</span>
@@ -4566,12 +4601,18 @@ def index():
                         <input type="hidden" id="overlay_model_width" value="{{ config.get('overlay_model_width', 0) }}">
                         <input type="hidden" id="overlay_model_height" value="{{ config.get('overlay_model_height', 0) }}">
                         <script>
-                            window._lineBoxesInit = {{ config.get('line_boxes', [{'x':-1,'y':-1,'w':300,'h':60},{'x':-1,'y':-1,'w':300,'h':60},{'x':-1,'y':-1,'w':300,'h':60},{'x':-1,'y':-1,'w':300,'h':60}]) | tojson }};
-                            window._lineMovementsInit = {{ config.get('line_movements', ['Center', 'Center', 'Center', 'Center']) | tojson }};
-                            window._lineSpeedsInit = {{ config.get('line_speeds', [50, 50, 50, 50]) | tojson }};
-                            window._lineFontsInit = {{ config.get('line_fonts', ['FreeSans', 'FreeSans', 'FreeSans', 'FreeSans']) | tojson }};
-                            window._lineOrientationsInit = {{ config.get('line_orientations', ['horizontal', 'horizontal', 'horizontal', 'horizontal']) | tojson }};
+                            {% set _ncl2 = config.get('names_content_list') or [] %}
+                            {% set _active2 = _ncl2[0] if _ncl2 else config %}
+                            window._lineBoxesInit = {{ (_active2.get('line_boxes') or [{'x':-1,'y':-1,'w':300,'h':60},{'x':-1,'y':-1,'w':300,'h':60},{'x':-1,'y':-1,'w':300,'h':60},{'x':-1,'y':-1,'w':300,'h':60}]) | tojson }};
+                            window._lineMovementsInit = {{ (_active2.get('line_movements') or ['Center', 'Center', 'Center', 'Center']) | tojson }};
+                            window._lineSpeedsInit = {{ (_active2.get('line_speeds') or [50, 50, 50, 50]) | tojson }};
+                            window._lineFontsInit = {{ (_active2.get('line_fonts') or ['FreeSans', 'FreeSans', 'FreeSans', 'FreeSans']) | tojson }};
+                            window._lineOrientationsInit = {{ (_active2.get('line_orientations') or ['horizontal', 'horizontal', 'horizontal', 'horizontal']) | tojson }};
                             window._customColorsInit = {{ config.get('custom_colors', []) | tojson }};
+                            window._namesContentListInit = {{ (config.get('names_content_list') or []) | tojson }};
+                            window._namesContentModeInit = {{ config.get('names_content_mode', 'roundrobin') | tojson }};
+                            window._flatNameContentInit = {{ config.get('name_display_playlist', '') | tojson }};
+                            window._flatDisplayDurationInit = {{ config.get('display_duration', 30) | tojson }};
                         </script>
                     </div>
                 </div>
@@ -5766,10 +5807,18 @@ def index():
 
                 // Returns {type, file} for the configured Names Display content, or null.
                 function getConfiguredContent() {
-                    var dp = document.getElementById('name_display_playlist');
-                    var defaultDp = document.getElementById('default_playlist');
-                    // Fall back to waiting content when names content is "None"
-                    var val = (dp && dp.value) ? dp.value : (defaultDp ? defaultDp.value : '');
+                    // Background for the preview = the SELECTED names content item, or the
+                    // waiting content when no names content is configured.
+                    var val = '';
+                    var lst = window._namesContentList || [];
+                    var idx = window._namesSelectedIndex;
+                    if (lst.length > 0 && idx != null && idx >= 0 && idx < lst.length) {
+                        val = lst[idx].content || '';
+                    }
+                    if (!val) {
+                        var defaultDp = document.getElementById('default_playlist');
+                        val = defaultDp ? defaultDp.value : '';
+                    }
                     if (!val) return null;
                     if (val.startsWith('seq:')) {
                         return { type: 'seq', file: val.replace(/^seq:/, '').replace(/\.fseq$/, '') };
@@ -5782,6 +5831,210 @@ def index():
                     }
                     return null;  // plain playlist — no canvas preview
                 }
+
+                // ===================== Names Content List =====================
+                window._namesContentList = Array.isArray(window._namesContentListInit) ? window._namesContentListInit : [];
+                window._namesMode = window._namesContentModeInit || 'roundrobin';
+                window._namesSelectedIndex = (window._namesContentList.length > 0) ? 0 : -1;
+
+                function _blankLayout() {
+                    return {
+                        message_lines: ['', '', '', ''],
+                        line_boxes: [{x:-1,y:-1,w:300,h:60},{x:-1,y:-1,w:300,h:60},{x:-1,y:-1,w:300,h:60},{x:-1,y:-1,w:300,h:60}],
+                        line_colors: ['','','',''],
+                        line_movements: ['Center','Center','Center','Center'],
+                        line_speeds: [50,50,50,50],
+                        line_fonts: ['FreeSans','FreeSans','FreeSans','FreeSans'],
+                        line_orientations: ['horizontal','horizontal','horizontal','horizontal'],
+                        display_duration: parseInt(window._flatDisplayDurationInit) || 30
+                    };
+                }
+
+                // Read the current editor DOM + window buffers into a layout object.
+                function collectEditorLayout() {
+                    function gv(id){ var el=document.getElementById(id); return el?el.value:''; }
+                    return {
+                        message_lines: [gv('line_1'),gv('line_2'),gv('line_3'),gv('line_4')],
+                        line_boxes: (window._lineBoxes||[]).slice(0,4).map(function(b){return {x:b.x,y:b.y,w:b.w,h:b.h};}),
+                        line_colors: [1,2,3,4].map(function(n){var el=document.getElementById('line_'+n+'_color'); return el?el.value.toUpperCase():'';}),
+                        line_movements: (window._lineMovements||['Center','Center','Center','Center']).slice(0,4),
+                        line_speeds: (window._lineSpeeds||[50,50,50,50]).slice(0,4),
+                        line_fonts: [1,2,3,4].map(function(n){var el=document.getElementById('line_'+n+'_font'); return (el&&el.value)?el.value:'FreeSans';}),
+                        line_orientations: (window._lineOrientations||['horizontal','horizontal','horizontal','horizontal']).slice(0,4),
+                        display_duration: parseInt(gv('content_duration'))||30
+                    };
+                }
+
+                // Write a layout into the editor DOM + window buffers, then refresh preview.
+                function applyLayoutToEditor(L) {
+                    L = L || _blankLayout();
+                    var lb = L.line_boxes || [];
+                    window._lineBoxes = [];
+                    for (var i=0;i<4;i++){ var b=lb[i]||{x:-1,y:-1,w:300,h:60}; window._lineBoxes.push({x:b.x,y:b.y,w:b.w,h:b.h}); }
+                    window._lineMovements = (L.line_movements||[]).slice(0,4); while(window._lineMovements.length<4) window._lineMovements.push('Center');
+                    window._lineSpeeds = (L.line_speeds||[]).slice(0,4); while(window._lineSpeeds.length<4) window._lineSpeeds.push(50);
+                    window._lineOrientations = (L.line_orientations||[]).slice(0,4); while(window._lineOrientations.length<4) window._lineOrientations.push('horizontal');
+                    var ml=L.message_lines||[], lc=L.line_colors||[], lf=L.line_fonts||[];
+                    for (var n=0;n<4;n++){
+                        var t=document.getElementById('line_'+(n+1)); if(t) t.value=ml[n]||'';
+                        var c=document.getElementById('line_'+(n+1)+'_color'); if(c) c.value=(lc[n]||'#FF0000');
+                        var mv=document.getElementById('line_'+(n+1)+'_movement'); if(mv) mv.value=window._lineMovements[n];
+                        var fo=document.getElementById('line_'+(n+1)+'_font'); if(fo && lf[n]) fo.value=lf[n];
+                        var oro=document.getElementById('line_'+(n+1)+'_orientation'); if(oro) oro.value=window._lineOrientations[n];
+                        var sp=window._lineSpeeds[n];
+                        var au=document.getElementById('line_'+(n+1)+'_speed_auto'); if(au) au.checked=(sp<=0);
+                        var se=document.getElementById('line_'+(n+1)+'_speed'); if(se) se.value=(sp>0?sp:50);
+                        var pa=document.getElementById('line_'+(n+1)+'_passes'); if(pa) pa.value=(sp<0?(-sp):1);
+                        var sw=document.getElementById('line_'+(n+1)+'_speed_wrap'); if(sw) sw.style.display=(sp<=0)?'none':'';
+                        var pw=document.getElementById('line_'+(n+1)+'_passes_wrap'); if(pw) pw.style.display=(sp<=0)?'':'none';
+                        if (typeof updateLineSpeedRowVisibility==='function') updateLineSpeedRowVisibility(n);
+                        if (typeof updateLineOrientationRowVisibility==='function') updateLineOrientationRowVisibility(n);
+                    }
+                    var d=document.getElementById('content_duration'); if(d) d.value=L.display_duration||30;
+                    if (typeof window.renderCanvasPreview==='function') window.renderCanvasPreview();
+                }
+
+                // Flush the editor into the currently-selected item (mirror duration to the
+                // hidden global field when there is no list).
+                function flushEditorToSelected() {
+                    var lst=window._namesContentList||[];
+                    var idx=window._namesSelectedIndex;
+                    if (lst.length>0 && idx>=0 && idx<lst.length) {
+                        var L=collectEditorLayout(); var it=lst[idx];
+                        it.message_lines=L.message_lines; it.line_boxes=L.line_boxes; it.line_colors=L.line_colors;
+                        it.line_movements=L.line_movements; it.line_speeds=L.line_speeds;
+                        it.line_orientations=L.line_orientations; it.display_duration=L.display_duration;
+                        // Only capture fonts once the font dropdowns are populated, else an
+                        // early autosave would overwrite real fonts with the FreeSans default.
+                        if (window._fontsReady) it.line_fonts=L.line_fonts;
+                    } else {
+                        var d=document.getElementById('content_duration'); var hd=document.getElementById('display_duration');
+                        if (d && hd) hd.value = parseInt(d.value)||30;
+                    }
+                }
+
+                // Render the Name Display list + preview dropdown + mode toggle + none warning.
+                function renderNamesList() {
+                    var lst=window._namesContentList||[];
+                    var box=document.getElementById('names_content_items');
+                    if (box) {
+                        box.innerHTML='';
+                        if (lst.length===0) {
+                            box.innerHTML='<div style="font-size:13px;color:#aaa;">No content added — names show over the Waiting content.</div>';
+                        } else {
+                            lst.forEach(function(it, i){
+                                var row=document.createElement('div');
+                                row.style.cssText='display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid #444;';
+                                var label=document.createElement('span');
+                                label.style.cssText='flex:1;font-size:13px;color:#eee;cursor:pointer;';
+                                label.textContent=(i+1)+'. '+(it.content||'(none)');
+                                label.title='Edit this content’s text on the Display tab';
+                                label.onclick=function(){ selectNamesItem(i); };
+                                var del=document.createElement('button');
+                                del.type='button'; del.textContent='✕'; del.title='Remove';
+                                del.style.cssText='background:#5a2a2a;border:none;color:#fbb;padding:2px 8px;border-radius:3px;cursor:pointer;';
+                                del.onclick=function(){ removeNamesItem(i); };
+                                row.appendChild(label); row.appendChild(del);
+                                box.appendChild(row);
+                            });
+                        }
+                    }
+                    var modeRow=document.getElementById('names_mode_row');
+                    if (modeRow) modeRow.style.display=(lst.length>1)?'block':'none';
+                    var rr=document.querySelector('input[name="names_mode"][value="roundrobin"]');
+                    var rnd=document.querySelector('input[name="names_mode"][value="random"]');
+                    if (rr) rr.checked=(window._namesMode!=='random');
+                    if (rnd) rnd.checked=(window._namesMode==='random');
+                    var warn=document.getElementById('name_display_none_warning');
+                    if (warn) warn.style.display=(lst.length===0)?'block':'none';
+                    var sel=document.getElementById('preview_content_select');
+                    if (sel) { sel.innerHTML=''; lst.forEach(function(it,i){ sel.appendChild(new Option((i+1)+'. '+(it.content||'(none)'), i, false, i===window._namesSelectedIndex)); }); }
+                    var prow=document.getElementById('preview_content_row');
+                    if (prow) prow.style.display=(lst.length>1)?'block':'none';
+                    var scope=document.getElementById('content_duration_scope');
+                    if (scope) scope.textContent=(lst.length>0)?('— for content '+(window._namesSelectedIndex+1)):'— shown over waiting content';
+                }
+
+                function openAddContentModal(){ var m=document.getElementById('add_content_modal'); if(m) m.style.display='flex'; }
+                function closeAddContentModal(){ var m=document.getElementById('add_content_modal'); if(m) m.style.display='none'; }
+                function addContentConfirm() {
+                    var sel=document.getElementById('add_content_select'); var val=sel?sel.value:'';
+                    if (!val) { closeAddContentModal(); return; }
+                    flushEditorToSelected();
+                    var lst=window._namesContentList; var newItem;
+                    if (lst.length===0) { newItem=collectEditorLayout(); newItem.content=val; } // seed 1st from flat editor
+                    else { newItem=_blankLayout(); newItem.content=val; }
+                    lst.push(newItem);
+                    window._namesSelectedIndex=lst.length-1;
+                    if (sel) sel.value='';
+                    closeAddContentModal();
+                    renderNamesList();
+                    applyLayoutToEditor(newItem);
+                    if (typeof window.toggleFseqPreview==='function') window.toggleFseqPreview();
+                    saveConfig();
+                }
+                function removeNamesItem(i) {
+                    var lst=window._namesContentList; if (i<0||i>=lst.length) return;
+                    flushEditorToSelected();
+                    lst.splice(i,1);
+                    if (window._namesSelectedIndex>=lst.length) window._namesSelectedIndex=lst.length-1;
+                    if (lst.length===0) window._namesSelectedIndex=-1;
+                    renderNamesList();
+                    if (window._namesSelectedIndex>=0) applyLayoutToEditor(lst[window._namesSelectedIndex]);
+                    if (typeof window.toggleFseqPreview==='function') window.toggleFseqPreview();
+                    saveConfig();
+                }
+                function selectNamesItem(i) {
+                    var lst=window._namesContentList; if (i<0||i>=lst.length) return;
+                    flushEditorToSelected();      // capture edits to the item we're leaving
+                    window._namesSelectedIndex=i;
+                    applyLayoutToEditor(lst[i]);
+                    renderNamesList();
+                    if (typeof window.toggleFseqPreview==='function') window.toggleFseqPreview();
+                    if (typeof saveConfig==='function') saveConfig();  // persist the flushed edits
+                }
+                function onPreviewContentChange(){ var sel=document.getElementById('preview_content_select'); if(sel) selectNamesItem(parseInt(sel.value)); }
+                function onNamesModeChange(mode){ window._namesMode=(mode==='random')?'random':'roundrobin'; saveConfig(); }
+                function onContentDurationChange(){ flushEditorToSelected(); saveConfig(); }
+
+                function initNamesUI() {
+                    var lst=window._namesContentList||[];
+                    // Only pick the initial selection / duration ONCE (loadFPPData may re-run
+                    // on a list refresh; don't stomp the user's current editor selection then).
+                    if (!window._namesUIInited) {
+                        // Migrate a pre-list single Name content into the list on first load,
+                        // seeded with the flat text layout the server just rendered, so an
+                        // upgrading user's existing setup appears as content #1 and is editable.
+                        if (lst.length===0 && window._flatNameContentInit) {
+                            var seed = collectEditorLayout();
+                            seed.content = window._flatNameContentInit;
+                            seed.display_duration = parseInt(window._flatDisplayDurationInit)||30;
+                            if (window._lineFontsInit && window._lineFontsInit.length) seed.line_fonts = window._lineFontsInit.slice(0,4);
+                            lst.push(seed);
+                            window._namesContentList = lst;
+                        }
+                        window._namesSelectedIndex=(lst.length>0)?0:-1;
+                        var d=document.getElementById('content_duration');
+                        if (d) d.value=(lst.length>0)?(lst[0].display_duration||30):(parseInt(window._flatDisplayDurationInit)||30);
+                        window._namesUIInited=true;
+                    }
+                    if (window._namesSelectedIndex>=lst.length) window._namesSelectedIndex=lst.length-1;
+                    renderNamesList();
+                }
+
+                window.openAddContentModal=openAddContentModal;
+                window.closeAddContentModal=closeAddContentModal;
+                window.addContentConfirm=addContentConfirm;
+                window.removeNamesItem=removeNamesItem;
+                window.selectNamesItem=selectNamesItem;
+                window.onPreviewContentChange=onPreviewContentChange;
+                window.onNamesModeChange=onNamesModeChange;
+                window.onContentDurationChange=onContentDurationChange;
+                window.initNamesUI=initNamesUI;
+                window.renderNamesList=renderNamesList;
+                window.flushEditorToSelected=flushEditorToSelected;
+                window.collectEditorLayout=collectEditorLayout;
+                window.applyLayoutToEditor=applyLayoutToEditor;
 
                 window.toggleFseqPreview = function() {
                     var ct = getConfiguredContent();
@@ -5986,9 +6239,10 @@ def index():
             })();
 
             function updateNameDisplayWarning() {
-                var el = document.getElementById('name_display_playlist');
+                // The names list drives the warning + list UI now.
+                if (window.renderNamesList) { window.renderNamesList(); return; }
                 var warn = document.getElementById('name_display_none_warning');
-                if (el && warn) warn.style.display = el.value ? 'none' : 'block';
+                if (warn) warn.style.display = ((window._namesContentList || []).length === 0) ? 'block' : 'none';
             }
 
             // All DOM elements are above this script block — call init functions directly.
@@ -6104,12 +6358,14 @@ def index():
                 .then(data => {
                     if (data.error) console.warn('FPP data partial error:', data.error);
                     const defaultSelect = document.getElementById('default_playlist');
-                    const nameSelect = document.getElementById('name_display_playlist');
+                    // "nameSelect" is now the Add-Content modal's picker (the single Name
+                    // dropdown was replaced by the names content list).
+                    const nameSelect = document.getElementById('add_content_select');
                     const currentDefault = "{{ config.get('default_playlist', '') }}";
-                    const currentName = "{{ config.get('name_display_playlist', '') }}";
+                    const currentName = '';  // add-modal has no pre-selected value
 
                     defaultSelect.innerHTML = '<option value="">-- Select a sequence --</option>';
-                    nameSelect.innerHTML = '<option value="">-- None (No Change) --</option>';
+                    if (nameSelect) nameSelect.innerHTML = '<option value="">-- Select content --</option>';
 
                     // Content types: sequences (.fseq, background FSEQ effect) and images
                     // (static overlay) are enabled. Playlists and videos run FOREGROUND
@@ -6228,6 +6484,8 @@ def index():
                         saveConfig();
                     });
 
+                    // Names list UI (and the modal picker) are ready — render them.
+                    try { if (window.initNamesUI) window.initNamesUI(); } catch(e) { console.error('Names UI init error:', e); }
                     // Load background preview now that dropdowns are populated
                     try { if (window.toggleFseqPreview) window.toggleFseqPreview(); } catch(e) { console.error('Preview error:', e); }
                     updateNameDisplayWarning();
@@ -6249,6 +6507,10 @@ var _saveTimer = null;
                 status.style.color = '#888';
                 status.textContent = 'Saving...';
 
+                // Capture the current editor into the selected names item (or mirror the
+                // duration to the hidden global field when there's no list) before saving.
+                if (typeof window.flushEditorToSelected === 'function') window.flushEditorToSelected();
+
                 const data = {
                     message_source: document.getElementById('message_source').value,
                     twilio_account_sid: document.getElementById('account_sid').value,
@@ -6266,7 +6528,11 @@ var _saveTimer = null;
                     profanity_filter: document.getElementById('profanity_filter').checked,
                     use_whitelist: document.getElementById('use_whitelist').checked,
                     default_playlist: document.getElementById('default_playlist').value,
-                    name_display_playlist: document.getElementById('name_display_playlist').value,
+                    // Names content is now a list; the flat key stays '' (only used as the
+                    // fallback when the list is empty = names over the waiting content).
+                    name_display_playlist: '',
+                    names_content_list: window._namesContentList || [],
+                    names_content_mode: window._namesMode || 'roundrobin',
                     overlay_model_name: document.getElementById('overlay_model_name').value,
                     overlay_model_width: parseInt(document.getElementById('overlay_model_width').value) || 0,
                     overlay_model_height: parseInt(document.getElementById('overlay_model_height').value) || 0,

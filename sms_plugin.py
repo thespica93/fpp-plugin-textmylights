@@ -3781,9 +3781,12 @@ def index():
                                 ⚠️ No Names content — names will appear directly over the Waiting content (using the Display-tab text layout).
                             </div>
 
-                            <!-- Manage Names Content modal: Available (left) → Names list (right), with arrows -->
-                            <div id="manage_content_modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:1000; align-items:center; justify-content:center;">
-                                <div style="background:#fff; color:#333; border-radius:8px; padding:22px; width:94%; max-width:740px; box-shadow:0 8px 30px rgba(0,0,0,0.35); max-height:90vh; overflow:auto; box-sizing:border-box;">
+                            <!-- Manage Names Content modal: Available (left) → Names list (right), with arrows.
+                                 Top-aligned + high z-index (matching the export modal's overlay) and paired with
+                                 a scroll-to-top on open, so it lands in view inside the auto-height FPP iframe
+                                 where position:fixed is relative to the full plugin height, not the viewport. -->
+                            <div id="manage_content_modal" onclick="if(event.target===this)closeManageContentModal()" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:100000; align-items:flex-start; justify-content:center; padding-top:24px; box-sizing:border-box;">
+                                <div onclick="event.stopPropagation()" style="background:#fff; color:#333; border-radius:8px; padding:22px; width:94%; max-width:740px; box-shadow:0 8px 30px rgba(0,0,0,0.35); max-height:90vh; overflow:auto; box-sizing:border-box;">
                                     <h3 style="margin-top:0;">Manage Names Content</h3>
                                     <p class="help-text" style="margin-top:4px;">Select content on the left and click ▶ to add it to your Names list. Reorder the list with ▲ / ▼ (order matters for Round Robin). Remove with ◀.</p>
                                     <div style="display:flex; gap:10px; align-items:stretch;">
@@ -5975,9 +5978,11 @@ def index():
 
                 // ---- Manage Content modal (Available <-> Names list, with arrows) ----
                 function _mngAvailableOptions() {
+                    // Hide content already in the Names list (right side).
+                    var used={}; (window._namesContentList||[]).forEach(function(it){ used[it.content]=true; });
                     var out=[];
-                    (window._fppSeqList||[]).forEach(function(s){ out.push({val:'seq:'+s, label:'🎬 '+s}); });
-                    (window._fppImgList||[]).forEach(function(im){ out.push({val:'img:'+im, label:'🖼️ '+im}); });
+                    (window._fppSeqList||[]).forEach(function(s){ var v='seq:'+s; if(!used[v]) out.push({val:v, label:'🎬 '+s}); });
+                    (window._fppImgList||[]).forEach(function(im){ var v='img:'+im; if(!used[v]) out.push({val:v, label:'🖼️ '+im}); });
                     return out;
                 }
                 function _mngRenderAvailable() {
@@ -5995,6 +6000,8 @@ def index():
                     flushEditorToSelected();          // don't lose current edits
                     _mngRenderAvailable();
                     _mngRenderSelected();
+                    // Scroll to top so the top-aligned fixed modal is in view inside the iframe.
+                    try { window.scrollTo(0,0); window.parent.postMessage({type:'scrollTop'},'*'); } catch(e) {}
                     var m=document.getElementById('manage_content_modal'); if(m) m.style.display='flex';
                 }
                 function closeManageContentModal() {
@@ -6019,6 +6026,7 @@ def index():
                         lst.push(item);
                     });
                     _mngRenderSelected(lst.length-1);
+                    _mngRenderAvailable();   // hide the newly-added items from the left list
                 }
                 function mngRemove() {
                     var sel=document.getElementById('mng_selected'); if(!sel) return;
@@ -6026,6 +6034,7 @@ def index():
                     if (!idxs.length) return;
                     idxs.sort(function(a,b){return b-a;}).forEach(function(i){ window._namesContentList.splice(i,1); });
                     _mngRenderSelected();
+                    _mngRenderAvailable();   // removed items become available again
                 }
                 function mngMoveUp() {
                     var sel=document.getElementById('mng_selected'); if(!sel) return;
@@ -6174,7 +6183,8 @@ def index():
                                 // send_to_fpp/display loop) -- anything past that point in the
                                 // FSEQ is never actually seen behind a message, so cap the
                                 // scrubber there instead of the file's full length.
-                                var displayDur = getDisplayDuration();
+                                var _durEl = document.getElementById('content_duration') || document.getElementById('display_duration');
+                                var displayDur = (_durEl && parseInt(_durEl.value)) || 30;
                                 var totalSec = Math.min(displayDur, Math.max(1, Math.floor(data.duration_ms / 1000)));
                                 var scrubber = document.getElementById('fseq_scrubber');
                                 scrubber.max = totalSec;
@@ -6198,7 +6208,8 @@ def index():
                         // Capped to display_duration, not the video's own length -- playback
                         // always restarts from 0 and is cut off after display_duration seconds
                         // each time a message shows, so nothing past that point is ever seen.
-                        scrubber.max = getDisplayDuration();
+                        var _vDurEl = document.getElementById('content_duration') || document.getElementById('display_duration');
+                        scrubber.max = (_vDurEl && parseInt(_vDurEl.value)) || 30;
                         scrubber.value = 0;
                         window._scrubSeconds = 0;
                         document.getElementById('fseq_scrubber_row').style.display = '';

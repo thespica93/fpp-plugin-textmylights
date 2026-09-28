@@ -857,7 +857,29 @@ def render_image_to_shm(image_path, model_name, width, height, line_items=None):
         return False
 
 
-def animate_lines_via_shm(items, model_name, width, height, duration):
+def _fseq_fps_for_content(content, default=30.0):
+    """Resolve the frame rate to animate overlay text at, read from the FSEQ header of
+    the background sequence. xLights writes the sequence's step time into the header, so
+    this paces the scrolling text to the exact clock FPP plays/outputs that sequence at
+    (no rate beating between the overlay and the sequence underneath it).
+    `content` is a config content value; only 'seq:' values carry a real fps. Returns
+    `default` for non-sequence content or on any read error."""
+    try:
+        if not content or not content.startswith('seq:'):
+            return default
+        name = os.path.basename(content[4:].removesuffix('.fseq'))  # filename only, no traversal
+        filepath = os.path.join(FSEQ_SEQUENCE_PATH, name + '.fseq')
+        if not os.path.exists(filepath):
+            return default
+        hdr = parse_fseq_header(filepath)
+        fps = hdr.get('fps') if hdr else None
+        return fps if (fps and fps > 0) else default
+    except Exception as e:
+        logging.warning(f"could not read fps from sequence '{content}': {e}")
+        return default
+
+
+def animate_lines_via_shm(items, model_name, width, height, duration, fps=None):
     """Animate independently-moving/colored/fitted text lines together in FPP shared memory.
     Runs in a background thread for `duration` seconds then stops.
 
@@ -885,7 +907,10 @@ def animate_lines_via_shm(items, model_name, width, height, duration):
     if not PIL_AVAILABLE or width <= 0 or height <= 0:
         return False
     try:
-        fps = 30
+        # Pace to the background sequence's own frame rate (from its FSEQ header) when the
+        # caller supplies it; fall back to 30 for non-sequence backgrounds. This drives
+        # both the step-per-frame motion math (via _step_for below) and the frame clock.
+        fps = fps if (fps and fps > 0) else 30
 
         # Pre-render each line to its own image strip (fit to its box) and resolve its
         # fixed axis/motion + clip rect.
@@ -1007,48 +1032,81 @@ def animate_lines_via_shm(items, model_name, width, height, duration):
 
         def _animate():
             import time as _time
+            # Motion is driven off the frame index `n` (one step per frame), and the frame
+            # index is paced against an ABSOLUTE clock (start + n/fps) rather than a fixed
+            # post-work sleep. This removes the cumulative drift that made the old loop
+            # jittery: previously the real period was render_time + 1/fps, and since
+            # render_time varied (GC, GIL contention, disk I/O), the cadence was irregular.
+            # If a frame runs long we shorten (or skip) the next sleep to catch back up to
+            # the wall clock, so motion stays locked to real time. The shm handle is opened
+            # ONCE and reused (seek(0)+write) instead of open/close per frame.
+            try:
+                shm = open(shm_path, 'r+b')
+            except Exception as ex:
+                logging.error(f"animate shm open failed: {ex}")
+                return
+            frame_bytes = width * height * 3
             start = _time.time()
-            while _time.time() - start < duration:
-                frame = Image.new('RGB', (width, height), (0, 0, 0))
-                for e in prepared:
-                    if e['movement'] in ('L2R', 'R2L'):
-                        ix = int(e['pos'])
-                        src_x = max(0, -ix); dst_x = max(0, ix)
-                        vis_w = min(e['tw'] - src_x, width - dst_x)
-                        if vis_w > 0:
-                            _clip_paste(frame, e['strip'], src_x, 0, dst_x, e['dy'], vis_w, e['th'], e['clip'])
-                    elif e['movement'] in ('T2B', 'B2T'):
-                        iy = int(e['pos'])
-                        src_y = max(0, -iy); dst_y = max(0, iy)
-                        vis_h = min(e['th'] - src_y, height - dst_y)
-                        if vis_h > 0:
-                            _clip_paste(frame, e['strip'], 0, src_y, e['dx'], dst_y, e['tw'], vis_h, e['clip'])
-                    else:
-                        frame.paste(e['strip'], (e['dx'], e['dy']))
-                try:
-                    with open(shm_path, 'r+b') as f: f.write(frame.tobytes())
-                except Exception:
-                    pass
-                for e in prepared:
-                    if e['movement'] in ('L2R', 'R2L', 'T2B', 'B2T'):
-                        if e.get('done'):
-                            continue  # fit passes all completed -- hold fully exited
-                        e['pos'] += e['dir'] * e['step_px']
-                        overshot = (e['dir'] < 0 and e['pos'] < e['loop_end']) or (e['dir'] > 0 and e['pos'] > e['loop_end'])
-                        if overshot:
-                            # A pass just completed. Fixed-speed loops forever (snap back
-                            # and repeat for the rest of the window). Fit-to-time snaps back
-                            # for passes 1..N-1, then on the Nth pass holds fully exited at
-                            # loop_end (no jarring snap-back flash at the very end).
-                            if e.get('fit'):
-                                e['wraps'] += 1
-                                if e['wraps'] >= e['fit_passes']:
-                                    e['pos'] = e['loop_end']; e['done'] = True
+            n = 0
+            try:
+                while _time.time() - start < duration:
+                    frame = Image.new('RGB', (width, height), (0, 0, 0))
+                    for e in prepared:
+                        if e['movement'] in ('L2R', 'R2L'):
+                            ix = int(e['pos'])
+                            src_x = max(0, -ix); dst_x = max(0, ix)
+                            vis_w = min(e['tw'] - src_x, width - dst_x)
+                            if vis_w > 0:
+                                _clip_paste(frame, e['strip'], src_x, 0, dst_x, e['dy'], vis_w, e['th'], e['clip'])
+                        elif e['movement'] in ('T2B', 'B2T'):
+                            iy = int(e['pos'])
+                            src_y = max(0, -iy); dst_y = max(0, iy)
+                            vis_h = min(e['th'] - src_y, height - dst_y)
+                            if vis_h > 0:
+                                _clip_paste(frame, e['strip'], 0, src_y, e['dx'], dst_y, e['tw'], vis_h, e['clip'])
+                        else:
+                            frame.paste(e['strip'], (e['dx'], e['dy']))
+                    try:
+                        buf = frame.tobytes()
+                        shm.seek(0)
+                        # One write() syscall for the whole buffer keeps the frame FPP reads
+                        # as close to atomic as userspace allows (minimizes tearing), and
+                        # flush() pushes it out immediately rather than at close time.
+                        shm.write(buf if len(buf) == frame_bytes else buf[:frame_bytes])
+                        shm.flush()
+                    except Exception:
+                        pass
+                    for e in prepared:
+                        if e['movement'] in ('L2R', 'R2L', 'T2B', 'B2T'):
+                            if e.get('done'):
+                                continue  # fit passes all completed -- hold fully exited
+                            e['pos'] += e['dir'] * e['step_px']
+                            overshot = (e['dir'] < 0 and e['pos'] < e['loop_end']) or (e['dir'] > 0 and e['pos'] > e['loop_end'])
+                            if overshot:
+                                # A pass just completed. Fixed-speed loops forever (snap back
+                                # and repeat for the rest of the window). Fit-to-time snaps back
+                                # for passes 1..N-1, then on the Nth pass holds fully exited at
+                                # loop_end (no jarring snap-back flash at the very end).
+                                if e.get('fit'):
+                                    e['wraps'] += 1
+                                    if e['wraps'] >= e['fit_passes']:
+                                        e['pos'] = e['loop_end']; e['done'] = True
+                                    else:
+                                        e['pos'] = e['loop_start']
                                 else:
                                     e['pos'] = e['loop_start']
-                            else:
-                                e['pos'] = e['loop_start']
-                _time.sleep(1.0 / fps)
+                    # Absolute-deadline pacing: sleep until the next frame's scheduled time
+                    # instead of a fixed 1/fps after the work. No cumulative drift; a late
+                    # frame is absorbed by a shorter next sleep.
+                    n += 1
+                    delay = (start + n / fps) - _time.time()
+                    if delay > 0:
+                        _time.sleep(delay)
+            finally:
+                try:
+                    shm.close()
+                except Exception:
+                    pass
 
         _scroll_thread = threading.Thread(target=_animate, daemon=True)
         _scroll_thread.start()
@@ -2392,8 +2450,16 @@ def send_to_fpp(name):
                         if img_bg_path:
                             logging.warning("⚠️ Image background does not support per-line movement — "
                                             "animating over a black background instead.")
+                        # Pace the overlay animation to the background sequence's fps
+                        # (from its FSEQ header) so scrolling motion is locked to the same
+                        # clock FPP outputs the sequence at. The background is the names
+                        # seq: if one is set, else the default waiting seq:.
+                        bg_content = (name_playlist if (name_playlist and name_playlist.startswith('seq:'))
+                                      else config.get('default_playlist', ''))
+                        anim_fps = _fseq_fps_for_content(bg_content)
+                        logging.info(f"🎞️  Overlay animation fps={anim_fps} (from background: {bg_content or 'none'})")
                         scroll_started = animate_lines_via_shm(
-                            all_items, overlay_model, mw, mh, duration
+                            all_items, overlay_model, mw, mh, duration, fps=anim_fps
                         )
                         if scroll_started:
                             time.sleep(0.05)  # let first frame land before enabling overlay

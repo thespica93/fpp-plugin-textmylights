@@ -2438,12 +2438,6 @@ def send_to_fpp(name):
                 state_url = f"{fpp_host}/api/overlays/model/{encoded_model}/state"
                 text_url  = f"{fpp_host}/api/overlays/model/{encoded_model}/text"
 
-                # Order matters to avoid flash of previous name:
-                # 1. Disable overlay (State 0) — hides it
-                # 2. Write new frame (PIL shm or FPP text API)
-                # 3. Enable overlay (State 3 Transparent RGB) — activates cleanly
-                requests.put(state_url, json={"State": 0}, timeout=3)
-
                 mw = config.get('overlay_model_width', 0)
                 mh = config.get('overlay_model_height', 0)
                 logging.info(f"📐 Overlay: model={overlay_model} overlay_size={mw}x{mh} "
@@ -2465,6 +2459,17 @@ def send_to_fpp(name):
                     if not os.path.exists(img_bg_path):
                         logging.warning(f"⚠️ Image not found: {img_bg_path}")
                         img_bg_path = None
+
+                # Blanking policy (avoids the transition flash):
+                #  - Incoming IMAGE (State 2, Opaque): do NOT blank. The current overlay
+                #    (e.g. the previous image) stays on screen while we load/resize the new
+                #    one — the slow part — and render_image_to_shm swaps it in with a single
+                #    write(), so image→image changes have no blank frame at all.
+                #  - Incoming text/seq (State 3, Transparent): blank first, so the previous
+                #    name can't linger while the new text frame is built. (Text path unchanged
+                #    — it already works cleanly.)
+                if not img_bg_path:
+                    requests.put(state_url, json={"State": 0}, timeout=3)
 
                 if PIL_AVAILABLE and mw > 0 and mh > 0:
                     if not any_moving:
@@ -2626,42 +2631,44 @@ def return_to_default_playlist():
         fpp_host = FPP_HOST
         overlay_model = config.get('overlay_model_name', 'Texting Matrix')
 
-        if overlay_model:
-            try:
-                logging.info(f"🧹 Clearing text from model: {overlay_model}")
-                import urllib.parse
-                encoded_model = urllib.parse.quote(overlay_model)
-                # Disable the overlay model (State 0) to stop rendering text
-                state_url = f"{fpp_host}/api/overlays/model/{encoded_model}/state"
-                response = requests.put(state_url, json={"State": 0}, timeout=3)
-                logging.info(f"   Disable overlay (State 0): {response.status_code} - {response.text}")
-                if response.status_code == 200:
-                    logging.info(f"✅ Text cleared")
-                else:
-                    logging.warning(f"⚠️  Could not clear text: {response.status_code}")
-            except Exception as e:
-                logging.warning(f"Could not clear text: {e}")
+        import urllib.parse
 
+        # Don't blank between queued names — the next name's display handles its own
+        # (flash-free) overlay transition. Blanking here would flash between names.
         with queue_lock:
             queue_length = len(message_queue)
-
         if queue_length > 0:
             logging.info(f"📋 Queue has {queue_length} more names — skipping return-to-default")
             return
 
-        import urllib.parse
-        name_playlist  = config.get('name_display_playlist', '')
+        name_playlist   = config.get('name_display_playlist', '')
         default_content = config.get('default_playlist', '')
+        returning_to_image = default_content.startswith('img:')
+
+        def _clear_overlay():
+            # Turn the text/image overlay OFF (State 0). Used only when we are NOT
+            # returning to an image — a seq:/none waiting background shows through once
+            # the overlay is off. (An image waiting background is instead restored by
+            # start_default_playlist, which overwrites the overlay buffer and sets State 2
+            # in one step, so there is no blank frame.)
+            if not overlay_model:
+                return
+            try:
+                enc = urllib.parse.quote(overlay_model)
+                requests.put(f"{fpp_host}/api/overlays/model/{enc}/state", json={"State": 0}, timeout=3)
+                logging.info("🧹 Overlay cleared (State 0)")
+            except Exception as e:
+                logging.warning(f"Could not clear overlay: {e}")
 
         if not name_playlist:
-            # No names content. img: content was paused/replaced for overlay display —
-            # restart it now. seq:/playlist content was never stopped.
-            _default = config.get('default_playlist', '')
-            if _default.startswith('img:'):
-                start_default_playlist()
-                logging.info("ℹ️  No names playlist — restarted default img content after overlay")
+            # No names content configured. Nothing on the output to stop (seq:/playlist
+            # waiting was never stopped); just restore the overlay for the waiting content.
+            if returning_to_image:
+                start_default_playlist()   # image + State 2, overwrites overlay, no blank
+                logging.info("ℹ️  No names playlist — restored img waiting (no blank)")
             else:
-                logging.info("ℹ️  No names playlist — waiting content unchanged, overlay cleared")
+                _clear_overlay()
+                logging.info("ℹ️  No names playlist — overlay cleared, waiting content shows")
             return
 
         # 1) Stop the NAME content by type. Never a blanket Stop Now — the main
@@ -2680,15 +2687,19 @@ def return_to_default_playlist():
             r = requests.get(f"{fpp_host}/api/playlists/stop", timeout=3)
             logging.info(f"⏹️  Stopped names playlist ({r.status_code})")
 
-        # 2) Restore WAITING content. An img: waiting background lives on the overlay,
-        #    which the name display just overwrote (scrolling text frames, or a name
-        #    image), so it must be re-rendered regardless of what the name content was —
-        #    including a seq: name (the case the old per-branch restore missed). A seq:
-        #    waiting background was never stopped (it keeps looping underneath), so it
-        #    needs nothing here.
-        if default_content.startswith('img:'):
+        # 2) Restore WAITING content on the overlay.
+        #    - img: waiting → re-render it and set State 2 Opaque. The name display
+        #      overwrote the overlay buffer (text frames or a name image), so this must
+        #      run for every name type. start_default_playlist writes the image and flips
+        #      to State 2 in one step, so an image→image return has NO blank frame.
+        #    - seq:/none waiting → just turn the overlay off; the seq (still looping
+        #      underneath) or the bare output shows through. No blank either (the
+        #      background was there the whole time).
+        if returning_to_image:
             start_default_playlist()
-            logging.info("🖼️  Restored img waiting content after name display")
+            logging.info("🖼️  Restored img waiting content (no blank)")
+        else:
+            _clear_overlay()
 
     except Exception as e:
         logging.error(f"Error in return_to_default_playlist: {e}")

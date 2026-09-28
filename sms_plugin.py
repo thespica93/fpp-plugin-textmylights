@@ -800,6 +800,22 @@ def render_to_shm(line_items, model_name, width, height):
         return False
 
 
+def _text_coverage_mask(strip):
+    """Build an alpha/coverage mask from an RGB text strip that was drawn as a colored
+    glyph on a BLACK background: per-pixel max of R,G,B. Glyph pixels → opaque, the black
+    background → transparent, anti-aliased edges → partial. Pass this as the mask when
+    pasting text onto an image so only the glyph lands (no black box); the black
+    background is what FPP's State-3 transparency handles for sequences, but over an
+    Opaque (State 2) image we must do that blending ourselves. Returns None on failure
+    (caller then pastes opaquely, as before)."""
+    try:
+        from PIL import ImageChops
+        r, g, b = strip.split()
+        return ImageChops.lighter(ImageChops.lighter(r, g), b)
+    except Exception:
+        return None
+
+
 def render_image_to_shm(image_path, model_name, width, height, line_items=None):
     """Load an image file, resize to model dimensions, optionally composite text on top,
     then write to FPP shared memory.  Returns True on success.
@@ -823,7 +839,8 @@ def render_image_to_shm(image_path, model_name, width, height, line_items=None):
                 if strip is not None:
                     draw_x = resolved_bx + max(0, (box_w - sw) // 2)
                     draw_y = resolved_by + max(0, (box_h - sh) // 2)
-                    img.paste(strip, (draw_x, draw_y))
+                    # Mask so only the glyph lands on the image (no black box behind text).
+                    img.paste(strip, (draw_x, draw_y), _text_coverage_mask(strip))
 
         shm_path = f"/dev/shm/FPP-Model-Data-{model_name}"
         raw = img.tobytes()
@@ -962,6 +979,10 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
 
             entry = {'strip': strip, 'tw': tw, 'th': th, 'movement': movement,
                      'clip': (resolved_bx, resolved_by, box_w, box_h)}
+            # Over an image background, paste only the glyph (mask out the strip's black
+            # box). Over a black background (no image) leave it None — pasting opaquely on
+            # black is identical and cheaper.
+            entry['mask'] = _text_coverage_mask(strip) if bg_image_path else None
             # speed == 0 is the "fit to display time" sentinel: instead of a fixed
             # px/s speed (which, with dynamic-length text, either loops a short name
             # several times or cuts a long name off mid-scroll), time one complete
@@ -1031,17 +1052,20 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
         if base_frame is None:
             base_frame = Image.new('RGB', (width, height), (0, 0, 0))
 
-        def _clip_paste(frame, strip, src_x, src_y, dst_x, dst_y, vis_w, vis_h, clip):
+        def _clip_paste(frame, strip, mask, src_x, src_y, dst_x, dst_y, vis_w, vis_h, clip):
             # Intersect the paste rect with the line's own box, so scrolling text is only
             # visible while inside it — entering/exiting at the box edges instead of the
-            # full canvas edges.
+            # full canvas edges. `mask` (or None) is cropped the same way so text lands on
+            # an image background without its black box.
             cx, cy, cw, ch = clip
             x0, y0 = max(dst_x, cx), max(dst_y, cy)
             x1, y1 = min(dst_x + vis_w, cx + cw), min(dst_y + vis_h, cy + ch)
             if x1 <= x0 or y1 <= y0:
                 return
             crop_x0, crop_y0 = src_x + (x0 - dst_x), src_y + (y0 - dst_y)
-            frame.paste(strip.crop((crop_x0, crop_y0, crop_x0 + (x1 - x0), crop_y0 + (y1 - y0))), (x0, y0))
+            crop_box = (crop_x0, crop_y0, crop_x0 + (x1 - x0), crop_y0 + (y1 - y0))
+            crop_mask = mask.crop(crop_box) if mask is not None else None
+            frame.paste(strip.crop(crop_box), (x0, y0), crop_mask)
 
         def _pos_at(e, t):
             # Closed-form scroll position at elapsed time `t` (seconds). Motion is a pure
@@ -1084,15 +1108,15 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
                             src_x = max(0, -ix); dst_x = max(0, ix)
                             vis_w = min(e['tw'] - src_x, width - dst_x)
                             if vis_w > 0:
-                                _clip_paste(frame, e['strip'], src_x, 0, dst_x, e['dy'], vis_w, e['th'], e['clip'])
+                                _clip_paste(frame, e['strip'], e['mask'], src_x, 0, dst_x, e['dy'], vis_w, e['th'], e['clip'])
                         elif mv in ('T2B', 'B2T'):
                             iy = int(_pos_at(e, t))
                             src_y = max(0, -iy); dst_y = max(0, iy)
                             vis_h = min(e['th'] - src_y, height - dst_y)
                             if vis_h > 0:
-                                _clip_paste(frame, e['strip'], 0, src_y, e['dx'], dst_y, e['tw'], vis_h, e['clip'])
+                                _clip_paste(frame, e['strip'], e['mask'], 0, src_y, e['dx'], dst_y, e['tw'], vis_h, e['clip'])
                         else:
-                            frame.paste(e['strip'], (e['dx'], e['dy']))
+                            frame.paste(e['strip'], (e['dx'], e['dy']), e['mask'])
                     try:
                         buf = frame.tobytes()
                         shm.seek(0)

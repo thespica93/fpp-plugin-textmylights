@@ -271,12 +271,6 @@ DEFAULT_CONFIG = {
     "gv_smtp_port": 587,
     "poll_interval": 2,
     "display_duration": 10,
-    # Coexistence / secondary-app mode. When True, the Pi is treated as the main
-    # show controller and Text My Lights is a secondary "break-time" app: on Stop
-    # it stops ONLY its own content and hands the output back to FPP's scheduler
-    # (Start Next Scheduled Item) instead of a blanket Stop Now that leaves FPP
-    # idle. Lets the projector be shared with the main show over time.
-    "coexistence_mode": False,
     "max_messages_per_phone": 5,
     "max_message_length": 30,
     "max_message_age_mins": 5,
@@ -2289,15 +2283,19 @@ def send_to_fpp(name):
         # Step 1: Start the name display playlist/sequence/video/image (background)
         if name_playlist:
             try:
-                logging.info(f"⏸️  STEP 1: Stopping any running playlist...")
-                requests.get(f"{fpp_host}/api/playlists/stop", timeout=3)
-                # Note: background FSEQ Effect is NOT stopped here — the names sequence
-                # (foreground) will automatically suppress it and it auto-resumes after.
+                import urllib.parse
+                # The plugin runs as a BACKGROUND layer: never stop the foreground, so
+                # a coexisting house sequence (pixels) keeps playing. Stop only the
+                # plugin's OWN waiting FSEQ effect so the names content shows cleanly on
+                # the projector; return_to_default_playlist() restarts it afterward.
+                default_wait = config.get('default_playlist', '')
+                if default_wait.startswith('seq:'):
+                    wait_seq = default_wait[4:].removesuffix('.fseq')
+                    requests.get(f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(wait_seq)}", timeout=3)
+                    logging.info(f"⏸️  Stopped waiting effect ({wait_seq}) for name display")
                 time.sleep(0.1)
 
                 logging.info(f"▶️  STEP 2: Starting name display content: {name_playlist}")
-
-                import urllib.parse
                 if name_playlist.startswith('seq:'):
                     # FSEQ Effect (loop=true, background=true): plays as background so
                     # overlay model renders on top with correct text colors.
@@ -2583,8 +2581,10 @@ def return_to_default_playlist():
                 start_default_playlist()
 
         else:
-            r = requests.get(f"{fpp_host}/api/command/{urllib.parse.quote('Stop Now')}", timeout=3)
-            logging.info(f"⏹️  Stop Now ({r.status_code})")
+            # Names content is a foreground playlist — stop just that playlist
+            # (not a blanket Stop Now), so any coexisting foreground isn't killed.
+            r = requests.get(f"{fpp_host}/api/playlists/stop", timeout=3)
+            logging.info(f"⏹️  Stopped names playlist ({r.status_code})")
             if default_content.startswith('img:'):
                 start_default_playlist()
 
@@ -2593,44 +2593,40 @@ def return_to_default_playlist():
 
 
 def stop_show_playback():
-    """Stop the plugin's own content. This is the 'lights off' action shared by
-    Stop and the end of a graceful drain — it does NOT touch config['enabled']
-    (the caller owns that).
+    """Stop ONLY the plugin's own content — its background FSEQ effect(s) and its
+    text/image overlay. The plugin always runs as a BACKGROUND layer, so this
+    deliberately never issues 'Stop Now' or a blanket playlist stop: any OTHER
+    foreground sequence on the Pi (e.g. a static house display running the pixels)
+    keeps playing. This is the 'lights off' action shared by Stop and the end of a
+    graceful drain — it does NOT touch config['enabled'] (the caller owns that).
 
-    Behavior depends on coexistence mode:
-      • OFF (default): the plugin owns the Pi — do a blanket 'Stop Now' so all
-        playback halts and FPP goes idle.
-      • ON (Pi is the main show controller, plugin is secondary): stop ONLY the
-        plugin's own effect/playlist + clear its overlay, then hand the output
-        back to the scheduler with 'Start Next Scheduled Item' — so the main show
-        resumes and the projector isn't left dead."""
+    (If the plugin's own waiting content is itself a foreground playlist/video —
+    not a background effect — we stop that one playlist, since in that case it IS
+    the plugin's own foreground.)"""
     try:
         import urllib.parse
-        default = config.get('default_playlist', '')
-        coexist = config.get('coexistence_mode', False)
 
-        # Always stop the plugin's own background FSEQ effect (if the waiting
-        # content is a sequence) and clear its text/image overlay.
-        if default.startswith('seq:'):
-            seq_name = default[4:].removesuffix('.fseq')
-            r = requests.get(f"{FPP_HOST}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(seq_name)}", timeout=3)
-            logging.info(f"🛑 FSEQ Effect Stop: {r.status_code} - {r.text}")
+        # Stop the plugin's own background FSEQ effects (waiting + names sequences).
+        for content in (config.get('default_playlist', ''), config.get('name_display_playlist', '')):
+            if content.startswith('seq:'):
+                seq_name = content[4:].removesuffix('.fseq')
+                r = requests.get(f"{FPP_HOST}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(seq_name)}", timeout=3)
+                logging.info(f"🛑 FSEQ Effect Stop ({seq_name}): {r.status_code}")
+
+        # Clear the plugin's text/image overlay so nothing is left on the model.
         overlay_model = config.get('overlay_model_name', '')
         if overlay_model:
             encoded = urllib.parse.quote(overlay_model)
             requests.put(f"{FPP_HOST}/api/overlays/model/{encoded}/state", json={"State": 0}, timeout=3)
             logging.info("🛑 Overlay cleared")
 
-        if coexist:
-            # Secondary mode: stop only the plugin's own foreground playlist (if
-            # any), then return the output to the main show controller.
-            requests.get(f"{FPP_HOST}/api/playlists/stop", timeout=3)
-            r = requests.get(f"{FPP_HOST}/api/command/{urllib.parse.quote('Start Next Scheduled Item')}", timeout=3)
-            logging.info(f"🔀 Coexistence: returned to main show schedule: {r.status_code} - {r.text}")
-        else:
-            # Primary mode: the plugin owns the Pi — stop everything.
-            r2 = requests.get(f"{FPP_HOST}/api/command/{urllib.parse.quote('Stop Now')}", timeout=3)
-            logging.info(f"🛑 Stop Now: {r2.status_code} - {r2.text}")
+        # Only if the plugin's OWN waiting content is a foreground playlist/video
+        # (not a background seq:/img:) do we stop the foreground — that playlist is
+        # the plugin's own. Never for seq:/img:, so a coexisting show is untouched.
+        default = config.get('default_playlist', '')
+        if default and not default.startswith(('seq:', 'img:')):
+            r = requests.get(f"{FPP_HOST}/api/playlists/stop", timeout=3)
+            logging.info(f"🛑 Stopped plugin foreground playlist: {r.status_code}")
     except Exception as e:
         logging.warning(f"Could not stop FPP playback: {e}")
 
@@ -3512,14 +3508,6 @@ def index():
                             <select id="overlay_model_name">
                                 <option value="">-- None --</option>
                             </select>
-                        </div>
-
-                        <hr style="border: none; border-top: 1px solid #ddd; margin: 15px 0;">
-                        <label>🔀 Coexistence</label>
-                        <div style="display:flex; align-items:flex-start; gap:10px; margin-top:4px;">
-                            <label class="toggle-switch" style="flex:0 0 auto;"><input type="checkbox" id="coexistence_mode" {{ 'checked' if config.get('coexistence_mode', False) else '' }} onchange="saveConfig();"><span class="toggle-slider"></span></label>
-                            <span style="font-weight:normal;"><strong>Run as a secondary app (Pi is the main show controller)</strong><br>
-                            <span class="help-text">When on, pressing <strong>Stop</strong> (or the Text My Lights Stop script) stops only this plugin's content and hands the output back to your main show's schedule — instead of stopping everything. Use this when the projector is shared with other sequences and Text My Lights only runs during breaks.</span></span>
                         </div>
 
                         <hr style="border: none; border-top: 1px solid #ddd; margin: 15px 0;">
@@ -5985,7 +5973,6 @@ var _saveTimer = null;
                     gv_app_password: document.getElementById('gv_app_password').value,
                     poll_interval: parseInt(document.getElementById('poll_interval').value),
                     display_duration: parseInt(document.getElementById('display_duration').value),
-                    coexistence_mode: document.getElementById('coexistence_mode').checked,
                     max_messages_per_phone: parseInt(document.getElementById('max_messages').value),
                     allow_duplicate_names: document.getElementById('allow_duplicate_names').checked,
                     max_message_length: parseInt(document.getElementById('max_length').value),

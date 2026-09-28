@@ -150,6 +150,7 @@ function tml_shot($file, $alt) {
         <tr><th>Setting</th><th>What it does</th></tr>
         <tr><td>Message Source</td><td>Twilio or Google Voice. Changing it swaps which credential fields are shown, the rate-limit default, and the allowed responses.</td></tr>
         <tr><td>Start / Stop</td><td>The show is started and stopped by the <code>Start</code> / <code>Stop</code> scheduler commands — no manual enable toggle.</td></tr>
+        <tr><td>Coexistence mode</td><td>Turn on when the Pi is your <strong>main show controller</strong> and Text My Lights only runs during breaks. On <strong>Stop</strong> it stops just this plugin's content and returns the output to your main show's schedule (<em>Start Next Scheduled Item</em>) instead of stopping everything — so the projector can be shared with other sequences. Off (default): the plugin owns the Pi and Stop halts all playback.</td></tr>
         <tr><td>Credentials</td><td>Twilio: Account SID, Auth Token, Phone Number. Google Voice: Gmail Address + App Password.</td></tr>
         <tr><td>Poll Interval</td><td>How often (seconds) to check for new messages. 2–5 is typical.</td></tr>
         <tr><td>Default “Waiting” Content</td><td><strong>Required.</strong> The playlist/sequence that loops while waiting for texts.</td></tr>

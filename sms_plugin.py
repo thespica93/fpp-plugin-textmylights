@@ -44,6 +44,20 @@ except ImportError:
     ZSTD_AVAILABLE = False
 
 _scroll_thread = None   # background PIL scroll animation thread
+_scroll_stop = threading.Event()   # set to stop the scroll thread promptly (before it self-expires)
+
+
+def _stop_scroll_thread(timeout=2.0):
+    """Stop the current scroll animation thread and wait for it to fully exit (closing its
+    shm handle) before returning. Callers that are about to write the shm buffer themselves
+    (restoring waiting content, starting a new name) MUST call this first, otherwise a
+    still-running animation frame can land AFTER the new content and 'reload' the old name."""
+    global _scroll_thread
+    _scroll_stop.set()
+    th = _scroll_thread
+    if th is not None and th.is_alive():
+        th.join(timeout)
+    _scroll_thread = None
 
 # Configuration
 PLUGIN_DIR      = os.path.dirname(os.path.abspath(__file__))
@@ -1098,7 +1112,7 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
             try:
                 while True:
                     t = _time.time() - start
-                    if t >= duration:
+                    if t >= duration or _scroll_stop.is_set():
                         break
                     frame = base_frame.copy()
                     for e in prepared:
@@ -1140,6 +1154,8 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
                 except Exception:
                     pass
 
+        _stop_scroll_thread()      # ensure no prior animation is still writing the buffer
+        _scroll_stop.clear()       # re-arm for this run
         _scroll_thread = threading.Thread(target=_animate, daemon=True)
         _scroll_thread.start()
         return True
@@ -2645,6 +2661,11 @@ def return_to_default_playlist():
         default_content = config.get('default_playlist', '')
         returning_to_image = default_content.startswith('img:')
 
+        # Kill the name's scroll animation and wait for it to fully exit BEFORE we write
+        # the waiting content. Otherwise a last in-flight animation frame can land after
+        # the waiting image and briefly 'reload' the name.
+        _stop_scroll_thread()
+
         def _clear_overlay():
             # Turn the text/image overlay OFF (State 0). Used only when we are NOT
             # returning to an image — a seq:/none waiting background shows through once
@@ -2718,6 +2739,10 @@ def stop_show_playback():
     the plugin's own foreground.)"""
     try:
         import urllib.parse
+
+        # Stop any running name scroll animation first so it can't rewrite the overlay
+        # buffer after we clear it below.
+        _stop_scroll_thread()
 
         # Stop the plugin's own background FSEQ effects (waiting + names sequences).
         for content in (config.get('default_playlist', ''), config.get('name_display_playlist', '')):

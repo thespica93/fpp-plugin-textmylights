@@ -2628,25 +2628,31 @@ def return_to_default_playlist():
                 logging.info("ℹ️  No names playlist — waiting content unchanged, overlay cleared")
             return
 
+        # 1) Stop the NAME content by type. Never a blanket Stop Now — the main
+        #    scheduler and any coexisting foreground must keep running.
         if name_playlist.startswith('seq:'):
-            # Stop the names FSEQ Effect — waiting FSEQ keeps running underneath
+            # Stop the names FSEQ Effect — waiting FSEQ (if any) keeps running underneath
             seq_name = name_playlist[4:].removesuffix('.fseq')
             r = requests.get(f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(seq_name)}", timeout=3)
             logging.info(f"⏹️  FSEQ Effect Stop (names): {r.status_code} - {r.text}")
-
         elif name_playlist.startswith('img:'):
-            # Image mode: overlay was used, nothing extra to stop.
-            # Re-apply default img content (it won't auto-resume)
-            if default_content.startswith('img:'):
-                start_default_playlist()
-
+            # Image name used the overlay only — nothing on the output to stop.
+            pass
         else:
             # Names content is a foreground playlist — stop just that playlist
             # (not a blanket Stop Now), so any coexisting foreground isn't killed.
             r = requests.get(f"{fpp_host}/api/playlists/stop", timeout=3)
             logging.info(f"⏹️  Stopped names playlist ({r.status_code})")
-            if default_content.startswith('img:'):
-                start_default_playlist()
+
+        # 2) Restore WAITING content. An img: waiting background lives on the overlay,
+        #    which the name display just overwrote (scrolling text frames, or a name
+        #    image), so it must be re-rendered regardless of what the name content was —
+        #    including a seq: name (the case the old per-branch restore missed). A seq:
+        #    waiting background was never stopped (it keeps looping underneath), so it
+        #    needs nothing here.
+        if default_content.startswith('img:'):
+            start_default_playlist()
+            logging.info("🖼️  Restored img waiting content after name display")
 
     except Exception as e:
         logging.error(f"Error in return_to_default_playlist: {e}")
@@ -5898,11 +5904,10 @@ def index():
                     defaultSelect.innerHTML = '<option value="">-- Select a sequence --</option>';
                     nameSelect.innerHTML = '<option value="">-- None (No Change) --</option>';
 
-                    // TEMPORARILY DISABLED (2026-09-27): only sequences (.fseq) run as
-                    // background FSEQ effects, which is what we want right now. Playlists,
-                    // videos, and images run FOREGROUND (they take over the output), so
-                    // they're commented out until we decide how to handle them. See the
-                    // memory note "background_effects_only_content".
+                    // Content types: sequences (.fseq, background FSEQ effect) and images
+                    // (static overlay) are enabled. Playlists and videos run FOREGROUND
+                    // (they take over the output and would fight the main scheduler), so
+                    // they stay commented out until we decide how to handle them.
                     /* PLAYLISTS — foreground, disabled for now
                     if (data.playlists && data.playlists.length > 0) {
                         const pg1 = document.createElement('optgroup');
@@ -5948,7 +5953,10 @@ def index():
                     }
                     */
 
-                    /* IMAGES — overlay layer, disabled for now (background effects only)
+                    // IMAGES — static overlay content. An image is written once to the
+                    // overlay model and shown Opaque (it owns those pixels), so it's the
+                    // cheapest content type (no per-frame CPU) and never touches the main
+                    // scheduler. Available for both Waiting and Names content.
                     if (data.images && data.images.length > 0) {
                         const ig1 = document.createElement('optgroup');
                         ig1.label = '🖼️ Images';
@@ -5962,7 +5970,6 @@ def index():
                         defaultSelect.add(ig1);
                         nameSelect.add(ig2);
                     }
-                    */
 
                     // If a stored content selection no longer exists in FPP (e.g. the
                     // Waiting or Name sequence was deleted in the file manager), revert

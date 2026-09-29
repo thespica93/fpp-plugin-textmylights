@@ -4328,7 +4328,7 @@ def index():
                     <div class="section">
                         <h2>Message Lines</h2>
 
-                        <label>Message Lines: <span style="font-size:11px; color:#888; font-weight:normal;">Use {name} in any line. Empty lines are skipped.</span></label>
+                        <label style="font-size:11px; color:#888; font-weight:normal;">Use {name} in any line. Empty lines are skipped.</label>
                         <style>
                             .line-card { background:#3a3a3a; border:1px solid #555; border-radius:5px; padding:8px 8px 6px; margin-bottom:6px; }
                             .line-row { display:flex; align-items:center; gap:6px; }
@@ -4595,7 +4595,6 @@ def index():
 
                         <!-- Canvas: per-line drag in static mode; block preview in scroll modes -->
                         <div id="canvas_section">
-                            <label>Position Preview:</label>
                             <p id="canvas_hint" style="font-weight:bold; font-size:13px; color:#4fc3f7; margin:4px 0 8px;">🖱️ Click a line to select it, then drag inside its box to move it, or drag an edge/corner to resize. Text auto-sizes to fill the box — the box is the MAX size text can be.</p>
                             <p class="help-text" style="margin:-4px 0 8px;">↔️ For scrolling text (Left/Right/Top/Bottom movement), the box is also where the text is allowed to show — it enters and exits at the box's own edges, not the display's, and always starts fully off-page before scrolling in.</p>
                             <canvas id="matrix_canvas" style="width:100%; display:block; background:#000; border:2px solid #555; border-radius:4px; cursor:default;"></canvas>
@@ -4616,9 +4615,13 @@ def index():
                                 <span style="font-size:13px; font-weight:bold; color:#eee;">Background Preview</span>
                                 <span id="fseq_scrub_hint" style="font-weight:normal; font-size:11px; color:#bbb; margin-left:6px;">Use scroll bar to move preview.</span>
                                 <div id="fseq_preview_controls" style="margin-top:8px;">
-                                    <div style="margin-bottom:6px;">
-                                        <span id="fseq_seq_label" style="font-size:12px; color:#ccc;">Sequence: —</span>
+
+                                    <!-- Per-content editor: pick which Names content's text you are
+                                         arranging/previewing. Shown only when >1 content is configured. -->
+                                    <div id="preview_content_row" style="display:none; margin-bottom:8px; padding:8px; background:#3a3a3a; border:1px solid #555; border-radius:4px;">
+                                        <select id="preview_content_select" onchange="onPreviewContentChange()" style="width:100%;"></select>
                                     </div>
+
                                     <div id="fseq_scrubber_row" style="display:none;">
                                         <div style="display:flex; align-items:center; gap:8px;">
                                             <span id="fseq_time_display" style="font-size:12px; color:#aaa; min-width:85px; white-space:nowrap;">0:00 / 0:00</span>
@@ -4629,12 +4632,6 @@ def index():
                                         <div id="fseq_status" style="font-size:11px; color:#888; margin-top:4px; min-height:16px;"></div>
                                     </div>
                                     <div id="fseq_load_status" style="font-size:11px; color:#888; margin-top:4px; min-height:16px;"></div>
-
-                                    <!-- Per-content editor: pick which Names content's text you are
-                                         arranging/previewing. Shown only when >1 content is configured. -->
-                                    <div id="preview_content_row" style="display:none; margin-top:8px; padding:8px; background:#3a3a3a; border:1px solid #555; border-radius:4px;">
-                                        <select id="preview_content_select" onchange="onPreviewContentChange()" style="width:100%;"></select>
-                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -6163,15 +6160,14 @@ def index():
 
                 window.toggleFseqPreview = function() {
                     var ct = getConfiguredContent();
-                    var label = document.getElementById('fseq_seq_label');
+                    var loadEl = document.getElementById('fseq_load_status');
                     if (!ct) {
-                        label.textContent = '\u26a0 Select a .fseq, video, or image as Waiting or Names content for background preview.';
-                        label.style.color = '#ff9800';
+                        if (loadEl) {
+                            loadEl.textContent = '\u26a0 Select a .fseq, video, or image as Waiting or Names content for background preview.';
+                            loadEl.style.color = '#ff9800';
+                        }
                         return;
                     }
-                    var icon = ct.type === 'seq' ? '🎬 ' : ct.type === 'vid' ? '🎥 ' : '🖼️ ';
-                    label.textContent = icon + ct.file;
-                    label.style.color = '#ccc';
                     loadBgPreview();
                 };
 

@@ -5979,8 +5979,8 @@ def index():
                                 row.style.cssText='display:flex;align-items:center;gap:8px;padding:5px 6px;border-bottom:1px solid #eee;border-radius:3px;'+(isSel?'background:#e3f2fd;':'');
                                 var label=document.createElement('span');
                                 label.style.cssText='flex:1;font-size:13px;color:#333;cursor:pointer;';
-                                label.textContent=(i+1)+'. '+(it.content||'(none)')+(isSel?'  ✏️':'');
-                                label.title='Edit this content’s text on the Display tab';
+                                label.textContent=(i+1)+'. '+(it.content||'(none)');
+                                label.title='Click to edit this content’s text on the Display tab';
                                 label.onclick=function(){ selectNamesItem(i); };
                                 var del=document.createElement('button');
                                 del.type='button'; del.textContent='✕'; del.title='Remove';

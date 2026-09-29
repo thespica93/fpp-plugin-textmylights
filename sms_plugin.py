@@ -4629,6 +4629,13 @@ def index():
                                         <div id="fseq_status" style="font-size:11px; color:#888; margin-top:4px; min-height:16px;"></div>
                                     </div>
                                     <div id="fseq_load_status" style="font-size:11px; color:#888; margin-top:4px; min-height:16px;"></div>
+
+                                    <!-- Per-content editor: pick which Names content's text you are
+                                         arranging/previewing. Shown only when >1 content is configured. -->
+                                    <div id="preview_content_row" style="display:none; margin-top:8px; padding:8px; background:#3a3a3a; border:1px solid #555; border-radius:4px;">
+                                        <select id="preview_content_select" onchange="onPreviewContentChange()" style="width:100%;"></select>
+                                    </div>
+
                                     <div style="margin-top:10px; padding-top:8px; border-top:1px dashed #888;">
                                         <button type="button" onclick="runFseqDiag()" style="padding:5px 10px; font-size:12px; background:#5c6bc0; color:#fff; border:none; border-radius:3px; cursor:pointer;">🔬 Diagnostics (copy for support)</button>
                                         <span class="help-text" style="margin-left:6px;">Runs on the currently-selected content above. Paste the output back to Claude.</span>
@@ -4639,12 +4646,6 @@ def index():
                                         </div>
                                     </div>
                                 </div>
-                            </div>
-
-                            <!-- Per-content editor: pick which Names content's text you are
-                                 arranging/previewing. Shown only when >1 content is configured. -->
-                            <div id="preview_content_row" style="display:none; margin-top:10px; padding:8px; background:#3a3a3a; border:1px solid #555; border-radius:4px;">
-                                <select id="preview_content_select" onchange="onPreviewContentChange()"></select>
                             </div>
                         </div>
 
@@ -6045,6 +6046,21 @@ def index():
                     if (typeof window.toggleFseqPreview==='function') window.toggleFseqPreview();
                     saveConfig();
                 }
+                // A freshly-added content defaults to showing the texter's {name} on
+                // line 1, centered (position + movement). Never clobber text the user
+                // has already typed into any line.
+                function _seedNamePlaceholder(item) {
+                    var ml = item.message_lines || ['','','',''];
+                    var hasText = ml.some(function(s){ return (s||'').trim() !== ''; });
+                    if (!hasText) {
+                        item.message_lines = ['{name}','','',''];
+                        item.line_boxes = item.line_boxes || [];
+                        item.line_boxes[0] = {x:-1,y:-1,w:300,h:60};   // -1,-1 = centered
+                        item.line_movements = item.line_movements || ['Center','Center','Center','Center'];
+                        item.line_movements[0] = 'Center';
+                    }
+                    return item;
+                }
                 function mngAdd() {
                     var av=document.getElementById('mng_available'); if(!av) return;
                     var chosen=Array.prototype.filter.call(av.options,function(o){return o.selected;}).map(function(o){return o.value;});
@@ -6054,6 +6070,7 @@ def index():
                         var item;
                         if (lst.length===0) { item=collectEditorLayout(); item.content=val; }  // seed first from current editor
                         else { item=_blankLayout(); item.content=val; }
+                        _seedNamePlaceholder(item);
                         lst.push(item);
                     });
                     _mngRenderSelected(lst.length-1);

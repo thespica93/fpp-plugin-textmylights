@@ -4635,16 +4635,6 @@ def index():
                                     <div id="preview_content_row" style="display:none; margin-top:8px; padding:8px; background:#3a3a3a; border:1px solid #555; border-radius:4px;">
                                         <select id="preview_content_select" onchange="onPreviewContentChange()" style="width:100%;"></select>
                                     </div>
-
-                                    <div style="margin-top:10px; padding-top:8px; border-top:1px dashed #888;">
-                                        <button type="button" onclick="runFseqDiag()" style="padding:5px 10px; font-size:12px; background:#5c6bc0; color:#fff; border:none; border-radius:3px; cursor:pointer;">🔬 Diagnostics (copy for support)</button>
-                                        <span class="help-text" style="margin-left:6px;">Runs on the currently-selected content above. Paste the output back to Claude.</span>
-                                        <div id="fseq_diag_wrap" style="display:none; margin-top:8px;">
-                                            <button type="button" onclick="copyFseqDiag()" style="padding:4px 8px; font-size:11px; background:#555; color:#fff; border:none; border-radius:3px; cursor:pointer;">📋 Copy</button>
-                                            <span id="fseq_diag_copied" style="font-size:11px; color:#81c784; margin-left:6px;"></span>
-                                            <textarea id="fseq_diag_out" readonly style="width:100%; height:260px; margin-top:6px; font-family:monospace; font-size:11px; background:#1e1e1e; color:#d4d4d4; border:1px solid #555; border-radius:3px; padding:6px; white-space:pre; overflow:auto;"></textarea>
-                                        </div>
-                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -6374,53 +6364,6 @@ def index():
                     document.getElementById('fseq_load_status').textContent = '';
                 };
 
-                // Diagnostics: dump how the selected .fseq is parsed/decoded, for support.
-                window.runFseqDiag = function() {
-                    var wrap = document.getElementById('fseq_diag_wrap');
-                    var out  = document.getElementById('fseq_diag_out');
-                    document.getElementById('fseq_diag_copied').textContent = '';
-                    wrap.style.display = '';
-                    var ct = getConfiguredContent();
-                    if (!ct) {
-                        out.value = 'No content selected. Pick a .fseq as this content’s background first.';
-                        return;
-                    }
-                    if (ct.type !== 'seq') {
-                        out.value = 'Diagnostics only applies to .fseq sequences.\\n' +
-                                    'Selected content is a ' + ct.type + ' file: ' + ct.file;
-                        return;
-                    }
-                    var model = document.getElementById('overlay_model_name').value || '';
-                    var mw    = document.getElementById('overlay_model_width').value  || 0;
-                    var mh    = document.getElementById('overlay_model_height').value || 0;
-                    out.value = 'Running…';
-                    var url = '/api/fseq/debug'
-                        + '?sequence=' + encodeURIComponent(ct.file)
-                        + '&model='    + encodeURIComponent(model)
-                        + '&width='    + mw
-                        + '&height='   + mh;
-                    fetch(url)
-                        .then(function(r) { return r.json(); })
-                        .then(function(d) { out.value = JSON.stringify(d, null, 2); })
-                        .catch(function(e) { out.value = 'Diagnostics request failed: ' + e; });
-                };
-
-                window.copyFseqDiag = function() {
-                    var out = document.getElementById('fseq_diag_out');
-                    var note = document.getElementById('fseq_diag_copied');
-                    out.select();
-                    try {
-                        if (navigator.clipboard && navigator.clipboard.writeText) {
-                            navigator.clipboard.writeText(out.value);
-                        } else {
-                            document.execCommand('copy');
-                        }
-                        note.textContent = 'Copied!';
-                    } catch (e) {
-                        note.textContent = 'Select the text and copy manually.';
-                    }
-                    setTimeout(function() { note.textContent = ''; }, 2500);
-                };
             })();
 
             function updateNameDisplayWarning() {

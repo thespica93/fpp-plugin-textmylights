@@ -6347,7 +6347,7 @@ def index():
                         return;
                     }
                     if (ct.type !== 'seq') {
-                        out.value = 'Diagnostics only applies to .fseq sequences.\n' +
+                        out.value = 'Diagnostics only applies to .fseq sequences.\\n' +
                                     'Selected content is a ' + ct.type + ' file: ' + ct.file;
                         return;
                     }

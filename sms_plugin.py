@@ -4604,12 +4604,6 @@ def index():
                                 <span id="pos_display" style="font-size:12px; color:#888;"></span>
                             </div>
 
-                            <!-- Per-content editor: pick which Names content's text you are
-                                 arranging/previewing. Shown only when >1 content is configured. -->
-                            <div id="preview_content_row" style="display:none; margin-top:10px; padding:8px; background:#3a3a3a; border:1px solid #555; border-radius:4px;">
-                                <label style="margin-bottom:4px;">✏️ Editing text for content:</label>
-                                <select id="preview_content_select" onchange="onPreviewContentChange()"></select>
-                            </div>
                             <div style="margin-top:10px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
                                 <label style="margin:0;">Display Duration (seconds):</label>
                                 <input type="number" id="content_duration" min="1" max="600" style="width:90px; margin:0;" onchange="onContentDurationChange()">
@@ -4645,6 +4639,12 @@ def index():
                                         </div>
                                     </div>
                                 </div>
+                            </div>
+
+                            <!-- Per-content editor: pick which Names content's text you are
+                                 arranging/previewing. Shown only when >1 content is configured. -->
+                            <div id="preview_content_row" style="display:none; margin-top:10px; padding:8px; background:#3a3a3a; border:1px solid #555; border-radius:4px;">
+                                <select id="preview_content_select" onchange="onPreviewContentChange()"></select>
                             </div>
                         </div>
 

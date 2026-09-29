@@ -1322,20 +1322,31 @@ def parse_fseq_header(filepath):
     num_comp_blocks   = raw[20]           # uint8
     num_sparse_ranges = raw[21]           # uint8
 
-    # ── Auto-detect zstd compression ─────────────────────────────────────────
+    # ── Auto-detect compression ──────────────────────────────────────────────
     # FSEQ v2.2 (minor_version >= 2) sometimes writes compression_type=0 in
-    # byte 19 even though the data is zstd-compressed.  Probe the actual data
-    # at chan_data_offset for the zstd frame magic (0xFD2FB528 little-endian).
+    # byte 19 even though the data is actually compressed.  Probe the real data
+    # at chan_data_offset for a compression magic and override:
+    #   • zstd frame magic 0x28 0xB5 0x2F 0xFD (0xFD2FB528 little-endian) → type 2
+    #   • zlib header 0x78 + valid FLG (CMF*256+FLG divisible by 31)        → type 1
+    # Without this, a compressed file read as "uncompressed" paints raw
+    # compressed bytes to the display → TV-snow noise in the preview.
     _ZSTD_MAGIC = b'\x28\xB5\x2F\xFD'
     with open(filepath, 'rb') as _f:
         _f.seek(chan_data_offset)
         _probe = _f.read(4)
     effective_ctype = compression_type
-    if _probe == _ZSTD_MAGIC and compression_type == 0:
+    if compression_type == 0 and _probe[:4] == _ZSTD_MAGIC:
         effective_ctype = 2   # override: treat as zstd
         logging.info(
             "FSEQ: header says uncompressed (byte 19 = 0) but zstd magic detected "
             "at chan_data_offset — treating as zstd (FSEQ v2.2 quirk)"
+        )
+    elif (compression_type == 0 and len(_probe) >= 2 and _probe[0] == 0x78
+          and ((_probe[0] << 8 | _probe[1]) % 31 == 0)):
+        effective_ctype = 1   # override: treat as zlib
+        logging.info(
+            "FSEQ: header says uncompressed (byte 19 = 0) but zlib magic detected "
+            "at chan_data_offset — treating as zlib (FSEQ v2.2 quirk)"
         )
 
     # ── Compression block table ───────────────────────────────────────────────
@@ -1444,6 +1455,17 @@ def read_fseq_frame(header, frame_idx, start_ch, ch_count):
             raise ValueError(
                 f"Model channel count {ch_count} exceeds FSEQ channel count {total_ch}"
             )
+    elif not sparse_ranges and frame_byte + ch_count > total_ch and ch_count <= total_ch:
+        # Dense, model-specific / partial export: the file holds ONLY this
+        # model's channels starting at file offset 0, so the show-level start
+        # channel would overrun the file (e.g. FSEQ channel_count == model
+        # channel_count, but start_ch > 0).  Read from the top instead.
+        logging.warning(
+            f"FSEQ preview: model range {start_ch}..{start_ch + ch_count} exceeds "
+            f"file channel_count {total_ch} — treating as model-specific export "
+            f"(frame byte 0)"
+        )
+        frame_byte = 0
 
     if ctype == 0:
         # Uncompressed: seek directly to frame + channel byte offset

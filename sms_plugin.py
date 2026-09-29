@@ -4613,6 +4613,15 @@ def index():
                                         <div id="fseq_status" style="font-size:11px; color:#888; margin-top:4px; min-height:16px;"></div>
                                     </div>
                                     <div id="fseq_load_status" style="font-size:11px; color:#888; margin-top:4px; min-height:16px;"></div>
+                                    <div style="margin-top:10px; padding-top:8px; border-top:1px dashed #888;">
+                                        <button type="button" onclick="runFseqDiag()" style="padding:5px 10px; font-size:12px; background:#5c6bc0; color:#fff; border:none; border-radius:3px; cursor:pointer;">🔬 Diagnostics (copy for support)</button>
+                                        <span class="help-text" style="margin-left:6px;">Runs on the currently-selected content above. Paste the output back to Claude.</span>
+                                        <div id="fseq_diag_wrap" style="display:none; margin-top:8px;">
+                                            <button type="button" onclick="copyFseqDiag()" style="padding:4px 8px; font-size:11px; background:#555; color:#fff; border:none; border-radius:3px; cursor:pointer;">📋 Copy</button>
+                                            <span id="fseq_diag_copied" style="font-size:11px; color:#81c784; margin-left:6px;"></span>
+                                            <textarea id="fseq_diag_out" readonly style="width:100%; height:260px; margin-top:6px; font-family:monospace; font-size:11px; background:#1e1e1e; color:#d4d4d4; border:1px solid #555; border-radius:3px; padding:6px; white-space:pre; overflow:auto;"></textarea>
+                                        </div>
+                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -6325,6 +6334,54 @@ def index():
                     document.getElementById('fseq_status').textContent = '';
                     document.getElementById('fseq_load_status').textContent = '';
                 };
+
+                // Diagnostics: dump how the selected .fseq is parsed/decoded, for support.
+                window.runFseqDiag = function() {
+                    var wrap = document.getElementById('fseq_diag_wrap');
+                    var out  = document.getElementById('fseq_diag_out');
+                    document.getElementById('fseq_diag_copied').textContent = '';
+                    wrap.style.display = '';
+                    var ct = getConfiguredContent();
+                    if (!ct) {
+                        out.value = 'No content selected. Pick a .fseq as this content’s background first.';
+                        return;
+                    }
+                    if (ct.type !== 'seq') {
+                        out.value = 'Diagnostics only applies to .fseq sequences.\n' +
+                                    'Selected content is a ' + ct.type + ' file: ' + ct.file;
+                        return;
+                    }
+                    var model = document.getElementById('overlay_model_name').value || '';
+                    var mw    = document.getElementById('overlay_model_width').value  || 0;
+                    var mh    = document.getElementById('overlay_model_height').value || 0;
+                    out.value = 'Running…';
+                    var url = '/api/fseq/debug'
+                        + '?sequence=' + encodeURIComponent(ct.file)
+                        + '&model='    + encodeURIComponent(model)
+                        + '&width='    + mw
+                        + '&height='   + mh;
+                    fetch(url)
+                        .then(function(r) { return r.json(); })
+                        .then(function(d) { out.value = JSON.stringify(d, null, 2); })
+                        .catch(function(e) { out.value = 'Diagnostics request failed: ' + e; });
+                };
+
+                window.copyFseqDiag = function() {
+                    var out = document.getElementById('fseq_diag_out');
+                    var note = document.getElementById('fseq_diag_copied');
+                    out.select();
+                    try {
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                            navigator.clipboard.writeText(out.value);
+                        } else {
+                            document.execCommand('copy');
+                        }
+                        note.textContent = 'Copied!';
+                    } catch (e) {
+                        note.textContent = 'Select the text and copy manually.';
+                    }
+                    setTimeout(function() { note.textContent = ''; }, 2500);
+                };
             })();
 
             function updateNameDisplayWarning() {
@@ -7548,17 +7605,46 @@ def fseq_debug():
         hdr = parse_fseq_header(filepath)
         comp_names = {0: 'uncompressed', 1: 'zlib', 2: 'zstd'}
         result['fseq'] = {
-            'channel_count':     hdr['channel_count'],
-            'frame_count':       hdr['frame_count'],
-            'fps':               round(hdr['fps'], 2),
-            'step_time_ms':      hdr['step_time_ms'],
-            'compression_type':  hdr['compression_type'],
-            'compression_name':  comp_names.get(hdr['compression_type'], 'unknown'),
-            'chan_data_offset':   hdr['chan_data_offset'],
-            'num_comp_blocks':   len(hdr['comp_blocks']),
-            'num_sparse_ranges': hdr['num_sparse_ranges'],
-            'sparse_ranges':     hdr['sparse_ranges'],
-            'sparse_sum':        sum(sr['count'] for sr in hdr['sparse_ranges']),
+            'channel_count':        hdr['channel_count'],
+            'frame_count':          hdr['frame_count'],
+            'fps':                  round(hdr['fps'], 2),
+            'step_time_ms':         hdr['step_time_ms'],
+            'compression_type':     hdr['compression_type'],
+            'compression_name':     comp_names.get(hdr['compression_type'], 'unknown'),
+            'raw_compression_type': hdr['raw_compression_type'],
+            'raw_compression_name': comp_names.get(hdr['raw_compression_type'], 'unknown'),
+            'chan_data_offset':     hdr['chan_data_offset'],
+            'num_comp_blocks':      len(hdr['comp_blocks']),
+            'header_num_comp_blocks':   hdr['num_comp_blocks'],
+            'num_sparse_ranges':    hdr['num_sparse_ranges'],
+            'sparse_ranges':        hdr['sparse_ranges'],
+            'sparse_sum':           sum(sr['count'] for sr in hdr['sparse_ranges']),
+            'comp_blocks_preview':  hdr['comp_blocks'][:6],
+        }
+
+        # ── Decisive raw bytes ──────────────────────────────────────────────
+        # These let us tell (without SSH) whether the channel data is actually
+        # zlib / zstd / raw, and whether the header's compression byte lies.
+        with open(filepath, 'rb') as _f:
+            _hdr_raw = _f.read(32)
+            _f.seek(hdr['chan_data_offset'])
+            _data_probe = _f.read(8)
+        probe_guess = 'unknown'
+        if _data_probe[:4] == b'\x28\xB5\x2F\xFD':
+            probe_guess = 'zstd'
+        elif _data_probe[:1] == b'\x78':
+            # zlib stream: 0x78 followed by 0x01/0x9C/0xDA typically
+            probe_guess = 'zlib'
+        elif hdr['compression_type'] == 0:
+            probe_guess = 'raw/uncompressed'
+        result['raw'] = {
+            'header_hex':          _hdr_raw.hex(),
+            'byte18_step_time':    _hdr_raw[18] if len(_hdr_raw) > 18 else None,
+            'byte19_compression':  _hdr_raw[19] if len(_hdr_raw) > 19 else None,
+            'byte20_num_blocks':   _hdr_raw[20] if len(_hdr_raw) > 20 else None,
+            'byte21_num_sparse':   _hdr_raw[21] if len(_hdr_raw) > 21 else None,
+            'data_probe_hex':      _data_probe.hex(),
+            'data_looks_like':     probe_guess,
         }
     except Exception as e:
         result['fseq_error'] = str(e)

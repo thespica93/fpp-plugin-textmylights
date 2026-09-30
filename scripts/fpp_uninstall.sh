@@ -51,6 +51,15 @@ else
     log_and_show "✓ Plugin data and stored credentials removed"
 fi
 
+# Remove the system integration this plugin added outside its own directory: the
+# sudoers rule and the root-owned shared-memory permission helper. Leaving the
+# sudoers rule behind would keep granting the fpp user a root command after the
+# plugin is gone.
+log_and_show "Removing sudoers rule and privileged helper..."
+rm -f /etc/sudoers.d/90-fpp-sms-shm
+rm -f /usr/local/bin/tml-fix-shm-perms
+log_and_show "✓ Sudoers rule and helper removed"
+
 # Remove log files
 log_and_show "Removing log files..."
 rm -f /home/fpp/media/logs/sms_plugin.log

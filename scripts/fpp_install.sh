@@ -174,13 +174,28 @@ fi
 chown fpp:fpp "$PLUGIN_DIR/whitelist.txt" "$PLUGIN_DIR/blacklist.txt" 2>/dev/null
 chmod 664 "$PLUGIN_DIR/whitelist.txt" "$PLUGIN_DIR/blacklist.txt" 2>/dev/null
 
-# Allow fpp user to chmod FPP shared memory files for pixel-accurate text rendering.
-# FPP creates /dev/shm/FPP-Model-Data-* as root AFTER postStart.sh runs, so the
-# plugin needs to be able to fix permissions at runtime without a FPPD restart.
+# Allow the fpp user to make FPP shared-memory files writable for pixel-accurate text
+# rendering. FPP creates /dev/shm/FPP-Model-Data-* as root AFTER postStart.sh runs, so the
+# plugin needs to fix permissions at runtime without a FPPD restart.
+#
+# SECURITY: instead of granting a broad `chmod 666 /dev/shm/FPP-Model-Data-*` (whose sudo
+# wildcard can match a slash, letting a crafted model name traverse to arbitrary files),
+# we install a small ROOT-OWNED wrapper that validates its argument and only ever touches
+# a single file inside /dev/shm, and grant sudo to that wrapper alone.
+SHM_HELPER="/usr/local/bin/tml-fix-shm-perms"
+install -o root -g root -m 0755 "$PLUGIN_DIR/scripts/tml-fix-shm-perms" "$SHM_HELPER" 2>/dev/null \
+    || { cp "$PLUGIN_DIR/scripts/tml-fix-shm-perms" "$SHM_HELPER"; chown root:root "$SHM_HELPER"; chmod 0755 "$SHM_HELPER"; }
+
 SUDOERS_FILE="/etc/sudoers.d/90-fpp-sms-shm"
-echo "fpp ALL=(ALL) NOPASSWD: /usr/bin/chmod 666 /dev/shm/FPP-Model-Data-*" > "$SUDOERS_FILE"
+echo "fpp ALL=(ALL) NOPASSWD: $SHM_HELPER" > "$SUDOERS_FILE"
 chmod 0440 "$SUDOERS_FILE"
-log_and_show "Sudoers rule installed for pixel rendering (shm access)"
+# Validate the sudoers file; remove it if malformed so we never wedge sudo.
+if command -v visudo >/dev/null 2>&1 && ! visudo -cf "$SUDOERS_FILE" >/dev/null 2>&1; then
+    rm -f "$SUDOERS_FILE"
+    log_and_show "WARNING: sudoers rule failed validation and was removed; shm fixes will need a FPPD restart"
+else
+    log_and_show "Sudoers rule installed for pixel rendering (shm access, validated wrapper)"
+fi
 
 # Set permissions on config/logs directories
 chown -R fpp:fpp /home/fpp/media/config /home/fpp/media/logs 2>/dev/null

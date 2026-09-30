@@ -1,0 +1,78 @@
+{
+	"repoName": "fpp-plugin-textmylights",
+	"name": "Text My Lights",
+	"author": "Nick Spica (thespica93)",
+	"description": "Viewers text a name that appears on your light display — via Twilio SMS or Google Voice. Includes message queueing, profanity filtering, name whitelist/blocklist, auto-responses, per-phone rate limiting, and duplicate detection.",
+	"homeURL": "https://github.com/thespica93/fpp-plugin-textmylights",
+	"srcURL": "https://github.com/thespica93/fpp-plugin-textmylights.git",
+	"bugURL": "https://github.com/thespica93/fpp-plugin-textmylights/issues",
+	"allowUpdates": 1,
+	"releaseNotesStyle": "gitHistory",
+	"versions": [
+		{
+			"minFPPVersion": "9.0",
+			"maxFPPVersion": "9.99",
+			"branch": "beta",
+			"sha": ""
+		},
+		{
+			"minFPPVersion": "10.0",
+			"maxFPPVersion": "0",
+			"branch": "beta",
+			"sha": ""
+		}
+	],
+	"dependencies": {
+		"python": ["flask==3.0.0", "twilio==8.10.0", "requests==2.31.0", "Pillow"]
+	},
+	"privacy": {
+		"summary": "Names people text to your show are relayed through your Twilio or Google Voice account and shown on your lights; sender phone numbers and messages are stored on this device to run the display.",
+		"sends": [
+			{
+				"to": "api.twilio.com",
+				"what": "Reads inbound SMS (sender number + text) from your Twilio account; sends optional reply texts",
+				"why": "Receive the names people text and optionally reply",
+				"alwaysOn": false
+			},
+			{
+				"to": "Gmail (imap.gmail.com / smtp.gmail.com)",
+				"what": "Reads Google Voice SMS-to-email (sender + text) from your Gmail; can send optional replies",
+				"why": "Receive texted names when Google Voice is the source",
+				"alwaysOn": false
+			}
+		],
+		"collects": [
+			{
+				"what": "Sender phone numbers and texted names/messages",
+				"about": "visitors",
+				"keptDays": 7,
+				"canDelete": false,
+				"where": "/home/fpp/media/plugin.fpp-textmylights/logs/messages/"
+			},
+			{
+				"what": "Blocked and approved phone numbers / names",
+				"about": "visitors",
+				"keptDays": null,
+				"canDelete": true,
+				"where": "/home/fpp/media/plugin.fpp-textmylights/"
+			},
+			{
+				"what": "Your Twilio auth token and Gmail app password",
+				"about": "operator",
+				"keptDays": null,
+				"canDelete": true,
+				"where": "/home/fpp/media/plugin.fpp-textmylights/secrets/credentials.json"
+			}
+		],
+		"sensors": [],
+		"remoteAccess": "lan",
+		"systemChanges": [
+			{
+				"kind": "privilege",
+				"what": "Adds an /etc/sudoers.d rule allowing chmod of the overlay model's shared-memory file for pixel rendering"
+			}
+		],
+		"closedCode": false,
+		"other": "Credentials are stored in an owner-only (0600) file and are removed on uninstall. The plugin also installs FPP scheduler command scripts (TextMyLightsStart/Stop). No data is sent anywhere except your own Twilio/Google accounts."
+	}
+}

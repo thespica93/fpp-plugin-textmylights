@@ -72,7 +72,7 @@ CONFIG_FILE     = os.path.join(PLUGIN_DATA_DIR, "plugin.json")
 # the same card. This keeps them out of the shared config and off casual view.)
 SECRETS_DIR     = os.path.join(PLUGIN_DATA_DIR, "secrets")
 SECRETS_FILE    = os.path.join(SECRETS_DIR, "credentials.json")
-SECRET_KEYS     = ("twilio_auth_token", "gv_app_password", "sync_key")
+SECRET_KEYS     = ("twilio_auth_token", "gv_app_password")
 # Placeholder shown in a saved secret field. Submitting it unchanged means
 # "keep the stored secret"; clearing the field to empty means "remove it";
 # any other value updates it. Must be something a real secret never equals.
@@ -233,14 +233,13 @@ def _require_access_token():
                             f"{AUTH_DISABLE_FILE} to re-enable access control.")
         return None
     # Inter-instance calls (a master pushing to a remote's /api/tml/* endpoints) come from
-    # a different IP, so the per-instance access token won't match. Authenticate them with
-    # the shared sync_key instead — constant-time, and only when one is configured.
-    _sk = (config.get('sync_key') or '').strip()
-    if _sk and request.path.startswith('/api/tml/'):
-        hdr = request.headers.get('X-TML-Sync-Key', '')
-        if hdr and _secrets.compare_digest(hdr, _sk):
+    # another FPP on the LAN, so the per-instance access token won't match. Instead of a
+    # shared secret, trust the FPP MultiSync peers this box already recognizes (the same
+    # systems FPP itself syncs with), plus any manually-listed remote IPs.
+    if request.path.startswith('/api/tml/'):
+        if request.remote_addr in _trusted_tml_peers():
             return None
-        return Response("Invalid sync key.", status=403, mimetype='text/plain')
+        return Response("Not a recognized FPP peer.", status=403, mimetype='text/plain')
     # First load carries the token as a query param (embedded by the FPP UI);
     # we then set a cookie so subsequent same-origin fetches are authorized.
     qtok = request.args.get('token', '')
@@ -307,10 +306,6 @@ DEFAULT_CONFIG = {
     #   "remote" — never polls/responds/counts; only renders name + content pushed by the
     #              master, using this instance's OWN overlay model / fonts / layout.
     "plugin_role": "",
-    # Shared secret, identical on every instance, authenticating inter-instance /api/tml/*
-    # calls (a master calling a remote comes from a non-loopback IP, so the per-instance
-    # access token wouldn't match). Treated as a secret (masked, owner-only file).
-    "sync_key": "",
     # Discovery of peer instances for the master's push. Auto uses FPP MultiSync
     # (/api/fppd/multiSyncSystems); manual list is a fallback / override (IPs or host:port).
     "auto_discover_remotes": True,
@@ -444,26 +439,60 @@ _resolved_role = None            # cached effective role ("master"/"remote")
 _remotes_cache = []              # cached list of remote base URLs the master pushes to
 _remotes_cache_time = 0.0
 _REMOTES_CACHE_TTL = 30          # seconds between MultiSync discovery refreshes
+_tml_peer_cache = set()          # cached IPs allowed to call /api/tml/* (FPP peers)
+_tml_peer_cache_time = 0.0
 _remote_last_state = None        # remote side: last state applied from a master push
 _remote_last_state_time = 0.0
+_last_fpp_mode = None            # last-seen FPP mode role, for the auto-follow watcher
 
 
-def _default_plugin_role():
-    """Suggested default role from the FPP instance's own mode: 'remote' when FPP is in
-    remote mode, else 'master'. Queried from /api/fppd/status; defaults to 'master' (the
-    full-function role, correct for a lone box) if FPP can't be reached."""
+def _fpp_mode_role():
+    """The plugin role implied by FPP's CURRENT mode — 'remote' when FPP is in remote mode,
+    else 'master' — or None when FPP can't be reached (so callers don't act on a transient
+    failure). Read from /api/fppd/status (mode_name/mode; REMOTE_MODE == 8)."""
     try:
         r = requests.get(f"{FPP_HOST}/api/fppd/status", timeout=3)
         if r.status_code == 200:
             data = r.json()
             mode_name = str(data.get('mode_name', '')).lower()
-            mode_num = data.get('mode')
-            # FPP mode: 'remote' by name, or the legacy numeric remote mode (8).
-            if 'remote' in mode_name or mode_num == 8:
+            if 'remote' in mode_name or data.get('mode') == 8:
                 return 'remote'
+            return 'master'
     except Exception as e:
-        logging.debug(f"_default_plugin_role: FPP status unavailable ({e})")
-    return 'master'
+        logging.debug(f"_fpp_mode_role: FPP status unavailable ({e})")
+    return None
+
+
+def _default_plugin_role():
+    """Suggested default role from FPP's mode; 'master' (the full-function role, correct for a
+    lone box) when FPP can't be reached."""
+    return _fpp_mode_role() or 'master'
+
+
+def fpp_mode_watcher():
+    """Keep the plugin role in lockstep with the FPP instance's own mode: when FPP switches to
+    remote the plugin becomes a remote; when FPP switches to player the plugin becomes master.
+    Acts only on an actual FPP mode CHANGE, so a manual toggle persists until FPP changes next."""
+    global _last_fpp_mode, _resolved_role
+    while True:
+        try:
+            role = _fpp_mode_role()   # None while FPP is unreachable → ignore
+            # Adopt FPP's mode on the first successful read (startup) and whenever it changes.
+            if role is not None and role != _last_fpp_mode:
+                first = _last_fpp_mode is None
+                _last_fpp_mode = role
+                if (config.get('plugin_role') or '') != role:
+                    logging.info(f"🔀 {'Following FPP mode at startup' if first else 'FPP mode changed'} "
+                                 f"→ plugin role now '{role}'")
+                    config['plugin_role'] = role
+                    _resolved_role = None
+                    try:
+                        save_config()
+                    except Exception:
+                        pass
+        except Exception as e:
+            logging.debug(f"fpp_mode_watcher: {e}")
+        time.sleep(15)
 
 
 def get_plugin_role():
@@ -516,20 +545,52 @@ def _parse_host_port(target, default_port=5000):
     return t, default_port
 
 
+def _multisync_addresses():
+    """IP addresses of the FPP systems this box knows via MultiSync (excludes self)."""
+    addrs = set()
+    try:
+        r = requests.get(f"{FPP_HOST}/api/fppd/multiSyncSystems", timeout=3)
+        if r.status_code == 200:
+            data = r.json()
+            systems = data.get('systems') if isinstance(data, dict) else data
+            local = _local_ips()
+            for s in (systems or []):
+                if not isinstance(s, dict):
+                    continue
+                a = str(s.get('address') or s.get('ip') or '').strip()
+                if a and a not in local and not s.get('local'):
+                    addrs.add(a)
+    except Exception as e:
+        logging.debug(f"_multisync_addresses: failed ({e})")
+    return addrs
+
+
+def _trusted_tml_peers():
+    """IPs allowed to call this instance's /api/tml/* endpoints WITHOUT the access token:
+    the FPP MultiSync peers this box already recognizes, plus any manual remote_targets.
+    No shared secret — trust follows FPP's own sync network. Cached briefly."""
+    global _tml_peer_cache, _tml_peer_cache_time
+    now = time.time()
+    if _tml_peer_cache and (now - _tml_peer_cache_time) < _REMOTES_CACHE_TTL:
+        return _tml_peer_cache
+    peers = set(_multisync_addresses())
+    for t in (config.get('remote_targets') or []):
+        hp = _parse_host_port(t)
+        if hp:
+            peers.add(hp[0])
+    _tml_peer_cache, _tml_peer_cache_time = peers, now
+    return peers
+
+
 def discover_remotes(force=False):
     """Return the base URLs of peer instances the master should push to — ONLY FPP systems
     that actually run this plugin AND are set to remote mode (confirmed via /api/tml/ping).
     Candidates come from FPP MultiSync (/api/fppd/multiSyncSystems) and the manual
-    remote_targets list. Cached briefly. Returns [] when no sync_key is configured."""
+    remote_targets list. Cached briefly."""
     global _remotes_cache, _remotes_cache_time
     now = time.time()
     if not force and _remotes_cache and (now - _remotes_cache_time) < _REMOTES_CACHE_TTL:
         return _remotes_cache
-
-    sk = (config.get('sync_key') or '').strip()
-    if not sk:
-        _remotes_cache, _remotes_cache_time = [], now
-        return []
 
     candidates = []
     for t in (config.get('remote_targets') or []):
@@ -538,25 +599,11 @@ def discover_remotes(force=False):
             candidates.append(hp)
 
     if config.get('auto_discover_remotes', True):
-        try:
-            r = requests.get(f"{FPP_HOST}/api/fppd/multiSyncSystems", timeout=3)
-            if r.status_code == 200:
-                data = r.json()
-                systems = data.get('systems') if isinstance(data, dict) else data
-                local = _local_ips()
-                for s in (systems or []):
-                    if not isinstance(s, dict):
-                        continue
-                    addr = str(s.get('address') or s.get('ip') or '').strip()
-                    if not addr or addr in local or s.get('local'):
-                        continue
-                    candidates.append((addr, 5000))
-        except Exception as e:
-            logging.debug(f"discover_remotes: multiSyncSystems failed ({e})")
+        for addr in _multisync_addresses():
+            candidates.append((addr, 5000))
 
     # Probe each candidate: keep only confirmed textmylights instances in REMOTE mode.
     seen, remotes = set(), []
-    hdr = {'X-TML-Sync-Key': sk}
     for host, port in candidates:
         h = f"[{host}]" if (':' in host and not host.startswith('[')) else host  # bracket IPv6
         base = f"http://{h}:{port}"
@@ -564,7 +611,7 @@ def discover_remotes(force=False):
             continue
         seen.add(base)
         try:
-            pr = requests.get(f"{base}/api/tml/ping", headers=hdr, timeout=2)
+            pr = requests.get(f"{base}/api/tml/ping", timeout=2)
             if pr.status_code == 200:
                 j = pr.json()
                 if j.get('plugin') == 'textmylights' and j.get('role') == 'remote':
@@ -579,11 +626,8 @@ def discover_remotes(force=False):
 def push_state_to_remotes(payload):
     """Master only: fire-and-forget the chosen display state (name + content id + timing —
     never sequence bytes) to every confirmed remote. Runs in a background thread so it never
-    delays the master's own display or SMS reply. No-op unless master with a sync_key set."""
+    delays the master's own display or SMS reply. No-op unless this instance is the master."""
     if get_plugin_role() != 'master':
-        return
-    sk = (config.get('sync_key') or '').strip()
-    if not sk:
         return
 
     def _worker():
@@ -591,10 +635,9 @@ def push_state_to_remotes(payload):
             remotes = discover_remotes()
             if not remotes:
                 return
-            hdr = {'X-TML-Sync-Key': sk}
             for base in remotes:
                 try:
-                    requests.post(f"{base}/api/tml/state", json=payload, headers=hdr, timeout=2)
+                    requests.post(f"{base}/api/tml/state", json=payload, timeout=2)
                 except Exception as e:
                     logging.debug(f"push to {base} failed: {e}")
         except Exception as e:
@@ -603,20 +646,26 @@ def push_state_to_remotes(payload):
     threading.Thread(target=_worker, daemon=True).start()
 
 
-_last_pushed_waiting = None
-
 def _push_waiting_state():
     """Master: tell remotes which waiting/background content is now active (a 'waiting event'
-    — content id only, no name), so remotes mirror rotation picks. Deduped so the repeated
-    image-restore after each name doesn't spam the network."""
-    global _last_pushed_waiting
+    — content id only, no name) so they mirror the master's rotation pick. The remote ignores
+    a push for content it's already showing, so re-sending is harmless."""
     if get_plugin_role() != 'master':
         return
-    cur = _active_waiting_content
-    if cur == _last_pushed_waiting:
-        return
-    _last_pushed_waiting = cur
-    push_state_to_remotes({'content': cur})
+    push_state_to_remotes({'content': _active_waiting_content})
+
+
+def master_sync_heartbeat():
+    """Master: re-assert the current WAITING content to remotes every few seconds so a remote
+    that joins late (rebooted, powered on after the master) converges to the same background.
+    Only fires while idle (no name showing); the remote no-ops if already on that content."""
+    while True:
+        try:
+            if get_plugin_role() == 'master' and currently_displaying is None:
+                push_state_to_remotes({'content': _active_waiting_content})
+        except Exception as e:
+            logging.debug(f"master_sync_heartbeat: {e}")
+        time.sleep(10)
 
 
 def _coerce_len(seq, n, fill):
@@ -4312,15 +4361,13 @@ def index():
                 <div class="column">
                     <div class="section">
                         <h2>🖥️ Projector Role (Master / Remote)</h2>
-                        <p class="help-text">Running the plugin on more than one FPP? The <strong>Master</strong> receives the texts, sends replies, and counts limits; each <strong>Remote</strong> only displays the names the Master pushes to it. One text = one name — no duplicate replies, no double counting.</p>
+                        <p class="help-text">Running the plugin on more than one FPP? The <strong>Master</strong> receives the texts, sends replies, and counts limits; each <strong>Remote</strong> only displays the names the Master pushes to it. One text = one name — no duplicate replies, no double counting. This follows your FPP's mode automatically (FPP <em>Player</em> → Master, FPP <em>Remote</em> → Remote) and updates if you change FPP's mode; override it here if you need to.</p>
                         <label>This instance is:</label>
                         <select id="plugin_role" onchange="onRoleChange()">
                             <option value="master" {{ 'selected' if effective_role != 'remote' else '' }}>Master — handles texts &amp; pushes names</option>
                             <option value="remote" {{ 'selected' if effective_role == 'remote' else '' }}>Remote — only displays pushed names</option>
                         </select>
                         <p class="help-text" id="role_default_hint" style="margin-top:4px;">{% if not config.get('plugin_role') %}Defaulting to <strong>{{ effective_role }}</strong> because this FPP is in <strong>{{ fpp_mode_default_reason }}</strong> mode. Change it above if needed.{% endif %}</p>
-                        <label style="margin-top:10px;">Sync Key <span class="help-text" style="font-weight:normal;">— set the SAME value on every instance; it authenticates the master↔remote connection.</span></label>
-                        <input type="password" id="sync_key" value="{{ secret_sentinel if config.get('sync_key') else '' }}" placeholder="A shared secret, e.g. a random phrase">
                         <div id="master_discovery_box">
                             <label class="toggle-switch" style="margin-top:10px;"><input type="checkbox" id="auto_discover_remotes" {{ 'checked' if config.get('auto_discover_remotes', True) else '' }} onchange="saveConfig()"><span class="toggle-slider"></span></label>
                             <label class="checkbox-label">Auto-discover remotes via FPP MultiSync</label>
@@ -7457,7 +7504,6 @@ var _saveTimer = null;
 
                 const data = {
                     plugin_role: (document.getElementById('plugin_role')||{}).value || 'master',
-                    sync_key: (document.getElementById('sync_key')||{}).value || '',
                     auto_discover_remotes: (document.getElementById('auto_discover_remotes')||{}).checked ?? true,
                     remote_targets: ((document.getElementById('remote_targets')||{}).value || '').split('\\n').map(function(s){return s.trim();}).filter(Boolean),
                     message_source: document.getElementById('message_source').value,
@@ -7937,9 +7983,10 @@ def update_config():
             if not isinstance(raw_rt, list):
                 raw_rt = []
             config['remote_targets'] = [str(t).strip() for t in raw_rt if str(t).strip()][:32]
-        # A role/discovery change invalidates the master's cached remote list.
-        global _remotes_cache_time
+        # A role/discovery change invalidates the cached remote list + trusted-peer set.
+        global _remotes_cache_time, _tml_peer_cache_time
         _remotes_cache_time = 0
+        _tml_peer_cache_time = 0
 
         # Normalize phone number to E.164 (strip spaces, dashes, parens — keep + and digits)
         if config.get('twilio_phone_number'):
@@ -10063,7 +10110,7 @@ def view_messages():
 
 
 # ── Multi-instance (master/remote) endpoints ────────────────────────────────
-# Authenticated by the shared sync_key in _require_access_token (the /api/tml/ prefix).
+# Authenticated in _require_access_token by trusting known FPP MultiSync peers (no secret).
 
 @app.route('/api/tml/ping', methods=['GET'])
 def api_tml_ping():
@@ -10074,8 +10121,11 @@ def api_tml_ping():
 
 def _apply_remote_waiting(content):
     """Remote: switch the base waiting/background layer to the master-pushed content — unless
-    this instance lacks that content, in which case keep whatever is currently showing."""
+    it's already showing that content (no-op, so the master's heartbeat re-push doesn't cause
+    a visible restart), or this instance lacks that content (keep whatever is showing)."""
     content = content or ''
+    if content == _active_waiting_content:
+        return  # already on it — ignore repeat/heartbeat pushes
     if content and not _content_exists_locally(content):
         logging.info(f"ℹ️  Remote: pushed waiting content '{content}' not present — keeping current")
         return
@@ -10217,6 +10267,12 @@ if __name__ == '__main__':
     # and a 2+ item rotation list is configured.
     rotator_thread = threading.Thread(target=waiting_rotator, daemon=True)
     rotator_thread.start()
+
+    # Master heartbeat: keeps remotes' waiting content in sync even if one joins late.
+    threading.Thread(target=master_sync_heartbeat, daemon=True).start()
+
+    # Follow FPP's own mode: switch the plugin role to match when FPP changes player↔remote.
+    threading.Thread(target=fpp_mode_watcher, daemon=True).start()
 
     # Polling thread starts if the selected source is configured — runs in
     # standby (show_not_live replies) when disabled, and processes names normally

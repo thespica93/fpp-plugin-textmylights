@@ -212,6 +212,7 @@ def _load_or_create_token():
     return _tok
 
 ACCESS_TOKEN = _load_or_create_token()
+_auth_disabled_warned_at = 0.0   # throttle the "auth disabled" warning log
 
 @app.before_request
 def _require_access_token():
@@ -221,6 +222,15 @@ def _require_access_token():
     if request.remote_addr in ('127.0.0.1', '::1'):
         return None
     if os.path.exists(AUTH_DISABLE_FILE):
+        # Debug escape hatch — the whole UI is wide open to anyone on the network.
+        # Warn (throttled) so this is never silently left enabled in production.
+        global _auth_disabled_warned_at
+        _now = time.time()
+        if _now - _auth_disabled_warned_at > 300:
+            _auth_disabled_warned_at = _now
+            logging.warning("⚠️  AUTH DISABLED (.disable_auth present) — the plugin is "
+                            "reachable WITHOUT a token by anyone on the network. Remove "
+                            f"{AUTH_DISABLE_FILE} to re-enable access control.")
         return None
     # First load carries the token as a query param (embedded by the FPP UI);
     # we then set a cookie so subsequent same-origin fetches are authorized.
@@ -9829,4 +9839,8 @@ if __name__ == '__main__':
         threading.Thread(target=_start_default, daemon=True).start()
 
     logging.info("Text My Lights plugin starting...")
+    if os.path.exists(AUTH_DISABLE_FILE):
+        logging.warning("⚠️  AUTH DISABLED at startup (.disable_auth present) — access "
+                        "control is OFF for everyone on the network. This is for debugging "
+                        f"only; delete {AUTH_DISABLE_FILE} before normal use.")
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)

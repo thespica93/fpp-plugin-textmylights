@@ -118,7 +118,7 @@ if python3 -c "import requests" >/dev/null 2>&1; then
     log_and_show "[5/7] Requests already installed"
 else
     log_and_show "[5/7] Installing Requests... please wait"
-    pip3 install --break-system-packages --no-cache-dir requests==2.31.0 >> "$LOG" 2>&1
+    pip3 install --break-system-packages --no-cache-dir requests==2.32.3 >> "$LOG" 2>&1
     log_and_show "[5/7] Requests complete"
 fi
 
@@ -200,7 +200,10 @@ fi
 # Set permissions on config/logs directories
 chown -R fpp:fpp /home/fpp/media/config /home/fpp/media/logs 2>/dev/null
 touch /home/fpp/media/logs/sms_plugin.log
-chmod 666 /home/fpp/media/logs/sms_plugin.log
+# 0644, not 0666: the plugin (fpp) writes it and FPP's log viewer reads it, but no other
+# local user should be able to tamper with it. Contains texter phone numbers, so not group/
+# world writable.
+chmod 644 /home/fpp/media/logs/sms_plugin.log
 chown fpp:fpp /home/fpp/media/logs/sms_plugin.log
 
 # Install scheduler scripts into FPP's scripts directory so they appear in

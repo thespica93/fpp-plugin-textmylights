@@ -23,7 +23,7 @@
 		}
 	],
 	"dependencies": {
-		"python": ["flask==3.0.0", "twilio==8.10.0", "requests==2.31.0", "Pillow"]
+		"python": ["flask==3.0.0", "twilio==8.10.0", "requests==2.32.3", "Pillow"]
 	},
 	"privacy": {
 		"summary": "Names people text to your show are relayed through your Twilio or Google Voice account and shown on your lights; sender phone numbers and messages are stored on this device to run the display.",

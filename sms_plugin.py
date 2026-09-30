@@ -4067,7 +4067,7 @@ def index():
                         <div id="fpp_content_inputs">
                             <div style="display:flex; gap:20px; flex-wrap:wrap; align-items:flex-start;">
                               <div style="flex:1; min-width:280px;">
-                            <label>Default "Waiting" Content: <span style="color:#f44336;font-size:12px;">* required</span> <span class="help-text" style="font-weight:normal;margin-left:6px;">📺 Loops while waiting for texts. Add 2+ to rotate between them (each sequence plays fully, then the next starts with no black gap).</span></label>
+                            <label>Default "Waiting" Content: <span style="color:#f44336;font-size:12px;">* required</span> <span class="help-text" style="font-weight:normal;margin-left:6px;">📺 Loops while waiting for texts. Add 2+ to rotate between them (each sequence plays full length.)</span></label>
                             <!-- Hidden legacy single-value select: kept in sync with the first
                                  list item. Drives the canvas preview background + the
                                  deleted-file prune, and is the value saved as default_playlist. -->
@@ -4659,7 +4659,7 @@ def index():
                     <div class="section">
                         <h2>Message Lines</h2>
 
-                        <label style="font-size:11px; color:#888; font-weight:normal;">Use {name} in any line. Empty lines are skipped.</label>
+                        <label style="font-size:11px; color:#888; font-weight:bold;">Use {name} as placeholder for texts in any line. Empty lines are skipped.</label>
                         <style>
                             .line-card { background:#3a3a3a; border:1px solid #555; border-radius:5px; padding:8px 8px 6px; margin-bottom:6px; }
                             .line-row { display:flex; align-items:center; gap:6px; }

@@ -87,6 +87,11 @@ BLOCKLIST_FILE  = os.path.join(PLUGIN_DATA_DIR, "blocked_phones.json")
 FSEQ_SEQUENCE_PATH = '/home/fpp/media/sequences'
 FPP_VIDEOS_PATH    = '/home/fpp/media/videos'
 FPP_IMAGES_PATH    = '/home/fpp/media/images'
+# Root helper (installed by fpp_install.sh) that makes a single
+# /dev/shm/FPP-Model-Data-<model> file writable by the fpp user. The plugin may only
+# invoke THIS via sudo — never `chmod` directly — so a model name can never be abused to
+# change permissions on files outside /dev/shm. The helper re-validates its argument.
+SHM_PERMS_HELPER = '/usr/local/bin/tml-fix-shm-perms'
 FPP_PLAYLISTS_PATH = '/home/fpp/media/playlists'
 FPP_CONFIG_DIR     = '/home/fpp/media/config'
 # FPP keeps Pixel Overlay Models (the "matrix" the plugin draws text onto) as
@@ -158,6 +163,13 @@ import flask.cli
 flask.cli.show_server_banner = lambda *args: None
 
 app = Flask(__name__)
+# Cap request bodies so an oversized upload can't exhaust memory. Config bundles
+# (which may include .fseq content) are the only large uploads; 512 MB is generous
+# for those while still bounding the damage. Applies to every endpoint.
+app.config['MAX_CONTENT_LENGTH'] = 512 * 1024 * 1024
+# Independent guard on a config-import bundle's *decompressed* size — a small .zip can
+# expand to gigabytes (a "zip bomb"). Reject bundles whose contents exceed this.
+MAX_IMPORT_UNCOMPRESSED = 1024 * 1024 * 1024  # 1 GB total across all entries
 
 # ============================================================================
 # NETWORK ACCESS CONTROL
@@ -200,6 +212,7 @@ def _load_or_create_token():
     return _tok
 
 ACCESS_TOKEN = _load_or_create_token()
+_auth_disabled_warned_at = 0.0   # throttle the "auth disabled" warning log
 
 @app.before_request
 def _require_access_token():
@@ -209,6 +222,15 @@ def _require_access_token():
     if request.remote_addr in ('127.0.0.1', '::1'):
         return None
     if os.path.exists(AUTH_DISABLE_FILE):
+        # Debug escape hatch — the whole UI is wide open to anyone on the network.
+        # Warn (throttled) so this is never silently left enabled in production.
+        global _auth_disabled_warned_at
+        _now = time.time()
+        if _now - _auth_disabled_warned_at > 300:
+            _auth_disabled_warned_at = _now
+            logging.warning("⚠️  AUTH DISABLED (.disable_auth present) — the plugin is "
+                            "reachable WITHOUT a token by anyone on the network. Remove "
+                            f"{AUTH_DISABLE_FILE} to re-enable access control.")
         return None
     # First load carries the token as a query param (embedded by the FPP UI);
     # we then set a cookie so subsequent same-origin fetches are authorized.
@@ -947,6 +969,30 @@ def _render_oriented_text_strip(text, font_name, box_w, box_h, color_rgb, orient
         return strip, strip.width, strip.height
 
 
+def _sudo_fix_shm_perms(model_name):
+    """Make /dev/shm/FPP-Model-Data-<model_name> writable by the fpp user via the root
+    helper. The model name is validated here (no path separators) AND again inside the
+    helper, so it can never be used to chmod a file outside /dev/shm — this is the guard
+    against the old broad `sudo chmod 666 /dev/shm/FPP-Model-Data-*` sudoers rule that a
+    crafted model name could abuse for path traversal. Returns True on success."""
+    if not model_name or '/' in model_name or '\x00' in model_name or '\n' in model_name:
+        logging.error(f"Refusing shm permission fix for unsafe model name: {model_name!r}")
+        return False
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['sudo', '-n', SHM_PERMS_HELPER, model_name],
+            capture_output=True, timeout=5
+        )
+        if result.returncode == 0:
+            return True
+        logging.error(f"shm perms helper failed ({result.returncode}): "
+                      f"{result.stderr.decode(errors='replace').strip()}")
+    except Exception as e:
+        logging.error(f"shm perms helper error: {e}")
+    return False
+
+
 def render_to_shm(line_items, model_name, width, height):
     """Render multiple text lines to FPP shared memory, each with its own box, color, font,
     and orientation.
@@ -991,16 +1037,11 @@ def render_to_shm(line_items, model_name, width, height):
         except PermissionError:
             # FPP creates shm files as root after postStart.sh runs.
             # Use the sudoers rule added by fpp_install.sh to fix permissions once.
-            logging.warning(f"render_to_shm: permission denied on {shm_path} — running sudo chmod")
-            import subprocess
-            result = subprocess.run(
-                ['sudo', '-n', '/usr/bin/chmod', '666', shm_path],
-                capture_output=True, timeout=5
-            )
-            if result.returncode == 0:
+            logging.warning(f"render_to_shm: permission denied on {shm_path} — fixing via helper")
+            if _sudo_fix_shm_perms(model_name):
                 _write()
             else:
-                logging.error(f"render_to_shm: sudo chmod failed: {result.stderr.decode().strip()}")
+                logging.error("render_to_shm: shm permission fix failed")
                 logging.error("render_to_shm: restart FPPD to apply shm permissions from postStart.sh")
                 return False
 
@@ -1067,15 +1108,10 @@ def render_image_to_shm(image_path, model_name, width, height, line_items=None):
         try:
             _write()
         except PermissionError:
-            import subprocess
-            result = subprocess.run(
-                ['sudo', '-n', '/usr/bin/chmod', '666', shm_path],
-                capture_output=True, timeout=5
-            )
-            if result.returncode == 0:
+            if _sudo_fix_shm_perms(model_name):
                 _write()
             else:
-                logging.error(f"render_image_to_shm: sudo chmod failed")
+                logging.error(f"render_image_to_shm: shm permission fix failed")
                 return False
 
         logging.info(f"render_image_to_shm: wrote {image_path} → {shm_path}")
@@ -1273,9 +1309,7 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
 
         shm_path = f"/dev/shm/FPP-Model-Data-{model_name}"
         if os.path.exists(shm_path) and not os.access(shm_path, os.W_OK):
-            import subprocess
-            subprocess.run(['sudo', '-n', '/usr/bin/chmod', '666', shm_path],
-                           capture_output=True, timeout=5)
+            _sudo_fix_shm_perms(model_name)
 
         logging.info(f"🎬 animate_lines_via_shm: model={model_name} size={width}x{height} "
                      f"lines={len(prepared)} duration={duration}s")
@@ -4067,7 +4101,7 @@ def index():
                         <div id="fpp_content_inputs">
                             <div style="display:flex; gap:20px; flex-wrap:wrap; align-items:flex-start;">
                               <div style="flex:1; min-width:280px;">
-                            <label>Default "Waiting" Content: <span style="color:#f44336;font-size:12px;">* required</span> <span class="help-text" style="font-weight:normal;margin-left:6px;">📺 Loops while waiting for texts. Add 2+ to rotate between them (each sequence plays fully, then the next starts with no black gap).</span></label>
+                            <label>Default "Waiting" Content: <span style="color:#f44336;font-size:12px;">* required</span> <span class="help-text" style="font-weight:normal;margin-left:6px;">📺 Loops while waiting for texts. Add 2+ to rotate between them (each sequence plays full length.)</span></label>
                             <!-- Hidden legacy single-value select: kept in sync with the first
                                  list item. Drives the canvas preview background + the
                                  deleted-file prune, and is the value saved as default_playlist. -->
@@ -4659,7 +4693,7 @@ def index():
                     <div class="section">
                         <h2>Message Lines</h2>
 
-                        <label style="font-size:11px; color:#888; font-weight:normal;">Use {name} in any line. Empty lines are skipped.</label>
+                        <label style="font-size:11px; color:#888; font-weight:bold;">Use {name} as placeholder for texts in any line. Empty lines are skipped.</label>
                         <style>
                             .line-card { background:#3a3a3a; border:1px solid #555; border-radius:5px; padding:8px 8px 6px; margin-bottom:6px; }
                             .line-row { display:flex; align-items:center; gap:6px; }
@@ -7965,6 +7999,31 @@ def import_config():
             os.path.basename(BLACKLIST_REMOVED_FILE): BLACKLIST_REMOVED_FILE,
         }
 
+        # Reject a "zip bomb": a small archive that expands to a huge amount of data.
+        total_uncompressed = sum(zi.file_size for zi in zf.infolist())
+        if total_uncompressed > MAX_IMPORT_UNCOMPRESSED:
+            return jsonify({"success": False,
+                            "error": "Bundle contents are too large — refusing to import"}), 400
+
+        # Accept ONLY bundles whose every entry is a file this plugin itself writes on
+        # export (settings we know, our content subdirs, or the overlay payload). If the
+        # archive contains anything else, reject the WHOLE import rather than partially
+        # applying it — so a hand-built or tampered .zip can't smuggle stray files in.
+        def _entry_allowed(entry):
+            if entry.endswith('/') or entry == 'manifest.json':
+                return True
+            arc_dir = entry.rsplit('/', 1)[0] if '/' in entry else ''
+            base = os.path.basename(entry)
+            if arc_dir == 'settings':
+                return base in settings_targets
+            return arc_dir in dest_dirs or arc_dir == 'overlay'
+        bad = [e for e in names if not _entry_allowed(e)]
+        if bad:
+            return jsonify({"success": False,
+                            "error": "Bundle contains unexpected files — not a clean "
+                                     "Text My Lights export; import cancelled.",
+                            "unexpected": sorted(bad)[:10]}), 400
+
         for entry in names:
             if entry.endswith('/') or entry == 'manifest.json':
                 continue
@@ -9780,4 +9839,8 @@ if __name__ == '__main__':
         threading.Thread(target=_start_default, daemon=True).start()
 
     logging.info("Text My Lights plugin starting...")
+    if os.path.exists(AUTH_DISABLE_FILE):
+        logging.warning("⚠️  AUTH DISABLED at startup (.disable_auth present) — access "
+                        "control is OFF for everyone on the network. This is for debugging "
+                        f"only; delete {AUTH_DISABLE_FILE} before normal use.")
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)

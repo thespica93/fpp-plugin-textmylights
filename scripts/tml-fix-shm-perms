@@ -1,0 +1,36 @@
+#!/bin/bash
+###############################################################################
+# Text My Lights - shared-memory permission helper (runs as root via sudo)
+#
+# Makes ONE FPP overlay-model shared-memory file writable by the fpp user so the
+# plugin can draw text/images into it. This is the ONLY chmod the plugin is
+# allowed to run as root (see /etc/sudoers.d/90-fpp-sms-shm), replacing the old
+# broad `chmod 666 /dev/shm/FPP-Model-Data-*` rule.
+#
+# It accepts a single model NAME and only ever touches
+#   /dev/shm/FPP-Model-Data-<name>
+# The name is rejected if it is empty or contains a slash, so it can never be
+# used to change permissions on a file outside /dev/shm (no path traversal).
+###############################################################################
+set -eu
+
+name="${1-}"
+
+# Reject empty, or any name containing a path separator or NUL. Without a slash,
+# the target is always a single file directly inside /dev/shm.
+case "$name" in
+    "" | */* )
+        echo "tml-fix-shm-perms: invalid model name" >&2
+        exit 1
+        ;;
+esac
+
+target="/dev/shm/FPP-Model-Data-${name}"
+
+# Only act on a regular file that actually exists; never create anything.
+if [ ! -f "$target" ]; then
+    echo "tml-fix-shm-perms: no such shm file" >&2
+    exit 1
+fi
+
+exec /usr/bin/chmod 666 "$target"

@@ -157,7 +157,8 @@ mkdir -p "$PLUGIN_DATA_DIR/secrets"
 chown -R fpp:fpp "$PLUGIN_DATA_DIR" 2>/dev/null
 chmod 700 "$PLUGIN_DATA_DIR/secrets" 2>/dev/null
 [ -f "$PLUGIN_DATA_DIR/secrets/credentials.json" ] && chmod 600 "$PLUGIN_DATA_DIR/secrets/credentials.json" 2>/dev/null
-log_and_show "Secrets folder ready: $PLUGIN_DATA_DIR/secrets (owner-only)"
+# Log only (not shown in the installer UI) — don't advertise the credentials path.
+echo "Secrets folder ready: $PLUGIN_DATA_DIR/secrets (owner-only)" >> "$LOG"
 
 # whitelist.txt and blacklist.txt ship with the plugin via git.
 # Force git checkout to ensure they are present (FPP update may not pull all files).

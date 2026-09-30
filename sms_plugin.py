@@ -5672,6 +5672,16 @@ def index():
                     var mw = window._canvasModelW || 640;
                     var mh = window._canvasModelH || 360;
 
+                    // Kick off loading of every line's font (no-op if already loaded/loading).
+                    // ensureFontLoaded repaints when a font finishes, so a preview drawn before
+                    // a custom font is ready — the common post-reboot / two-different-fonts case
+                    // — corrects itself without needing to toggle the font dropdown.
+                    if (typeof ensureFontLoaded === 'function') {
+                        for (var _ff = 0; _ff < 4; _ff++) {
+                            try { ensureFontLoaded(getLineFont(_ff)); } catch(e) {}
+                        }
+                    }
+
                     // The model fills the whole canvas -- no off-page margin. Scrolling text
                     // already starts fully hidden on its own (see the scroll-position
                     // simulation below: it starts at loop_start, past the box's own clip
@@ -6939,6 +6949,11 @@ def index():
                 var ff = new FontFace(name, 'url("/api/fonts/file/' + encodeURIComponent(name) + '")');
                 var p = ff.load().then(function(loaded) {
                     document.fonts.add(loaded);
+                    // Repaint once this font is actually available. The preview may have been
+                    // drawn with a fallback before the font finished loading (e.g. right after
+                    // a reboot / fresh page load); this makes it self-heal instead of sticking
+                    // on the wrong font until the user toggles the dropdown. Runs once per font.
+                    if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
                 }).catch(function(err) {
                     console.warn('Font preview load failed for "' + name + '":', err);
                 });

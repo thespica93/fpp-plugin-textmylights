@@ -27,14 +27,29 @@ pip3 uninstall -y --break-system-packages twilio >> "$LOG" 2>&1 && log_and_show 
 pip3 uninstall -y --break-system-packages flask >> "$LOG" 2>&1 && log_and_show "✓ Flask removed"
 pip3 uninstall -y --break-system-packages requests >> "$LOG" 2>&1 && log_and_show "✓ Requests removed"
 
-# Remove configuration files
-log_and_show "Removing configuration files..."
+# Remove ALL plugin data, including STORED CREDENTIALS, so a later reinstall
+# starts clean and never remembers the old account. This directory holds:
+#   • secrets/credentials.json  — Twilio auth token + Gmail app password
+#   • plugin.json               — Gmail address, Twilio account SID / phone number
+#   • blocked_phones.json, queue, message history logs (phone-number PII)
+log_and_show "Removing plugin data and stored credentials..."
+rm -rf /home/fpp/media/plugin.fpp-textmylights
+rm -rf /home/fpp/media/plugin.fpp-sms-twilio          # pre-rename data dir (older installs)
+
+# Legacy scattered config paths from versions before the data-dir migration.
 rm -f /home/fpp/media/config/plugin.fpp-textmylights.json
+rm -f /home/fpp/media/config/plugin.fpp-sms-twilio.json
 rm -f /home/fpp/media/config/blacklist.txt
 rm -f /home/fpp/media/config/whitelist.txt
 rm -f /home/fpp/media/config/blocked_phones.json
 rm -f /home/fpp/media/config/received_messages.json
-log_and_show "✓ Configuration files removed"
+rm -f /home/fpp/media/config/last_message_sid.txt
+
+if [ -e /home/fpp/media/plugin.fpp-textmylights ]; then
+    log_and_show "⚠ Could NOT fully remove the plugin data dir — check permissions/ownership"
+else
+    log_and_show "✓ Plugin data and stored credentials removed"
+fi
 
 # Remove log files
 log_and_show "Removing log files..."

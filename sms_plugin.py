@@ -295,6 +295,16 @@ DEFAULT_CONFIG = {
     "profanity_filter": True,
     "fpp_host": "http://127.0.0.1",
     "default_playlist": "",
+    # Waiting-content rotation list (v2.8+): each item is a background the plugin loops
+    # while idle. Authoritative when non-empty; empty list falls back to the single
+    # default_playlist above (the pre-list behavior). 1 item = play/loop it (no rotation);
+    # 2+ items = the waiting rotator cycles them (round-robin/random), switching at the end
+    # of each sequence (full FSEQ length) with a seamless overlap so there is no black gap.
+    # See select_default_content_item() and waiting_rotator(). default_playlist is kept in
+    # sync with list[0] so the required-field/validation/legacy paths still have a value.
+    "default_content_list": [],
+    "default_content_mode": "roundrobin",   # "roundrobin" | "random"
+    "default_content_rr_index": -1,          # persisted round-robin cursor (index last shown)
     "name_display_playlist": "",
     # Names content list (v2.7+): each name picks one of these items as its background,
     # each item carrying its OWN text layout + duration. Authoritative when non-empty;
@@ -370,6 +380,18 @@ queue_lock = threading.Lock()
 # means the flat-config fallback (name over waiting) is in use.
 _active_name_content = None       # e.g. "seq:Foo" / "img:bar.png" / ""
 _active_display_duration = None   # int seconds for the current display
+
+# The waiting content currently on the output as the BASE layer (what a name composites
+# over, what a name-return reveals, what stop must clear). Set by start_default_playlist()
+# for the single-content case and by the waiting rotator on each switch. Falls back to
+# config['default_playlist'] when unset.
+_active_waiting_content = ''
+# Waiting-content rotator (only rotates when default_content_list has 2+ items and the show
+# is enabled). The thread lives for the whole process, idling otherwise.
+rotator_thread = None
+stop_rotator = True               # pause flag: True = don't switch/idle. Cleared on start.
+rotator_lock = threading.Lock()   # serializes a rotator switch against stop_show_playback teardown
+_fseq_dur_cache = {}              # {seq_name: duration_seconds} — parsed FSEQ lengths
 
 
 def _coerce_len(seq, n, fill):
@@ -457,6 +479,70 @@ def select_names_content_item():
     config["names_content_rr_index"] = idx
     save_config()
     return lst[idx]
+
+
+def _default_item_defaults():
+    """A fresh waiting-content item. `display_duration` is only used for img: items (and as
+    a fallback when a seq's FSEQ length can't be read); seq: items play their full length."""
+    return {"content": "", "display_duration": 30}
+
+
+def _sanitize_default_item(raw):
+    """Coerce a client-supplied waiting item into the canonical {content, display_duration}
+    shape. Never trusts types from the request."""
+    d = _default_item_defaults()
+    if not isinstance(raw, dict):
+        return d
+    d["content"] = str(raw.get("content", "") or "")
+    try:
+        d["display_duration"] = max(1, int(raw.get("display_duration", 30) or 30))
+    except (TypeError, ValueError):
+        d["display_duration"] = 30
+    return d
+
+
+def select_default_content_item():
+    """Pick the next waiting-content item to rotate to, advancing/persisting the cursor.
+    Round-robin walks the list in order; random avoids an immediate repeat. Returns the
+    stored dict, or None when the list is empty (caller falls back to default_playlist)."""
+    lst = config.get("default_content_list", []) or []
+    if not lst:
+        return None
+    if len(lst) == 1:
+        config["default_content_rr_index"] = 0
+        return lst[0]
+    mode = config.get("default_content_mode", "roundrobin")
+    prev = config.get("default_content_rr_index", -1)
+    if mode == "random":
+        choices = [i for i in range(len(lst)) if i != prev] or list(range(len(lst)))
+        idx = random.choice(choices)
+    else:
+        idx = (prev + 1) % len(lst)
+    config["default_content_rr_index"] = idx
+    save_config()
+    return lst[idx]
+
+
+def _fseq_duration_seconds(content):
+    """Return the play length (seconds, rounded up) of a seq: waiting item from its FSEQ
+    header, or None if it can't be determined. Cached by sequence name."""
+    if not content or not content.startswith('seq:'):
+        return None
+    seq_name = os.path.basename(content[4:].removesuffix('.fseq'))  # filename only, no traversal
+    if seq_name in _fseq_dur_cache:
+        return _fseq_dur_cache[seq_name]
+    dur = None
+    try:
+        filepath = os.path.join(FSEQ_SEQUENCE_PATH, seq_name + '.fseq')
+        if os.path.exists(filepath):
+            hdr = parse_fseq_header(filepath)
+            ms = hdr.get('duration_ms', 0)
+            if ms and ms > 0:
+                dur = max(1, (int(ms) + 999) // 1000)   # ceil to whole seconds
+    except Exception as e:
+        logging.warning(f"Could not read FSEQ length for {seq_name}: {e}")
+    _fseq_dur_cache[seq_name] = dur
+    return dur
 
 
 def load_config():
@@ -997,6 +1083,36 @@ def render_image_to_shm(image_path, model_name, width, height, line_items=None):
     except Exception as e:
         logging.error(f"render_image_to_shm failed: {e}")
         return False
+
+
+def _overlay_model_dims():
+    """Resolve the overlay model's pixel size (width, height) — the resolution every image
+    and text frame is force-scaled to. Prefer the values stored in config (written when the
+    model is picked in the UI); if either is missing/0 (stale or never-saved config), fetch
+    the model's real dimensions live from FPP and cache them back so image waiting content
+    never silently fails to render. Returns (0, 0) only when the size is truly unknown."""
+    mw = int(config.get('overlay_model_width', 0) or 0)
+    mh = int(config.get('overlay_model_height', 0) or 0)
+    if mw > 0 and mh > 0:
+        return mw, mh
+    model = config.get('overlay_model_name', '')
+    if not model:
+        return mw, mh
+    try:
+        for m in get_fpp_models():
+            if m.get('name') == model and int(m.get('width', 0) or 0) > 0 and int(m.get('height', 0) or 0) > 0:
+                mw, mh = int(m['width']), int(m['height'])
+                config['overlay_model_width'] = mw
+                config['overlay_model_height'] = mh
+                try:
+                    save_config()
+                except Exception:
+                    pass
+                logging.info(f"📐 Overlay model dims resolved live from FPP: {model} = {mw}x{mh}")
+                return mw, mh
+    except Exception as e:
+        logging.warning(f"Could not resolve overlay model dims live from FPP: {e}")
+    return mw, mh
 
 
 def _fseq_fps_for_content(content, default=30.0):
@@ -2604,8 +2720,7 @@ def send_to_fpp(name):
                 state_url = f"{fpp_host}/api/overlays/model/{encoded_model}/state"
                 text_url  = f"{fpp_host}/api/overlays/model/{encoded_model}/text"
 
-                mw = config.get('overlay_model_width', 0)
-                mh = config.get('overlay_model_height', 0)
+                mw, mh = _overlay_model_dims()
                 logging.info(f"📐 Overlay: model={overlay_model} overlay_size={mw}x{mh} "
                              f"lines={len(all_items)} moving={any_moving} PIL={PIL_AVAILABLE}")
 
@@ -2618,7 +2733,7 @@ def send_to_fpp(name):
                 # Both static AND scrolling text composite over the image background now
                 # (static via render_image_to_shm, scrolling via animate_lines_via_shm's
                 # bg_image_path).
-                img_source = name_playlist if name_playlist else config.get('default_playlist', '')
+                img_source = name_playlist if name_playlist else (_active_waiting_content or config.get('default_playlist', ''))
                 img_bg_path = None
                 if img_source.startswith('img:'):
                     img_bg_path = os.path.join(FPP_IMAGES_PATH, img_source[4:])
@@ -2657,7 +2772,7 @@ def send_to_fpp(name):
                         # clock FPP outputs the sequence at. The background is the names
                         # seq: if one is set, else the default waiting seq:.
                         bg_content = (name_playlist if (name_playlist and name_playlist.startswith('seq:'))
-                                      else config.get('default_playlist', ''))
+                                      else (_active_waiting_content or config.get('default_playlist', '')))
                         anim_fps = _fseq_fps_for_content(bg_content)
                         logging.info(f"🎞️  Overlay animation fps={anim_fps} (bg={bg_content or 'none'}, "
                                      f"img={'yes' if img_bg_path else 'no'})")
@@ -2719,17 +2834,22 @@ def _start_video_looping(_fpp_host, _vid_name):
     return False
 
 
-def start_default_playlist():
-    """Start the configured default waiting playlist/sequence.
-    For sequences (seq:), uses FSEQ Effect (loop=true, background=true) so it loops
-    seamlessly as a background effect."""
+def start_default_playlist(content=None):
+    """Start a single waiting content item (playlist/sequence/image) and record it as the
+    active base layer. `content` defaults to config['default_playlist']; the rotator and the
+    image-restore path pass an explicit item. For sequences (seq:), uses FSEQ Effect
+    (loop=true, background=true) so it loops seamlessly as a background effect."""
+    global _active_waiting_content
     import urllib.parse
     fpp_host = FPP_HOST
-    default_playlist = config.get('default_playlist', '')
+    default_playlist = content if content is not None else config.get('default_playlist', '')
 
     if not default_playlist:
         logging.info("ℹ️  No default playlist configured — skipping auto-start")
         return False
+
+    # This content becomes the base waiting layer (what names composite over / return to).
+    _active_waiting_content = default_playlist
 
     try:
         if default_playlist.startswith('seq:'):
@@ -2757,8 +2877,7 @@ def start_default_playlist():
             img_name = default_playlist[4:]
             img_path = os.path.join(FPP_IMAGES_PATH, img_name)
             overlay_model = config.get('overlay_model_name', '')
-            mw = config.get('overlay_model_width', 0)
-            mh = config.get('overlay_model_height', 0)
+            mw, mh = _overlay_model_dims()   # falls back to a live FPP lookup if config dims are 0
             if PIL_AVAILABLE and overlay_model and mw > 0 and mh > 0 and os.path.exists(img_path):
                 ok = render_image_to_shm(img_path, overlay_model, mw, mh)
                 if ok:
@@ -2790,6 +2909,146 @@ def start_default_playlist():
         return False
 
 
+def _switch_waiting_content(new_content, prev_content):
+    """Seamlessly switch the base waiting layer from prev_content to new_content with NO
+    black gap: the new content is started FIRST (a later-started FSEQ effect / an opaque
+    image overlay renders on top), and only THEN is the previous content torn down. Updates
+    _active_waiting_content. Used by the rotator; safe to call with prev_content == '' for
+    the first item."""
+    global _active_waiting_content
+    import urllib.parse
+    fpp_host = FPP_HOST
+    if not new_content:
+        return False
+
+    # 1) Bring up the NEW content on top of whatever is currently showing.
+    ok = start_default_playlist(new_content)   # sets _active_waiting_content = new_content
+
+    # 2) Tear down the PREVIOUS content now that the new one covers it. Never touch it when
+    #    it's the same file (a repeat) — that would stop what we just started.
+    try:
+        if prev_content and prev_content != new_content:
+            if prev_content.startswith('seq:'):
+                seq_name = prev_content[4:].removesuffix('.fseq')
+                requests.get(f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(seq_name)}", timeout=3)
+                logging.info(f"⏹️  Rotator stopped previous waiting seq: {seq_name}")
+            elif prev_content.startswith('img:') and not new_content.startswith('img:'):
+                # Previous was an opaque image overlay and the new content is a seq/playlist
+                # underneath — turn the overlay off so the new content shows through.
+                overlay_model = config.get('overlay_model_name', '')
+                if overlay_model:
+                    enc = urllib.parse.quote(overlay_model)
+                    requests.put(f"{fpp_host}/api/overlays/model/{enc}/state", json={"State": 0}, timeout=3)
+                    logging.info("🧹 Rotator cleared previous waiting image overlay")
+            # img: → img: needs nothing (new render already overwrote the overlay buffer).
+    except Exception as e:
+        logging.warning(f"Rotator teardown of previous waiting content failed: {e}")
+    return ok
+
+
+def _rotator_should_idle():
+    """The rotator only rotates when NOT paused, the show is enabled, and 2+ waiting items
+    are configured. Otherwise it idles (single-content / disabled / stopped)."""
+    if stop_rotator or not config.get('enabled', False):
+        return True
+    return len((config.get('default_content_list', []) or [])) < 2
+
+
+def _rotator_busy():
+    """True while a name owns the display — the rotator holds the current waiting content
+    (looping underneath) rather than switching, and resumes once the queue drains."""
+    with queue_lock:
+        return (currently_displaying is not None) or (len(message_queue) > 0)
+
+
+def _waiting_hold_seconds(content):
+    """How long to keep `content` on screen before rotating: the full sequence length for
+    seq: (from the FSEQ header), else the matching list item's display_duration, else 30."""
+    d = _fseq_duration_seconds(content)
+    if d:
+        return d
+    for it in (config.get('default_content_list', []) or []):
+        if it.get('content') == content:
+            return int(it.get('display_duration', 30) or 30)
+    return 30
+
+
+def waiting_rotator():
+    """Long-lived daemon that rotates the waiting-content list while the show is idle.
+
+    Rotates only when 2+ items are configured and the show is enabled/not paused. Model:
+    HOLD the currently-active item for its full length, THEN advance to the next — so the
+    first item (brought up by start_waiting_content) plays fully before rotation begins.
+    Rotation is suspended while a name owns the display; the current waiting content keeps
+    looping underneath and the name composites on top."""
+    logging.info("🔁 Waiting rotator thread started")
+    while True:
+        try:
+            if _rotator_should_idle() or _rotator_busy():
+                time.sleep(0.5)
+                continue
+
+            # 1) Make sure SOMETHING valid is up (first tick, or the active item was removed
+            #    from the list). start_waiting_content normally brings up item 0 already.
+            with rotator_lock:
+                if _rotator_should_idle():
+                    continue
+                contents = [it.get('content', '') for it in (config.get('default_content_list', []) or [])]
+                if not _active_waiting_content or _active_waiting_content not in contents:
+                    item = select_default_content_item()
+                    if item and item.get('content'):
+                        _switch_waiting_content(item['content'], _active_waiting_content)
+                cur = _active_waiting_content
+
+            # 2) Hold the current item for its full length, waking early to stop/pause, when
+            #    disabled, or when a name arrives. Fire the overlap-switch a hair BEFORE the
+            #    natural end so the next content covers the tail instead of the current
+            #    (loop=true) sequence briefly restarting from frame 0 — a seamless handoff.
+            hold = _waiting_hold_seconds(cur)
+            logging.info(f"🔁 Rotator showing waiting content '{cur}' for {hold}s")
+            deadline = time.time() + max(0.5, hold - 0.25)
+            while time.time() < deadline and not _rotator_should_idle() and not _rotator_busy():
+                time.sleep(min(0.5, max(0.05, deadline - time.time())))
+
+            # 3) Advance to the next item — but never switch under a name or after a stop
+            #    (re-checked under the lock). If busy, loop back and re-hold the current item.
+            if _rotator_should_idle() or _rotator_busy():
+                continue
+            with rotator_lock:
+                if _rotator_should_idle() or _rotator_busy():
+                    continue
+                nxt = select_default_content_item()
+                if nxt and nxt.get('content') and nxt['content'] != _active_waiting_content:
+                    _switch_waiting_content(nxt['content'], _active_waiting_content)
+        except Exception as e:
+            logging.error(f"Error in waiting_rotator: {e}")
+            time.sleep(1.0)
+
+
+def start_waiting_content():
+    """Start the waiting background layer. With a rotation list of 2+ items, bring up the
+    first item and un-pause the (always-running) rotator; otherwise start the single
+    default_playlist / the sole list item exactly as before. Returns True if something was
+    started."""
+    global stop_rotator
+    lst = config.get('default_content_list', []) or []
+
+    if len(lst) >= 2:
+        stop_rotator = False   # un-pause the rotator
+        # Bring up the first item immediately so there's no gap before the rotator's first
+        # tick; ongoing rotation is handled by the thread.
+        with rotator_lock:
+            first = select_default_content_item()
+            if first and first.get('content'):
+                return _switch_waiting_content(first['content'], _active_waiting_content)
+        return False
+
+    # 0–1 items: single-content behavior. A 1-item list uses that item; else default_playlist.
+    if len(lst) == 1 and lst[0].get('content'):
+        return start_default_playlist(lst[0]['content'])
+    return start_default_playlist()
+
+
 def return_to_default_playlist():
     """Clear text overlay and stop the names sequence/playlist.
     If the default is a seq: (FSEQ Effect background), the background auto-resumes.
@@ -2811,7 +3070,9 @@ def return_to_default_playlist():
         # Stop whatever names content was ACTUALLY shown for this name (round-robin/random
         # picks per name), not the static config key. Falls back to the flat key.
         name_playlist   = _active_name_content if _active_name_content is not None else config.get('name_display_playlist', '')
-        default_content = config.get('default_playlist', '')
+        # The base waiting layer to return to is whatever is CURRENTLY active (the rotator
+        # holds this steady during a name display), falling back to the single default.
+        default_content = _active_waiting_content or config.get('default_playlist', '')
         returning_to_image = default_content.startswith('img:')
 
         # Kill the name's scroll animation and wait for it to fully exit BEFORE we write
@@ -2838,7 +3099,7 @@ def return_to_default_playlist():
             # No names content configured. Nothing on the output to stop (seq:/playlist
             # waiting was never stopped); just restore the overlay for the waiting content.
             if returning_to_image:
-                start_default_playlist()   # image + State 2, overwrites overlay, no blank
+                start_default_playlist(default_content)   # image + State 2, overwrites overlay, no blank
                 logging.info("ℹ️  No names playlist — restored img waiting (no blank)")
             else:
                 _clear_overlay()
@@ -2870,7 +3131,7 @@ def return_to_default_playlist():
         #      underneath) or the bare output shows through. No blank either (the
         #      background was there the whole time).
         if returning_to_image:
-            start_default_playlist()
+            start_default_playlist(default_content)
             logging.info("🖼️  Restored img waiting content (no blank)")
         else:
             _clear_overlay()
@@ -2890,6 +3151,20 @@ def stop_show_playback():
     (If the plugin's own waiting content is itself a foreground playlist/video —
     not a background effect — we stop that one playlist, since in that case it IS
     the plugin's own foreground.)"""
+    global stop_rotator, _active_waiting_content
+    # Pause the waiting rotator and hold its lock across teardown so it can't start a new
+    # item mid-stop (it re-checks the pause flag under this same lock before switching).
+    stop_rotator = True
+    try:
+        with rotator_lock:
+            _stop_show_playback_locked()
+    except Exception as e:
+        logging.warning(f"Could not stop FPP playback: {e}")
+
+
+def _stop_show_playback_locked():
+    """Teardown body of stop_show_playback, run while holding rotator_lock."""
+    global _active_waiting_content
     try:
         import urllib.parse
 
@@ -2897,11 +3172,13 @@ def stop_show_playback():
         # buffer after we clear it below.
         _stop_scroll_thread()
 
-        # Stop the plugin's own background FSEQ effects: the waiting content, the flat
-        # name content, and every seq: item in the names list (any could be the one
-        # currently looping). FSEQ Effect Stop on a non-running seq is harmless.
+        # Stop the plugin's own background FSEQ effects: the single waiting content, every
+        # seq: item in the WAITING rotation list, the flat name content, and every seq: item
+        # in the names list (any could be the one currently looping). FSEQ Effect Stop on a
+        # non-running seq is harmless.
+        _wait_seq = [it.get('content', '') for it in (config.get('default_content_list', []) or [])]
         _names_seq = [it.get('content', '') for it in (config.get('names_content_list', []) or [])]
-        for content in [config.get('default_playlist', ''), config.get('name_display_playlist', ''), *_names_seq]:
+        for content in [config.get('default_playlist', ''), config.get('name_display_playlist', ''), *_wait_seq, *_names_seq]:
             if content.startswith('seq:'):
                 seq_name = content[4:].removesuffix('.fseq')
                 r = requests.get(f"{FPP_HOST}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(seq_name)}", timeout=3)
@@ -2921,6 +3198,10 @@ def stop_show_playback():
         if default and not default.startswith(('seq:', 'img:')):
             r = requests.get(f"{FPP_HOST}/api/playlists/stop", timeout=3)
             logging.info(f"🛑 Stopped plugin foreground playlist: {r.status_code}")
+
+        # Nothing is on the output now — clear the active-waiting marker so a later restart
+        # brings its first item up as a clean switch rather than a same-file no-op.
+        _active_waiting_content = ''
     except Exception as e:
         logging.warning(f"Could not stop FPP playback: {e}")
 
@@ -3784,11 +4065,29 @@ def index():
                             🔴 <strong>Plugin is Live</strong> — run Text My Lights Stop to edit
                         </div>
                         <div id="fpp_content_inputs">
-                            <label>Default "Waiting" Content: <span style="color:#f44336;font-size:12px;">* required</span> <span class="help-text" style="font-weight:normal;margin-left:6px;">📺 This content loops while waiting for text messages</span></label>
-                            <select id="default_playlist">
+                            <div style="display:flex; gap:20px; flex-wrap:wrap; align-items:flex-start;">
+                              <div style="flex:1; min-width:280px;">
+                            <label>Default "Waiting" Content: <span style="color:#f44336;font-size:12px;">* required</span> <span class="help-text" style="font-weight:normal;margin-left:6px;">📺 Loops while waiting for texts. Add 2+ to rotate between them (each sequence plays fully, then the next starts with no black gap).</span></label>
+                            <!-- Hidden legacy single-value select: kept in sync with the first
+                                 list item. Drives the canvas preview background + the
+                                 deleted-file prune, and is the value saved as default_playlist. -->
+                            <select id="default_playlist" style="display:none;">
                                 <option value="">-- Select content --</option>
                             </select>
-
+                            <div id="waiting_content_list_box" style="border:1px solid #ddd; border-radius:5px; padding:10px; background:#fff;">
+                                <div id="waiting_content_items"></div>
+                                <button type="button" onclick="openManageWaitingModal()" style="margin-top:8px; font-size:13px; padding:6px 14px; cursor:pointer; background:#1976d2; color:#fff; border:none; border-radius:4px;">🗂️ Add / Arrange Waiting Content</button>
+                                <div id="waiting_mode_row" style="display:none; margin-top:12px; padding-top:10px; border-top:1px solid #eee;">
+                                    <span style="font-size:13px; color:#555; margin-right:10px;">When a sequence ends, play:</span>
+                                    <label style="margin-right:14px; cursor:pointer; color:#333; font-size:13px;"><input type="radio" name="waiting_mode" value="roundrobin" onchange="onWaitingModeChange('roundrobin')" style="width:auto;margin:0 5px 0 0;vertical-align:middle;">Round Robin (in order)</label>
+                                    <label style="cursor:pointer; color:#333; font-size:13px;"><input type="radio" name="waiting_mode" value="random" onchange="onWaitingModeChange('random')" style="width:auto;margin:0 5px 0 0;vertical-align:middle;">Random</label>
+                                </div>
+                            </div>
+                            <div id="waiting_content_none_warning" style="display:none; background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:5px; padding:8px 12px; margin-top:6px; font-size:13px;">
+                                ⚠️ No Waiting content selected — required before you can Start the show.
+                            </div>
+                              </div>
+                              <div style="flex:1; min-width:280px;">
                             <label>Name Display Content: <span class="help-text" style="font-weight:normal;margin-left:6px;">🎬 Background(s) shown when a name appears. Add one or more — each gets its own text layout on the Display tab.</span></label>
                             <div id="names_content_list_box" style="border:1px solid #ddd; border-radius:5px; padding:10px; background:#fff;">
                                 <div id="names_content_items"></div>
@@ -3801,6 +4100,8 @@ def index():
                             </div>
                             <div id="name_display_none_warning" style="display:none; background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:5px; padding:8px 12px; margin-top:6px; font-size:13px;">
                                 ⚠️ No Names content — names will appear directly over the Waiting content (using the Display-tab text layout).
+                            </div>
+                              </div>
                             </div>
 
                             <!-- Manage Names Content modal: Available (left) → Names list (right), with arrows.
@@ -3831,6 +4132,36 @@ def index():
                                     </div>
                                     <div style="margin-top:16px; display:flex; justify-content:flex-end; gap:8px;">
                                         <button type="button" onclick="closeManageContentModal()" style="background:#2e7d32; color:#fff; padding:8px 20px; border:none; border-radius:4px; cursor:pointer;">Done</button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Manage Waiting Content modal — same two-pane picker as Names, but the
+                                 right list is the waiting-content rotation (no per-item text layout). -->
+                            <div id="manage_waiting_modal" onclick="if(event.target===this)closeManageWaitingModal()" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:100000; align-items:flex-start; justify-content:center; padding-top:24px; box-sizing:border-box;">
+                                <div onclick="event.stopPropagation()" style="background:#fff; color:#333; border-radius:8px; padding:22px; width:94%; max-width:740px; box-shadow:0 8px 30px rgba(0,0,0,0.35); max-height:90vh; overflow:auto; box-sizing:border-box;">
+                                    <h3 style="margin-top:0;">Manage Waiting Content</h3>
+                                    <p class="help-text" style="margin-top:4px;">Select content on the left and click ▶ to add it. With 2+ items the plugin rotates them while idle — each sequence plays its full length, then the next starts seamlessly (no black gap). Reorder with ▲ / ▼ (order matters for Round Robin). Remove with ◀.</p>
+                                    <div style="display:flex; gap:10px; align-items:stretch;">
+                                        <div style="flex:1; min-width:0;">
+                                            <label style="font-size:13px;">Available Content</label>
+                                            <select id="wmng_available" multiple size="12" style="width:100%; height:280px; box-sizing:border-box;"></select>
+                                        </div>
+                                        <div style="display:flex; flex-direction:column; justify-content:center; gap:10px;">
+                                            <button type="button" onclick="wmngAdd()" title="Add to Waiting list" style="padding:6px 10px; cursor:pointer;">▶</button>
+                                            <button type="button" onclick="wmngRemove()" title="Remove from Waiting list" style="padding:6px 10px; cursor:pointer;">◀</button>
+                                        </div>
+                                        <div style="flex:1; min-width:0;">
+                                            <label style="font-size:13px;">Waiting List (in order)</label>
+                                            <select id="wmng_selected" multiple size="12" style="width:100%; height:280px; box-sizing:border-box;"></select>
+                                        </div>
+                                        <div style="display:flex; flex-direction:column; justify-content:center; gap:10px;">
+                                            <button type="button" onclick="wmngMoveUp()" title="Move up" style="padding:6px 10px; cursor:pointer;">▲</button>
+                                            <button type="button" onclick="wmngMoveDown()" title="Move down" style="padding:6px 10px; cursor:pointer;">▼</button>
+                                        </div>
+                                    </div>
+                                    <div style="margin-top:16px; display:flex; justify-content:flex-end; gap:8px;">
+                                        <button type="button" onclick="closeManageWaitingModal()" style="background:#2e7d32; color:#fff; padding:8px 20px; border:none; border-radius:4px; cursor:pointer;">Done</button>
                                     </div>
                                 </div>
                             </div>
@@ -4651,6 +4982,9 @@ def index():
                             window._namesContentModeInit = {{ config.get('names_content_mode', 'roundrobin') | tojson }};
                             window._flatNameContentInit = {{ config.get('name_display_playlist', '') | tojson }};
                             window._flatDisplayDurationInit = {{ config.get('display_duration', 30) | tojson }};
+                            window._waitingContentListInit = {{ (config.get('default_content_list') or []) | tojson }};
+                            window._waitingContentModeInit = {{ config.get('default_content_mode', 'roundrobin') | tojson }};
+                            window._flatDefaultContentInit = {{ config.get('default_playlist', '') | tojson }};
                         </script>
                     </div>
                 </div>
@@ -6158,6 +6492,183 @@ def index():
                 window.collectEditorLayout=collectEditorLayout;
                 window.applyLayoutToEditor=applyLayoutToEditor;
 
+                // ===================== Waiting Content Rotation List =====================
+                window._waitingContentList = Array.isArray(window._waitingContentListInit) ? window._waitingContentListInit : [];
+                window._waitingMode = window._waitingContentModeInit || 'roundrobin';
+
+                // A content value is "missing" if it names a seq:/img: file FPP no longer has.
+                function _waitingIsMissing(val) {
+                    if (!val) return false;
+                    if (val.indexOf('seq:')===0) return (window._fppSeqList||[]).indexOf(val.slice(4))<0;
+                    if (val.indexOf('img:')===0) return (window._fppImgList||[]).indexOf(val.slice(4))<0;
+                    return false;
+                }
+
+                // Render the Waiting list rows + mode toggle + none-warning, and keep the hidden
+                // legacy default_playlist select synced to the first item (drives preview + save).
+                function renderWaitingList() {
+                    var lst=window._waitingContentList||[];
+                    var box=document.getElementById('waiting_content_items');
+                    if (box) {
+                        box.innerHTML='';
+                        if (lst.length===0) {
+                            box.innerHTML='<div style="font-size:13px;color:#777;">No content added yet — click below to choose the sequence(s) that loop while waiting.</div>';
+                        } else {
+                            lst.forEach(function(it, i){
+                                var row=document.createElement('div');
+                                row.style.cssText='display:flex;align-items:center;gap:8px;padding:5px 6px;border-bottom:1px solid #eee;border-radius:3px;';
+                                var label=document.createElement('span');
+                                label.style.cssText='flex:1;font-size:13px;color:#333;';
+                                var miss=_waitingIsMissing(it.content);
+                                label.textContent=(i+1)+'. '+(it.content||'(none)')+(miss?'  ⚠ missing':'');
+                                if (miss) label.style.color='#c62828';
+                                row.appendChild(label);
+                                // Duration control: sequences play their full length; images have
+                                // no natural length, so expose an editable seconds field (default 30).
+                                if ((it.content||'').indexOf('img:')===0) {
+                                    var dwrap=document.createElement('span');
+                                    dwrap.style.cssText='font-size:12px;color:#555;display:flex;align-items:center;gap:4px;';
+                                    var dnum=document.createElement('input');
+                                    dnum.type='number'; dnum.min='1'; dnum.max='3600';
+                                    dnum.value=parseInt(it.display_duration)||30;
+                                    dnum.style.cssText='width:56px;padding:2px 4px;font-size:12px;';
+                                    dnum.title='How long this image shows before rotating';
+                                    dnum.onchange=function(){
+                                        var v=parseInt(dnum.value)||30; if(v<1)v=1;
+                                        dnum.value=v; it.display_duration=v; saveConfig();
+                                    };
+                                    dwrap.appendChild(dnum);
+                                    var secs=document.createElement('span'); secs.textContent='sec';
+                                    dwrap.appendChild(secs);
+                                    row.appendChild(dwrap);
+                                } else if ((it.content||'').indexOf('seq:')===0) {
+                                    var note=document.createElement('span');
+                                    note.style.cssText='font-size:11px;color:#999;';
+                                    note.textContent='full length';
+                                    row.appendChild(note);
+                                }
+                                var del=document.createElement('button');
+                                del.type='button'; del.textContent='✕'; del.title='Remove';
+                                del.style.cssText='background:#f44336;border:none;color:#fff;padding:2px 9px;border-radius:3px;cursor:pointer;font-size:12px;';
+                                del.onclick=function(){ removeWaitingItem(i); };
+                                row.appendChild(del);
+                                box.appendChild(row);
+                            });
+                        }
+                    }
+                    var modeRow=document.getElementById('waiting_mode_row');
+                    if (modeRow) modeRow.style.display=(lst.length>1)?'block':'none';
+                    var rr=document.querySelector('input[name="waiting_mode"][value="roundrobin"]');
+                    var rnd=document.querySelector('input[name="waiting_mode"][value="random"]');
+                    if (rr) rr.checked=(window._waitingMode!=='random');
+                    if (rnd) rnd.checked=(window._waitingMode==='random');
+                    var warn=document.getElementById('waiting_content_none_warning');
+                    if (warn) warn.style.display=(lst.length===0)?'block':'none';
+                    // Sync hidden legacy select to the first item so the preview background and
+                    // the saved default_playlist both track the list.
+                    var dp=document.getElementById('default_playlist');
+                    if (dp) {
+                        var first=(lst.length>0)?(lst[0].content||''):'';
+                        var has=Array.prototype.some.call(dp.options,function(o){return o.value===first;});
+                        if (!has && first) dp.add(new Option(first, first));
+                        dp.value=first;
+                    }
+                    if (typeof window.toggleFseqPreview==='function') window.toggleFseqPreview();
+                }
+
+                function _wmngAvailableOptions() {
+                    var used={}; (window._waitingContentList||[]).forEach(function(it){ used[it.content]=true; });
+                    var out=[];
+                    (window._fppSeqList||[]).forEach(function(s){ var v='seq:'+s; if(!used[v]) out.push({val:v, label:'🎬 '+s}); });
+                    (window._fppImgList||[]).forEach(function(im){ var v='img:'+im; if(!used[v]) out.push({val:v, label:'🖼️ '+im}); });
+                    return out;
+                }
+                function _wmngRenderAvailable() {
+                    var sel=document.getElementById('wmng_available'); if(!sel) return;
+                    sel.innerHTML='';
+                    _wmngAvailableOptions().forEach(function(o){ sel.appendChild(new Option(o.label, o.val)); });
+                }
+                function _wmngRenderSelected(keepIdx) {
+                    var sel=document.getElementById('wmng_selected'); if(!sel) return;
+                    sel.innerHTML='';
+                    (window._waitingContentList||[]).forEach(function(it,i){ sel.appendChild(new Option((i+1)+'. '+(it.content||'(none)'), i)); });
+                    if (keepIdx!=null && keepIdx>=0 && keepIdx<sel.options.length) sel.options[keepIdx].selected=true;
+                }
+                function openManageWaitingModal() {
+                    _wmngRenderAvailable();
+                    _wmngRenderSelected();
+                    try { window.scrollTo(0,0); window.parent.postMessage({type:'scrollTop'},'*'); } catch(e) {}
+                    var m=document.getElementById('manage_waiting_modal'); if(m) m.style.display='flex';
+                }
+                function closeManageWaitingModal() {
+                    var m=document.getElementById('manage_waiting_modal'); if(m) m.style.display='none';
+                    renderWaitingList();
+                    saveConfig();
+                }
+                function wmngAdd() {
+                    var av=document.getElementById('wmng_available'); if(!av) return;
+                    var chosen=Array.prototype.filter.call(av.options,function(o){return o.selected;}).map(function(o){return o.value;});
+                    if (!chosen.length) return;
+                    var lst=window._waitingContentList;
+                    chosen.forEach(function(val){ lst.push({content:val, display_duration:30}); });
+                    _wmngRenderSelected(lst.length-1);
+                    _wmngRenderAvailable();
+                }
+                function wmngRemove() {
+                    var sel=document.getElementById('wmng_selected'); if(!sel) return;
+                    var idxs=Array.prototype.filter.call(sel.options,function(o){return o.selected;}).map(function(o){return parseInt(o.value);});
+                    if (!idxs.length) return;
+                    idxs.sort(function(a,b){return b-a;}).forEach(function(i){ window._waitingContentList.splice(i,1); });
+                    _wmngRenderSelected();
+                    _wmngRenderAvailable();
+                }
+                function wmngMoveUp() {
+                    var sel=document.getElementById('wmng_selected'); if(!sel) return;
+                    var i=sel.selectedIndex; if(i<=0) return;
+                    var lst=window._waitingContentList;
+                    var tmp=lst[i-1]; lst[i-1]=lst[i]; lst[i]=tmp;
+                    _wmngRenderSelected(i-1);
+                }
+                function wmngMoveDown() {
+                    var sel=document.getElementById('wmng_selected'); if(!sel) return;
+                    var i=sel.selectedIndex; var lst=window._waitingContentList;
+                    if(i<0||i>=lst.length-1) return;
+                    var tmp=lst[i+1]; lst[i+1]=lst[i]; lst[i]=tmp;
+                    _wmngRenderSelected(i+1);
+                }
+                function removeWaitingItem(i) {
+                    var lst=window._waitingContentList; if (i<0||i>=lst.length) return;
+                    lst.splice(i,1);
+                    renderWaitingList();
+                    saveConfig();
+                }
+                function onWaitingModeChange(mode){ window._waitingMode=(mode==='random')?'random':'roundrobin'; saveConfig(); }
+
+                function initWaitingUI() {
+                    var lst=window._waitingContentList||[];
+                    if (!window._waitingUIInited) {
+                        // Migrate a pre-list single Waiting content into the list on first load so
+                        // an upgrading user's existing selection becomes item #1.
+                        if (lst.length===0 && window._flatDefaultContentInit) {
+                            lst.push({content:window._flatDefaultContentInit, display_duration:30});
+                            window._waitingContentList=lst;
+                        }
+                        window._waitingUIInited=true;
+                    }
+                    renderWaitingList();
+                }
+
+                window.openManageWaitingModal=openManageWaitingModal;
+                window.closeManageWaitingModal=closeManageWaitingModal;
+                window.wmngAdd=wmngAdd;
+                window.wmngRemove=wmngRemove;
+                window.wmngMoveUp=wmngMoveUp;
+                window.wmngMoveDown=wmngMoveDown;
+                window.removeWaitingItem=removeWaitingItem;
+                window.onWaitingModeChange=onWaitingModeChange;
+                window.initWaitingUI=initWaitingUI;
+                window.renderWaitingList=renderWaitingList;
+
                 window.toggleFseqPreview = function() {
                     var ct = getConfiguredContent();
                     var loadEl = document.getElementById('fseq_load_status');
@@ -6558,6 +7069,8 @@ def index():
 
                     // Names list UI (and the modal picker) are ready — render them.
                     try { if (window.initNamesUI) window.initNamesUI(); } catch(e) { console.error('Names UI init error:', e); }
+                    // Waiting content rotation list UI (needs _fppSeqList/_fppImgList populated).
+                    try { if (window.initWaitingUI) window.initWaitingUI(); } catch(e) { console.error('Waiting UI init error:', e); }
                     // Load background preview now that dropdowns are populated
                     try { if (window.toggleFseqPreview) window.toggleFseqPreview(); } catch(e) { console.error('Preview error:', e); }
                     updateNameDisplayWarning();
@@ -6600,6 +7113,10 @@ var _saveTimer = null;
                     profanity_filter: document.getElementById('profanity_filter').checked,
                     use_whitelist: document.getElementById('use_whitelist').checked,
                     default_playlist: document.getElementById('default_playlist').value,
+                    // Waiting content is a rotation list; default_playlist above is kept in
+                    // sync with its first item server-side for the required-field/legacy paths.
+                    default_content_list: window._waitingContentList || [],
+                    default_content_mode: window._waitingMode || 'roundrobin',
                     // Names content is now a list; the flat key stays '' (only used as the
                     // fallback when the list is empty = names over the waiting content).
                     name_display_playlist: '',
@@ -7020,6 +7537,25 @@ def update_config():
         if _lst_len == 0 or int(config.get('names_content_rr_index', -1) or -1) >= _lst_len:
             config['names_content_rr_index'] = -1
 
+        # Sanitize the WAITING content rotation list the same way.
+        if 'default_content_list' in new_config:
+            raw_wlist = new_config.get('default_content_list')
+            if not isinstance(raw_wlist, list):
+                raw_wlist = []
+            # Drop items with no content so an empty picker row can't wedge the rotator.
+            config['default_content_list'] = [d for d in (_sanitize_default_item(it) for it in raw_wlist) if d['content']]
+        if config.get('default_content_mode') not in ('roundrobin', 'random'):
+            config['default_content_mode'] = 'roundrobin'
+        _wlst = config.get('default_content_list', []) or []
+        if len(_wlst) == 0 or int(config.get('default_content_rr_index', -1) or -1) >= len(_wlst):
+            config['default_content_rr_index'] = -1
+        # Keep the single default_playlist in sync with the list's first item so the
+        # required-field check, export/validation, and every legacy single-content code
+        # path still resolve to a real value. Only mirror when a list is configured; an
+        # empty list leaves the user's single default_playlist untouched.
+        if _wlst:
+            config['default_playlist'] = _wlst[0]['content']
+
         # Normalize phone number to E.164 (strip spaces, dashes, parens — keep + and digits)
         if config.get('twilio_phone_number'):
             config['twilio_phone_number'] = re.sub(r'[^\d+]', '', config['twilio_phone_number'])
@@ -7160,8 +7696,9 @@ def export_config():
         content_files = []
         if inc_content:
             _list_content = [it.get('content', '') for it in (config.get('names_content_list', []) or [])]
+            _wait_content = [it.get('content', '') for it in (config.get('default_content_list', []) or [])]
             _seen_cv = set()
-            for cv in [config.get('default_playlist', ''), config.get('name_display_playlist', ''), *_list_content]:
+            for cv in [config.get('default_playlist', ''), config.get('name_display_playlist', ''), *_wait_content, *_list_content]:
                 if cv and cv not in _seen_cv:
                     _seen_cv.add(cv)
                     content_files.extend(_content_source_files(cv, warnings))
@@ -9120,9 +9657,11 @@ def api_activate():
     """FPP scheduler hook: enable the plugin, start SMS polling, and start the waiting playlist."""
     global polling_thread, stop_polling
 
-    # Require a default waiting playlist — without one the show has no defined state
-    if not config.get('default_playlist', '').strip():
-        msg = "ERROR: No Default Waiting Playlist configured. Set one in the plugin settings before running Text My Lights Start."
+    # Require waiting content — a single default_playlist or a rotation list. Without one
+    # the show has no defined state.
+    _has_list = len(config.get('default_content_list', []) or []) > 0
+    if not config.get('default_playlist', '').strip() and not _has_list:
+        msg = "ERROR: No Default Waiting Content configured. Set one in the plugin settings before running Text My Lights Start."
         logging.error(msg)
         return jsonify({"success": False, "error": msg}), 400
 
@@ -9134,8 +9673,8 @@ def api_activate():
     if not start_polling_if_needed():
         logging.warning("⚠️  Activate: message source not configured, polling not started")
 
-    # Start the default waiting playlist
-    result = start_default_playlist()
+    # Start the waiting content (single, or the rotator for a 2+ item list)
+    result = start_waiting_content()
 
     logging.info(f"✅ Text My Lights Start activated — playlist {'started' if result else 'FAILED to start'}")
     return jsonify({"success": True, "playlist_started": result,
@@ -9207,17 +9746,22 @@ if __name__ == '__main__':
     display_thread = threading.Thread(target=display_worker, daemon=True)
     display_thread.start()
 
+    # Waiting-content rotator runs for the whole process, idling unless the show is enabled
+    # and a 2+ item rotation list is configured.
+    rotator_thread = threading.Thread(target=waiting_rotator, daemon=True)
+    rotator_thread.start()
+
     # Polling thread starts if the selected source is configured — runs in
     # standby (show_not_live replies) when disabled, and processes names normally
     # when enabled. Picks Twilio or Google Voice based on message_source.
     start_polling_if_needed()
 
-    # Start the default waiting playlist on launch if the plugin is already enabled
+    # Start the waiting content on launch if the plugin is already enabled
     if config['enabled']:
         def _start_default():
             import time
             time.sleep(3)  # brief delay to let FPP settle before sending commands
-            start_default_playlist()
+            start_waiting_content()
         threading.Thread(target=_start_default, daemon=True).start()
 
     logging.info("Text My Lights plugin starting...")

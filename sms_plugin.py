@@ -12,6 +12,7 @@ import requests
 from datetime import datetime, timedelta, timezone
 import re
 import time
+import random
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from twilio.rest import Client
@@ -44,6 +45,20 @@ except ImportError:
     ZSTD_AVAILABLE = False
 
 _scroll_thread = None   # background PIL scroll animation thread
+_scroll_stop = threading.Event()   # set to stop the scroll thread promptly (before it self-expires)
+
+
+def _stop_scroll_thread(timeout=2.0):
+    """Stop the current scroll animation thread and wait for it to fully exit (closing its
+    shm handle) before returning. Callers that are about to write the shm buffer themselves
+    (restoring waiting content, starting a new name) MUST call this first, otherwise a
+    still-running animation frame can land AFTER the new content and 'reload' the old name."""
+    global _scroll_thread
+    _scroll_stop.set()
+    th = _scroll_thread
+    if th is not None and th.is_alive():
+        th.join(timeout)
+    _scroll_thread = None
 
 # Configuration
 PLUGIN_DIR      = os.path.dirname(os.path.abspath(__file__))
@@ -280,7 +295,24 @@ DEFAULT_CONFIG = {
     "profanity_filter": True,
     "fpp_host": "http://127.0.0.1",
     "default_playlist": "",
+    # Waiting-content rotation list (v2.8+): each item is a background the plugin loops
+    # while idle. Authoritative when non-empty; empty list falls back to the single
+    # default_playlist above (the pre-list behavior). 1 item = play/loop it (no rotation);
+    # 2+ items = the waiting rotator cycles them (round-robin/random), switching at the end
+    # of each sequence (full FSEQ length) with a seamless overlap so there is no black gap.
+    # See select_default_content_item() and waiting_rotator(). default_playlist is kept in
+    # sync with list[0] so the required-field/validation/legacy paths still have a value.
+    "default_content_list": [],
+    "default_content_mode": "roundrobin",   # "roundrobin" | "random"
+    "default_content_rr_index": -1,          # persisted round-robin cursor (index last shown)
     "name_display_playlist": "",
+    # Names content list (v2.7+): each name picks one of these items as its background,
+    # each item carrying its OWN text layout + duration. Authoritative when non-empty;
+    # empty list falls back to name_display_playlist + the flat line_*/message_lines below
+    # (the pre-list behavior). See select_names_content_item() and _names_item_defaults().
+    "names_content_list": [],
+    "names_content_mode": "roundrobin",   # "roundrobin" | "random"
+    "names_content_rr_index": -1,          # persisted round-robin cursor (index last shown)
     "overlay_model_name": "",
     "text_color": "#FF0000",
     "text_font": "FreeSans",
@@ -342,6 +374,176 @@ stop_display = False
 message_queue = deque()
 currently_displaying = None
 queue_lock = threading.Lock()
+
+# The names-content item actually chosen for the display in progress (set by send_to_fpp),
+# so the return/stop paths stop the right content and the worker uses its duration. None
+# means the flat-config fallback (name over waiting) is in use.
+_active_name_content = None       # e.g. "seq:Foo" / "img:bar.png" / ""
+_active_display_duration = None   # int seconds for the current display
+
+# The waiting content currently on the output as the BASE layer (what a name composites
+# over, what a name-return reveals, what stop must clear). Set by start_default_playlist()
+# for the single-content case and by the waiting rotator on each switch. Falls back to
+# config['default_playlist'] when unset.
+_active_waiting_content = ''
+# Waiting-content rotator (only rotates when default_content_list has 2+ items and the show
+# is enabled). The thread lives for the whole process, idling otherwise.
+rotator_thread = None
+stop_rotator = True               # pause flag: True = don't switch/idle. Cleared on start.
+rotator_lock = threading.Lock()   # serializes a rotator switch against stop_show_playback teardown
+_fseq_dur_cache = {}              # {seq_name: duration_seconds} — parsed FSEQ lengths
+
+
+def _coerce_len(seq, n, fill):
+    """Return a list of exactly n items from seq, truncating or padding with `fill`
+    (dicts are copied so padded entries never share a reference)."""
+    out = list(seq) if isinstance(seq, (list, tuple)) else []
+    out = out[:n]
+    while len(out) < n:
+        out.append(dict(fill) if isinstance(fill, dict) else fill)
+    return out
+
+
+def _names_item_defaults():
+    """A fresh names-content item with a default (blank, centered) text layout."""
+    return {
+        "content": "",
+        "display_duration": 30,
+        "message_lines": ["", "", "", ""],
+        "line_boxes": [{"x": -1, "y": -1, "w": 300, "h": 60} for _ in range(4)],
+        "line_colors": ["", "", "", ""],
+        "line_movements": ["Center", "Center", "Center", "Center"],
+        "line_speeds": [50, 50, 50, 50],
+        "line_fonts": ["FreeSans", "FreeSans", "FreeSans", "FreeSans"],
+        "line_orientations": ["horizontal", "horizontal", "horizontal", "horizontal"],
+    }
+
+
+def _names_item_from_flat_config():
+    """Build a names-content item from the current flat config keys (the single
+    name_display_playlist + global message_lines/line_*/display_duration). Used once to
+    migrate the pre-list config into names_content_list[0]."""
+    item = _names_item_defaults()
+    item["content"] = config.get("name_display_playlist", "")
+    try:
+        item["display_duration"] = max(1, int(config.get("display_duration", 30) or 30))
+    except (TypeError, ValueError):
+        item["display_duration"] = 30
+    item["message_lines"]     = _coerce_len(config.get("message_lines", []), 4, "")
+    item["line_boxes"]        = _coerce_len(config.get("line_boxes", []), 4, {"x": -1, "y": -1, "w": 300, "h": 60})
+    item["line_colors"]       = _coerce_len(config.get("line_colors", []), 4, "")
+    item["line_movements"]    = _coerce_len(config.get("line_movements", []), 4, "Center")
+    item["line_speeds"]       = _coerce_len(config.get("line_speeds", []), 4, 50)
+    item["line_fonts"]        = _coerce_len(config.get("line_fonts", []), 4, "FreeSans")
+    item["line_orientations"] = _coerce_len(config.get("line_orientations", []), 4, "horizontal")
+    return item
+
+
+def _sanitize_names_item(raw):
+    """Coerce a client-supplied names item into the canonical shape (arrays length 4, sane
+    defaults). Never trusts lengths/types from the request."""
+    d = _names_item_defaults()
+    if not isinstance(raw, dict):
+        return d
+    d["content"] = str(raw.get("content", "") or "")
+    try:
+        d["display_duration"] = max(1, int(raw.get("display_duration", 30) or 30))
+    except (TypeError, ValueError):
+        d["display_duration"] = 30
+    d["message_lines"]     = _coerce_len(raw.get("message_lines", []), 4, "")
+    d["line_boxes"]        = _coerce_len(raw.get("line_boxes", []), 4, {"x": -1, "y": -1, "w": 300, "h": 60})
+    d["line_colors"]       = _coerce_len(raw.get("line_colors", []), 4, "")
+    d["line_movements"]    = _coerce_len(raw.get("line_movements", []), 4, "Center")
+    d["line_speeds"]       = _coerce_len(raw.get("line_speeds", []), 4, 50)
+    d["line_fonts"]        = _coerce_len(raw.get("line_fonts", []), 4, "FreeSans")
+    d["line_orientations"] = _coerce_len(raw.get("line_orientations", []), 4, "horizontal")
+    return d
+
+
+def select_names_content_item():
+    """Pick the names-content item for the incoming name, or None to fall back to the flat
+    config (name over the waiting content). Round-robin advances and persists a cursor;
+    random avoids an immediate repeat. Returns the stored dict (callers read only)."""
+    lst = config.get("names_content_list", []) or []
+    if not lst:
+        return None
+    if len(lst) == 1:
+        return lst[0]
+    mode = config.get("names_content_mode", "roundrobin")
+    prev = config.get("names_content_rr_index", -1)
+    if mode == "random":
+        choices = [i for i in range(len(lst)) if i != prev] or list(range(len(lst)))
+        idx = random.choice(choices)
+    else:
+        idx = (prev + 1) % len(lst)
+    config["names_content_rr_index"] = idx
+    save_config()
+    return lst[idx]
+
+
+def _default_item_defaults():
+    """A fresh waiting-content item. `display_duration` is only used for img: items (and as
+    a fallback when a seq's FSEQ length can't be read); seq: items play their full length."""
+    return {"content": "", "display_duration": 30}
+
+
+def _sanitize_default_item(raw):
+    """Coerce a client-supplied waiting item into the canonical {content, display_duration}
+    shape. Never trusts types from the request."""
+    d = _default_item_defaults()
+    if not isinstance(raw, dict):
+        return d
+    d["content"] = str(raw.get("content", "") or "")
+    try:
+        d["display_duration"] = max(1, int(raw.get("display_duration", 30) or 30))
+    except (TypeError, ValueError):
+        d["display_duration"] = 30
+    return d
+
+
+def select_default_content_item():
+    """Pick the next waiting-content item to rotate to, advancing/persisting the cursor.
+    Round-robin walks the list in order; random avoids an immediate repeat. Returns the
+    stored dict, or None when the list is empty (caller falls back to default_playlist)."""
+    lst = config.get("default_content_list", []) or []
+    if not lst:
+        return None
+    if len(lst) == 1:
+        config["default_content_rr_index"] = 0
+        return lst[0]
+    mode = config.get("default_content_mode", "roundrobin")
+    prev = config.get("default_content_rr_index", -1)
+    if mode == "random":
+        choices = [i for i in range(len(lst)) if i != prev] or list(range(len(lst)))
+        idx = random.choice(choices)
+    else:
+        idx = (prev + 1) % len(lst)
+    config["default_content_rr_index"] = idx
+    save_config()
+    return lst[idx]
+
+
+def _fseq_duration_seconds(content):
+    """Return the play length (seconds, rounded up) of a seq: waiting item from its FSEQ
+    header, or None if it can't be determined. Cached by sequence name."""
+    if not content or not content.startswith('seq:'):
+        return None
+    seq_name = os.path.basename(content[4:].removesuffix('.fseq'))  # filename only, no traversal
+    if seq_name in _fseq_dur_cache:
+        return _fseq_dur_cache[seq_name]
+    dur = None
+    try:
+        filepath = os.path.join(FSEQ_SEQUENCE_PATH, seq_name + '.fseq')
+        if os.path.exists(filepath):
+            hdr = parse_fseq_header(filepath)
+            ms = hdr.get('duration_ms', 0)
+            if ms and ms > 0:
+                dur = max(1, (int(ms) + 999) // 1000)   # ceil to whole seconds
+    except Exception as e:
+        logging.warning(f"Could not read FSEQ length for {seq_name}: {e}")
+    _fseq_dur_cache[seq_name] = dur
+    return dur
+
 
 def load_config():
     """Load configuration from file, merging with defaults so new settings survive updates"""
@@ -450,6 +652,15 @@ def load_config():
             config['line_boxes'] = boxes
             save_config()
             logging.info("Migrated line_positions/line_font_sizes to line_boxes")
+
+        # names_content_list (v2.7) starts EMPTY on upgrade. While empty, send_to_fpp
+        # falls back to the flat name_display_playlist + global text layout — identical to
+        # the pre-list behavior, and the existing UI keeps working. The list is seeded from
+        # the flat config (via _names_item_from_flat_config) the first time the new
+        # per-content UI loads with content configured, at which point it becomes
+        # authoritative. The new-default-key backfill above already ensures the key exists.
+        if config.get('names_content_mode') not in ('roundrobin', 'random'):
+            config['names_content_mode'] = 'roundrobin'
 
         if config['twilio_account_sid'] and config['twilio_auth_token']:
             twilio_client = Client(
@@ -800,6 +1011,22 @@ def render_to_shm(line_items, model_name, width, height):
         return False
 
 
+def _text_coverage_mask(strip):
+    """Build an alpha/coverage mask from an RGB text strip that was drawn as a colored
+    glyph on a BLACK background: per-pixel max of R,G,B. Glyph pixels → opaque, the black
+    background → transparent, anti-aliased edges → partial. Pass this as the mask when
+    pasting text onto an image so only the glyph lands (no black box); the black
+    background is what FPP's State-3 transparency handles for sequences, but over an
+    Opaque (State 2) image we must do that blending ourselves. Returns None on failure
+    (caller then pastes opaquely, as before)."""
+    try:
+        from PIL import ImageChops
+        r, g, b = strip.split()
+        return ImageChops.lighter(ImageChops.lighter(r, g), b)
+    except Exception:
+        return None
+
+
 def render_image_to_shm(image_path, model_name, width, height, line_items=None):
     """Load an image file, resize to model dimensions, optionally composite text on top,
     then write to FPP shared memory.  Returns True on success.
@@ -823,7 +1050,8 @@ def render_image_to_shm(image_path, model_name, width, height, line_items=None):
                 if strip is not None:
                     draw_x = resolved_bx + max(0, (box_w - sw) // 2)
                     draw_y = resolved_by + max(0, (box_h - sh) // 2)
-                    img.paste(strip, (draw_x, draw_y))
+                    # Mask so only the glyph lands on the image (no black box behind text).
+                    img.paste(strip, (draw_x, draw_y), _text_coverage_mask(strip))
 
         shm_path = f"/dev/shm/FPP-Model-Data-{model_name}"
         raw = img.tobytes()
@@ -857,7 +1085,59 @@ def render_image_to_shm(image_path, model_name, width, height, line_items=None):
         return False
 
 
-def animate_lines_via_shm(items, model_name, width, height, duration):
+def _overlay_model_dims():
+    """Resolve the overlay model's pixel size (width, height) — the resolution every image
+    and text frame is force-scaled to. Prefer the values stored in config (written when the
+    model is picked in the UI); if either is missing/0 (stale or never-saved config), fetch
+    the model's real dimensions live from FPP and cache them back so image waiting content
+    never silently fails to render. Returns (0, 0) only when the size is truly unknown."""
+    mw = int(config.get('overlay_model_width', 0) or 0)
+    mh = int(config.get('overlay_model_height', 0) or 0)
+    if mw > 0 and mh > 0:
+        return mw, mh
+    model = config.get('overlay_model_name', '')
+    if not model:
+        return mw, mh
+    try:
+        for m in get_fpp_models():
+            if m.get('name') == model and int(m.get('width', 0) or 0) > 0 and int(m.get('height', 0) or 0) > 0:
+                mw, mh = int(m['width']), int(m['height'])
+                config['overlay_model_width'] = mw
+                config['overlay_model_height'] = mh
+                try:
+                    save_config()
+                except Exception:
+                    pass
+                logging.info(f"📐 Overlay model dims resolved live from FPP: {model} = {mw}x{mh}")
+                return mw, mh
+    except Exception as e:
+        logging.warning(f"Could not resolve overlay model dims live from FPP: {e}")
+    return mw, mh
+
+
+def _fseq_fps_for_content(content, default=30.0):
+    """Resolve the frame rate to animate overlay text at, read from the FSEQ header of
+    the background sequence. xLights writes the sequence's step time into the header, so
+    this paces the scrolling text to the exact clock FPP plays/outputs that sequence at
+    (no rate beating between the overlay and the sequence underneath it).
+    `content` is a config content value; only 'seq:' values carry a real fps. Returns
+    `default` for non-sequence content or on any read error."""
+    try:
+        if not content or not content.startswith('seq:'):
+            return default
+        name = os.path.basename(content[4:].removesuffix('.fseq'))  # filename only, no traversal
+        filepath = os.path.join(FSEQ_SEQUENCE_PATH, name + '.fseq')
+        if not os.path.exists(filepath):
+            return default
+        hdr = parse_fseq_header(filepath)
+        fps = hdr.get('fps') if hdr else None
+        return fps if (fps and fps > 0) else default
+    except Exception as e:
+        logging.warning(f"could not read fps from sequence '{content}': {e}")
+        return default
+
+
+def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, bg_image_path=None):
     """Animate independently-moving/colored/fitted text lines together in FPP shared memory.
     Runs in a background thread for `duration` seconds then stops.
 
@@ -885,7 +1165,10 @@ def animate_lines_via_shm(items, model_name, width, height, duration):
     if not PIL_AVAILABLE or width <= 0 or height <= 0:
         return False
     try:
-        fps = 30
+        # Pace to the background sequence's own frame rate (from its FSEQ header) when the
+        # caller supplies it; fall back to 30 for non-sequence backgrounds. This drives
+        # both the step-per-frame motion math (via _step_for below) and the frame clock.
+        fps = fps if (fps and fps > 0) else 30
 
         # Pre-render each line to its own image strip (fit to its box) and resolve its
         # fixed axis/motion + clip rect.
@@ -937,6 +1220,10 @@ def animate_lines_via_shm(items, model_name, width, height, duration):
 
             entry = {'strip': strip, 'tw': tw, 'th': th, 'movement': movement,
                      'clip': (resolved_bx, resolved_by, box_w, box_h)}
+            # Over an image background, paste only the glyph (mask out the strip's black
+            # box). Over a black background (no image) leave it None — pasting opaquely on
+            # black is identical and cheaper.
+            entry['mask'] = _text_coverage_mask(strip) if bg_image_path else None
             # speed == 0 is the "fit to display time" sentinel: instead of a fixed
             # px/s speed (which, with dynamic-length text, either loops a short name
             # several times or cuts a long name off mid-scroll), time one complete
@@ -993,63 +1280,109 @@ def animate_lines_via_shm(items, model_name, width, height, duration):
         logging.info(f"🎬 animate_lines_via_shm: model={model_name} size={width}x{height} "
                      f"lines={len(prepared)} duration={duration}s")
 
-        def _clip_paste(frame, strip, src_x, src_y, dst_x, dst_y, vis_w, vis_h, clip):
+        # Base frame the moving text is composited onto each frame: the (resized) image
+        # background if one was supplied, otherwise black. Loaded ONCE here so scrolling
+        # text can now ride over an image (previously image + movement fell back to black).
+        base_frame = None
+        if bg_image_path:
+            try:
+                base_frame = Image.open(bg_image_path).convert('RGB').resize((width, height), Image.LANCZOS)
+            except Exception as ex:
+                logging.warning(f"animate bg image load failed ({bg_image_path}): {ex}")
+                base_frame = None
+        if base_frame is None:
+            base_frame = Image.new('RGB', (width, height), (0, 0, 0))
+
+        def _clip_paste(frame, strip, mask, src_x, src_y, dst_x, dst_y, vis_w, vis_h, clip):
             # Intersect the paste rect with the line's own box, so scrolling text is only
             # visible while inside it — entering/exiting at the box edges instead of the
-            # full canvas edges.
+            # full canvas edges. `mask` (or None) is cropped the same way so text lands on
+            # an image background without its black box.
             cx, cy, cw, ch = clip
             x0, y0 = max(dst_x, cx), max(dst_y, cy)
             x1, y1 = min(dst_x + vis_w, cx + cw), min(dst_y + vis_h, cy + ch)
             if x1 <= x0 or y1 <= y0:
                 return
             crop_x0, crop_y0 = src_x + (x0 - dst_x), src_y + (y0 - dst_y)
-            frame.paste(strip.crop((crop_x0, crop_y0, crop_x0 + (x1 - x0), crop_y0 + (y1 - y0))), (x0, y0))
+            crop_box = (crop_x0, crop_y0, crop_x0 + (x1 - x0), crop_y0 + (y1 - y0))
+            crop_mask = mask.crop(crop_box) if mask is not None else None
+            frame.paste(strip.crop(crop_box), (x0, y0), crop_mask)
+
+        def _pos_at(e, t):
+            # Closed-form scroll position at elapsed time `t` (seconds). Motion is a pure
+            # function of wall-clock time, NOT an accumulator advanced per frame, so a slow
+            # or dropped render frame never causes stutter or drift — the text is always
+            # exactly where it belongs for time t. Velocity (px/sec) = per-frame step * fps.
+            loop_len = abs(e['loop_end'] - e['loop_start']) or 1.0
+            dist = e['step_px'] * fps * t            # total distance travelled by time t
+            passes_done = int(dist // loop_len)
+            within = dist - passes_done * loop_len   # distance into the current pass
+            if e.get('fit') and passes_done >= e['fit_passes']:
+                return e['loop_end']                 # fit-to-time: hold fully exited after N passes
+            return e['loop_start'] + e['dir'] * within
 
         def _animate():
             import time as _time
+            # Frames are RENDERED on an absolute-deadline clock (start + n/fps) so cadence
+            # is steady, and each line's POSITION is computed from elapsed wall time via
+            # _pos_at, so even when the Pi can't keep up and frames land late/dropped, the
+            # motion stays correct and smooth instead of juddering. The shm handle is opened
+            # ONCE and reused (seek(0)+write) instead of open/close per frame.
+            try:
+                shm = open(shm_path, 'r+b')
+            except Exception as ex:
+                logging.error(f"animate shm open failed: {ex}")
+                return
+            frame_bytes = width * height * 3
             start = _time.time()
-            while _time.time() - start < duration:
-                frame = Image.new('RGB', (width, height), (0, 0, 0))
-                for e in prepared:
-                    if e['movement'] in ('L2R', 'R2L'):
-                        ix = int(e['pos'])
-                        src_x = max(0, -ix); dst_x = max(0, ix)
-                        vis_w = min(e['tw'] - src_x, width - dst_x)
-                        if vis_w > 0:
-                            _clip_paste(frame, e['strip'], src_x, 0, dst_x, e['dy'], vis_w, e['th'], e['clip'])
-                    elif e['movement'] in ('T2B', 'B2T'):
-                        iy = int(e['pos'])
-                        src_y = max(0, -iy); dst_y = max(0, iy)
-                        vis_h = min(e['th'] - src_y, height - dst_y)
-                        if vis_h > 0:
-                            _clip_paste(frame, e['strip'], 0, src_y, e['dx'], dst_y, e['tw'], vis_h, e['clip'])
-                    else:
-                        frame.paste(e['strip'], (e['dx'], e['dy']))
+            n = 0
+            try:
+                while True:
+                    t = _time.time() - start
+                    if t >= duration or _scroll_stop.is_set():
+                        break
+                    frame = base_frame.copy()
+                    for e in prepared:
+                        mv = e['movement']
+                        if mv in ('L2R', 'R2L'):
+                            ix = int(_pos_at(e, t))
+                            src_x = max(0, -ix); dst_x = max(0, ix)
+                            vis_w = min(e['tw'] - src_x, width - dst_x)
+                            if vis_w > 0:
+                                _clip_paste(frame, e['strip'], e['mask'], src_x, 0, dst_x, e['dy'], vis_w, e['th'], e['clip'])
+                        elif mv in ('T2B', 'B2T'):
+                            iy = int(_pos_at(e, t))
+                            src_y = max(0, -iy); dst_y = max(0, iy)
+                            vis_h = min(e['th'] - src_y, height - dst_y)
+                            if vis_h > 0:
+                                _clip_paste(frame, e['strip'], e['mask'], 0, src_y, e['dx'], dst_y, e['tw'], vis_h, e['clip'])
+                        else:
+                            frame.paste(e['strip'], (e['dx'], e['dy']), e['mask'])
+                    try:
+                        buf = frame.tobytes()
+                        shm.seek(0)
+                        # One write() syscall for the whole buffer keeps the frame FPP reads
+                        # as close to atomic as userspace allows (minimizes tearing), and
+                        # flush() pushes it out immediately rather than at close time.
+                        shm.write(buf if len(buf) == frame_bytes else buf[:frame_bytes])
+                        shm.flush()
+                    except Exception:
+                        pass
+                    # Absolute-deadline pacing: sleep until the next frame's scheduled time
+                    # instead of a fixed 1/fps after the work. No cumulative drift; a late
+                    # frame is absorbed by a shorter next sleep.
+                    n += 1
+                    delay = (start + n / fps) - _time.time()
+                    if delay > 0:
+                        _time.sleep(delay)
+            finally:
                 try:
-                    with open(shm_path, 'r+b') as f: f.write(frame.tobytes())
+                    shm.close()
                 except Exception:
                     pass
-                for e in prepared:
-                    if e['movement'] in ('L2R', 'R2L', 'T2B', 'B2T'):
-                        if e.get('done'):
-                            continue  # fit passes all completed -- hold fully exited
-                        e['pos'] += e['dir'] * e['step_px']
-                        overshot = (e['dir'] < 0 and e['pos'] < e['loop_end']) or (e['dir'] > 0 and e['pos'] > e['loop_end'])
-                        if overshot:
-                            # A pass just completed. Fixed-speed loops forever (snap back
-                            # and repeat for the rest of the window). Fit-to-time snaps back
-                            # for passes 1..N-1, then on the Nth pass holds fully exited at
-                            # loop_end (no jarring snap-back flash at the very end).
-                            if e.get('fit'):
-                                e['wraps'] += 1
-                                if e['wraps'] >= e['fit_passes']:
-                                    e['pos'] = e['loop_end']; e['done'] = True
-                                else:
-                                    e['pos'] = e['loop_start']
-                            else:
-                                e['pos'] = e['loop_start']
-                _time.sleep(1.0 / fps)
 
+        _stop_scroll_thread()      # ensure no prior animation is still writing the buffer
+        _scroll_stop.clear()       # re-arm for this run
         _scroll_thread = threading.Thread(target=_animate, daemon=True)
         _scroll_thread.start()
         return True
@@ -1105,20 +1438,31 @@ def parse_fseq_header(filepath):
     num_comp_blocks   = raw[20]           # uint8
     num_sparse_ranges = raw[21]           # uint8
 
-    # ── Auto-detect zstd compression ─────────────────────────────────────────
+    # ── Auto-detect compression ──────────────────────────────────────────────
     # FSEQ v2.2 (minor_version >= 2) sometimes writes compression_type=0 in
-    # byte 19 even though the data is zstd-compressed.  Probe the actual data
-    # at chan_data_offset for the zstd frame magic (0xFD2FB528 little-endian).
+    # byte 19 even though the data is actually compressed.  Probe the real data
+    # at chan_data_offset for a compression magic and override:
+    #   • zstd frame magic 0x28 0xB5 0x2F 0xFD (0xFD2FB528 little-endian) → type 2
+    #   • zlib header 0x78 + valid FLG (CMF*256+FLG divisible by 31)        → type 1
+    # Without this, a compressed file read as "uncompressed" paints raw
+    # compressed bytes to the display → TV-snow noise in the preview.
     _ZSTD_MAGIC = b'\x28\xB5\x2F\xFD'
     with open(filepath, 'rb') as _f:
         _f.seek(chan_data_offset)
         _probe = _f.read(4)
     effective_ctype = compression_type
-    if _probe == _ZSTD_MAGIC and compression_type == 0:
+    if compression_type == 0 and _probe[:4] == _ZSTD_MAGIC:
         effective_ctype = 2   # override: treat as zstd
         logging.info(
             "FSEQ: header says uncompressed (byte 19 = 0) but zstd magic detected "
             "at chan_data_offset — treating as zstd (FSEQ v2.2 quirk)"
+        )
+    elif (compression_type == 0 and len(_probe) >= 2 and _probe[0] == 0x78
+          and ((_probe[0] << 8 | _probe[1]) % 31 == 0)):
+        effective_ctype = 1   # override: treat as zlib
+        logging.info(
+            "FSEQ: header says uncompressed (byte 19 = 0) but zlib magic detected "
+            "at chan_data_offset — treating as zlib (FSEQ v2.2 quirk)"
         )
 
     # ── Compression block table ───────────────────────────────────────────────
@@ -1227,6 +1571,17 @@ def read_fseq_frame(header, frame_idx, start_ch, ch_count):
             raise ValueError(
                 f"Model channel count {ch_count} exceeds FSEQ channel count {total_ch}"
             )
+    elif not sparse_ranges and frame_byte + ch_count > total_ch and ch_count <= total_ch:
+        # Dense, model-specific / partial export: the file holds ONLY this
+        # model's channels starting at file offset 0, so the show-level start
+        # channel would overrun the file (e.g. FSEQ channel_count == model
+        # channel_count, but start_ch > 0).  Read from the top instead.
+        logging.warning(
+            f"FSEQ preview: model range {start_ch}..{start_ch + ch_count} exceeds "
+            f"file channel_count {total_ch} — treating as model-specific export "
+            f"(frame byte 0)"
+        )
+        frame_byte = 0
 
     if ctype == 0:
         # Uncompressed: seek directly to frame + channel byte offset
@@ -2208,17 +2563,34 @@ def send_to_fpp(name):
     """Send name to FPP - Start name sequence and display text overlay"""
     try:
         fpp_host = FPP_HOST
-        name_playlist = config.get('name_display_playlist', '')
+        # Pick which names content (with its OWN text layout + duration) to use for THIS
+        # name. None => no list configured; fall back to the flat config (name over the
+        # waiting content), exactly as before. The chosen content + duration are stashed in
+        # module globals for display_worker() and the return/stop paths.
+        global _active_name_content, _active_display_duration
+        _item = select_names_content_item()
+        if _item is not None:
+            name_playlist         = _item.get('content', '')
+            message_lines         = _item.get('message_lines', ['', '', '', ''])
+            line_boxes_cfg        = _item.get('line_boxes', [])
+            line_colors_cfg       = _item.get('line_colors', [])
+            line_movements_cfg    = _item.get('line_movements', [])
+            line_speeds_cfg       = _item.get('line_speeds', [])
+            line_fonts_cfg        = _item.get('line_fonts', [])
+            line_orientations_cfg = _item.get('line_orientations', [])
+            _active_display_duration = int(_item.get('display_duration', config.get('display_duration', 30)) or 30)
+        else:
+            name_playlist         = config.get('name_display_playlist', '')
+            message_lines         = config.get('message_lines', ['Merry Christmas', '{name}!', '', ''])
+            line_boxes_cfg        = config.get('line_boxes', [])
+            line_colors_cfg       = config.get('line_colors', [])
+            line_movements_cfg    = config.get('line_movements', [])
+            line_speeds_cfg       = config.get('line_speeds', [])
+            line_fonts_cfg        = config.get('line_fonts', [])
+            line_orientations_cfg = config.get('line_orientations', [])
+            _active_display_duration = int(config.get('display_duration', 30) or 30)
+        _active_name_content = name_playlist
         overlay_model = config.get('overlay_model_name', 'Texting Matrix')
-        
-        # Build per-line rendered items from message_lines config
-        message_lines = config.get('message_lines', ['Merry Christmas', '{name}!', '', ''])
-        line_boxes_cfg = config.get('line_boxes', [])
-        line_colors_cfg = config.get('line_colors', [])
-        line_movements_cfg = config.get('line_movements', [])
-        line_speeds_cfg = config.get('line_speeds', [])
-        line_fonts_cfg = config.get('line_fonts', [])
-        line_orientations_cfg = config.get('line_orientations', [])
 
         global_text_color = config.get('text_color', '#FF0000')
         if not global_text_color.startswith('#'):
@@ -2283,15 +2655,13 @@ def send_to_fpp(name):
         # Step 1: Start the name display playlist/sequence/video/image (background)
         if name_playlist:
             try:
-                logging.info(f"⏸️  STEP 1: Stopping any running playlist...")
-                requests.get(f"{fpp_host}/api/playlists/stop", timeout=3)
-                # Note: background FSEQ Effect is NOT stopped here — the names sequence
-                # (foreground) will automatically suppress it and it auto-resumes after.
-                time.sleep(0.1)
-
-                logging.info(f"▶️  STEP 2: Starting name display content: {name_playlist}")
-
                 import urllib.parse
+                # Experiment: DON'T stop the waiting effect. The waiting FSEQ effect
+                # keeps looping and the names content starts as its own FSEQ effect
+                # that plays ON TOP of it (overlay text renders above both). Nothing
+                # foreground is touched. return_to_default_playlist() later stops just
+                # the names effect, leaving the waiting effect running underneath.
+                logging.info(f"▶️  STEP 2: Starting name display content OVER waiting: {name_playlist}")
                 if name_playlist.startswith('seq:'):
                     # FSEQ Effect (loop=true, background=true): plays as background so
                     # overlay model renders on top with correct text colors.
@@ -2350,14 +2720,7 @@ def send_to_fpp(name):
                 state_url = f"{fpp_host}/api/overlays/model/{encoded_model}/state"
                 text_url  = f"{fpp_host}/api/overlays/model/{encoded_model}/text"
 
-                # Order matters to avoid flash of previous name:
-                # 1. Disable overlay (State 0) — hides it
-                # 2. Write new frame (PIL shm or FPP text API)
-                # 3. Enable overlay (State 3 Transparent RGB) — activates cleanly
-                requests.put(state_url, json={"State": 0}, timeout=3)
-
-                mw = config.get('overlay_model_width', 0)
-                mh = config.get('overlay_model_height', 0)
+                mw, mh = _overlay_model_dims()
                 logging.info(f"📐 Overlay: model={overlay_model} overlay_size={mw}x{mh} "
                              f"lines={len(all_items)} moving={any_moving} PIL={PIL_AVAILABLE}")
 
@@ -2367,15 +2730,27 @@ def send_to_fpp(name):
                 # For img: names content, composite text onto the image (State 2 = Opaque).
                 # When no Names content is configured, fall back to an img: Default Waiting
                 # content so the name displays over it instead of wiping it with plain text.
-                # Image backgrounds only work with the static (no per-line movement) path —
-                # scrolling text has never supported compositing onto an image background.
-                img_source = name_playlist if name_playlist else config.get('default_playlist', '')
+                # Both static AND scrolling text composite over the image background now
+                # (static via render_image_to_shm, scrolling via animate_lines_via_shm's
+                # bg_image_path).
+                img_source = name_playlist if name_playlist else (_active_waiting_content or config.get('default_playlist', ''))
                 img_bg_path = None
                 if img_source.startswith('img:'):
                     img_bg_path = os.path.join(FPP_IMAGES_PATH, img_source[4:])
                     if not os.path.exists(img_bg_path):
                         logging.warning(f"⚠️ Image not found: {img_bg_path}")
                         img_bg_path = None
+
+                # Blanking policy (avoids the transition flash):
+                #  - Incoming IMAGE (State 2, Opaque): do NOT blank. The current overlay
+                #    (e.g. the previous image) stays on screen while we load/resize the new
+                #    one — the slow part — and render_image_to_shm swaps it in with a single
+                #    write(), so image→image changes have no blank frame at all.
+                #  - Incoming text/seq (State 3, Transparent): blank first, so the previous
+                #    name can't linger while the new text frame is built. (Text path unchanged
+                #    — it already works cleanly.)
+                if not img_bg_path:
+                    requests.put(state_url, json={"State": 0}, timeout=3)
 
                 if PIL_AVAILABLE and mw > 0 and mh > 0:
                     if not any_moving:
@@ -2390,12 +2765,22 @@ def send_to_fpp(name):
                                 line_items, overlay_model, mw, mh
                             )
                     else:
-                        duration = config.get('display_duration', 30)
-                        if img_bg_path:
-                            logging.warning("⚠️ Image background does not support per-line movement — "
-                                            "animating over a black background instead.")
+                        # Per-content duration (fit-to-time scroll windows use it too).
+                        duration = _active_display_duration or config.get('display_duration', 30)
+                        # Pace the overlay animation to the background sequence's fps
+                        # (from its FSEQ header) so scrolling motion is locked to the same
+                        # clock FPP outputs the sequence at. The background is the names
+                        # seq: if one is set, else the default waiting seq:.
+                        bg_content = (name_playlist if (name_playlist and name_playlist.startswith('seq:'))
+                                      else (_active_waiting_content or config.get('default_playlist', '')))
+                        anim_fps = _fseq_fps_for_content(bg_content)
+                        logging.info(f"🎞️  Overlay animation fps={anim_fps} (bg={bg_content or 'none'}, "
+                                     f"img={'yes' if img_bg_path else 'no'})")
+                        # Scrolling text now composites over the image background too
+                        # (img_bg_path is None → black background, unchanged behavior).
                         scroll_started = animate_lines_via_shm(
-                            all_items, overlay_model, mw, mh, duration
+                            all_items, overlay_model, mw, mh, duration,
+                            fps=anim_fps, bg_image_path=img_bg_path
                         )
                         if scroll_started:
                             time.sleep(0.05)  # let first frame land before enabling overlay
@@ -2422,9 +2807,11 @@ def send_to_fpp(name):
                 else:
                     logging.info(f"✅ PIL {'scroll' if scroll_started else 'static'} render active")
 
-                # State 2 (Opaque) for image background so it covers the display fully.
-                # State 3 (Transparent RGB) for normal/FSEQ background (black = transparent).
-                overlay_state = 2 if (img_bg_path and shm_rendered) else 3
+                # State 2 (Opaque) for image background so it covers the display fully —
+                # for both the static composite (shm_rendered) and the scroll composite
+                # (scroll_started) paths. State 3 (Transparent RGB) for normal/FSEQ
+                # background (black = transparent).
+                overlay_state = 2 if (img_bg_path and (shm_rendered or scroll_started)) else 3
                 state_resp = requests.put(state_url, json={"State": overlay_state}, timeout=3)
                 logging.info(f"   Overlay state={overlay_state}: {state_resp.status_code}")
 
@@ -2447,17 +2834,22 @@ def _start_video_looping(_fpp_host, _vid_name):
     return False
 
 
-def start_default_playlist():
-    """Start the configured default waiting playlist/sequence.
-    For sequences (seq:), uses FSEQ Effect (loop=true, background=true) so it loops
-    seamlessly as a background effect."""
+def start_default_playlist(content=None):
+    """Start a single waiting content item (playlist/sequence/image) and record it as the
+    active base layer. `content` defaults to config['default_playlist']; the rotator and the
+    image-restore path pass an explicit item. For sequences (seq:), uses FSEQ Effect
+    (loop=true, background=true) so it loops seamlessly as a background effect."""
+    global _active_waiting_content
     import urllib.parse
     fpp_host = FPP_HOST
-    default_playlist = config.get('default_playlist', '')
+    default_playlist = content if content is not None else config.get('default_playlist', '')
 
     if not default_playlist:
         logging.info("ℹ️  No default playlist configured — skipping auto-start")
         return False
+
+    # This content becomes the base waiting layer (what names composite over / return to).
+    _active_waiting_content = default_playlist
 
     try:
         if default_playlist.startswith('seq:'):
@@ -2485,8 +2877,7 @@ def start_default_playlist():
             img_name = default_playlist[4:]
             img_path = os.path.join(FPP_IMAGES_PATH, img_name)
             overlay_model = config.get('overlay_model_name', '')
-            mw = config.get('overlay_model_width', 0)
-            mh = config.get('overlay_model_height', 0)
+            mw, mh = _overlay_model_dims()   # falls back to a live FPP lookup if config dims are 0
             if PIL_AVAILABLE and overlay_model and mw > 0 and mh > 0 and os.path.exists(img_path):
                 ok = render_image_to_shm(img_path, overlay_model, mw, mh)
                 if ok:
@@ -2518,6 +2909,146 @@ def start_default_playlist():
         return False
 
 
+def _switch_waiting_content(new_content, prev_content):
+    """Seamlessly switch the base waiting layer from prev_content to new_content with NO
+    black gap: the new content is started FIRST (a later-started FSEQ effect / an opaque
+    image overlay renders on top), and only THEN is the previous content torn down. Updates
+    _active_waiting_content. Used by the rotator; safe to call with prev_content == '' for
+    the first item."""
+    global _active_waiting_content
+    import urllib.parse
+    fpp_host = FPP_HOST
+    if not new_content:
+        return False
+
+    # 1) Bring up the NEW content on top of whatever is currently showing.
+    ok = start_default_playlist(new_content)   # sets _active_waiting_content = new_content
+
+    # 2) Tear down the PREVIOUS content now that the new one covers it. Never touch it when
+    #    it's the same file (a repeat) — that would stop what we just started.
+    try:
+        if prev_content and prev_content != new_content:
+            if prev_content.startswith('seq:'):
+                seq_name = prev_content[4:].removesuffix('.fseq')
+                requests.get(f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(seq_name)}", timeout=3)
+                logging.info(f"⏹️  Rotator stopped previous waiting seq: {seq_name}")
+            elif prev_content.startswith('img:') and not new_content.startswith('img:'):
+                # Previous was an opaque image overlay and the new content is a seq/playlist
+                # underneath — turn the overlay off so the new content shows through.
+                overlay_model = config.get('overlay_model_name', '')
+                if overlay_model:
+                    enc = urllib.parse.quote(overlay_model)
+                    requests.put(f"{fpp_host}/api/overlays/model/{enc}/state", json={"State": 0}, timeout=3)
+                    logging.info("🧹 Rotator cleared previous waiting image overlay")
+            # img: → img: needs nothing (new render already overwrote the overlay buffer).
+    except Exception as e:
+        logging.warning(f"Rotator teardown of previous waiting content failed: {e}")
+    return ok
+
+
+def _rotator_should_idle():
+    """The rotator only rotates when NOT paused, the show is enabled, and 2+ waiting items
+    are configured. Otherwise it idles (single-content / disabled / stopped)."""
+    if stop_rotator or not config.get('enabled', False):
+        return True
+    return len((config.get('default_content_list', []) or [])) < 2
+
+
+def _rotator_busy():
+    """True while a name owns the display — the rotator holds the current waiting content
+    (looping underneath) rather than switching, and resumes once the queue drains."""
+    with queue_lock:
+        return (currently_displaying is not None) or (len(message_queue) > 0)
+
+
+def _waiting_hold_seconds(content):
+    """How long to keep `content` on screen before rotating: the full sequence length for
+    seq: (from the FSEQ header), else the matching list item's display_duration, else 30."""
+    d = _fseq_duration_seconds(content)
+    if d:
+        return d
+    for it in (config.get('default_content_list', []) or []):
+        if it.get('content') == content:
+            return int(it.get('display_duration', 30) or 30)
+    return 30
+
+
+def waiting_rotator():
+    """Long-lived daemon that rotates the waiting-content list while the show is idle.
+
+    Rotates only when 2+ items are configured and the show is enabled/not paused. Model:
+    HOLD the currently-active item for its full length, THEN advance to the next — so the
+    first item (brought up by start_waiting_content) plays fully before rotation begins.
+    Rotation is suspended while a name owns the display; the current waiting content keeps
+    looping underneath and the name composites on top."""
+    logging.info("🔁 Waiting rotator thread started")
+    while True:
+        try:
+            if _rotator_should_idle() or _rotator_busy():
+                time.sleep(0.5)
+                continue
+
+            # 1) Make sure SOMETHING valid is up (first tick, or the active item was removed
+            #    from the list). start_waiting_content normally brings up item 0 already.
+            with rotator_lock:
+                if _rotator_should_idle():
+                    continue
+                contents = [it.get('content', '') for it in (config.get('default_content_list', []) or [])]
+                if not _active_waiting_content or _active_waiting_content not in contents:
+                    item = select_default_content_item()
+                    if item and item.get('content'):
+                        _switch_waiting_content(item['content'], _active_waiting_content)
+                cur = _active_waiting_content
+
+            # 2) Hold the current item for its full length, waking early to stop/pause, when
+            #    disabled, or when a name arrives. Fire the overlap-switch a hair BEFORE the
+            #    natural end so the next content covers the tail instead of the current
+            #    (loop=true) sequence briefly restarting from frame 0 — a seamless handoff.
+            hold = _waiting_hold_seconds(cur)
+            logging.info(f"🔁 Rotator showing waiting content '{cur}' for {hold}s")
+            deadline = time.time() + max(0.5, hold - 0.25)
+            while time.time() < deadline and not _rotator_should_idle() and not _rotator_busy():
+                time.sleep(min(0.5, max(0.05, deadline - time.time())))
+
+            # 3) Advance to the next item — but never switch under a name or after a stop
+            #    (re-checked under the lock). If busy, loop back and re-hold the current item.
+            if _rotator_should_idle() or _rotator_busy():
+                continue
+            with rotator_lock:
+                if _rotator_should_idle() or _rotator_busy():
+                    continue
+                nxt = select_default_content_item()
+                if nxt and nxt.get('content') and nxt['content'] != _active_waiting_content:
+                    _switch_waiting_content(nxt['content'], _active_waiting_content)
+        except Exception as e:
+            logging.error(f"Error in waiting_rotator: {e}")
+            time.sleep(1.0)
+
+
+def start_waiting_content():
+    """Start the waiting background layer. With a rotation list of 2+ items, bring up the
+    first item and un-pause the (always-running) rotator; otherwise start the single
+    default_playlist / the sole list item exactly as before. Returns True if something was
+    started."""
+    global stop_rotator
+    lst = config.get('default_content_list', []) or []
+
+    if len(lst) >= 2:
+        stop_rotator = False   # un-pause the rotator
+        # Bring up the first item immediately so there's no gap before the rotator's first
+        # tick; ongoing rotation is handled by the thread.
+        with rotator_lock:
+            first = select_default_content_item()
+            if first and first.get('content'):
+                return _switch_waiting_content(first['content'], _active_waiting_content)
+        return False
+
+    # 0–1 items: single-content behavior. A 1-item list uses that item; else default_playlist.
+    if len(lst) == 1 and lst[0].get('content'):
+        return start_default_playlist(lst[0]['content'])
+    return start_default_playlist()
+
+
 def return_to_default_playlist():
     """Clear text overlay and stop the names sequence/playlist.
     If the default is a seq: (FSEQ Effect background), the background auto-resumes.
@@ -2526,90 +3057,151 @@ def return_to_default_playlist():
         fpp_host = FPP_HOST
         overlay_model = config.get('overlay_model_name', 'Texting Matrix')
 
-        if overlay_model:
-            try:
-                logging.info(f"🧹 Clearing text from model: {overlay_model}")
-                import urllib.parse
-                encoded_model = urllib.parse.quote(overlay_model)
-                # Disable the overlay model (State 0) to stop rendering text
-                state_url = f"{fpp_host}/api/overlays/model/{encoded_model}/state"
-                response = requests.put(state_url, json={"State": 0}, timeout=3)
-                logging.info(f"   Disable overlay (State 0): {response.status_code} - {response.text}")
-                if response.status_code == 200:
-                    logging.info(f"✅ Text cleared")
-                else:
-                    logging.warning(f"⚠️  Could not clear text: {response.status_code}")
-            except Exception as e:
-                logging.warning(f"Could not clear text: {e}")
+        import urllib.parse
 
+        # Don't blank between queued names — the next name's display handles its own
+        # (flash-free) overlay transition. Blanking here would flash between names.
         with queue_lock:
             queue_length = len(message_queue)
-
         if queue_length > 0:
             logging.info(f"📋 Queue has {queue_length} more names — skipping return-to-default")
             return
 
-        import urllib.parse
-        name_playlist  = config.get('name_display_playlist', '')
-        default_content = config.get('default_playlist', '')
+        # Stop whatever names content was ACTUALLY shown for this name (round-robin/random
+        # picks per name), not the static config key. Falls back to the flat key.
+        name_playlist   = _active_name_content if _active_name_content is not None else config.get('name_display_playlist', '')
+        # The base waiting layer to return to is whatever is CURRENTLY active (the rotator
+        # holds this steady during a name display), falling back to the single default.
+        default_content = _active_waiting_content or config.get('default_playlist', '')
+        returning_to_image = default_content.startswith('img:')
+
+        # Kill the name's scroll animation and wait for it to fully exit BEFORE we write
+        # the waiting content. Otherwise a last in-flight animation frame can land after
+        # the waiting image and briefly 'reload' the name.
+        _stop_scroll_thread()
+
+        def _clear_overlay():
+            # Turn the text/image overlay OFF (State 0). Used only when we are NOT
+            # returning to an image — a seq:/none waiting background shows through once
+            # the overlay is off. (An image waiting background is instead restored by
+            # start_default_playlist, which overwrites the overlay buffer and sets State 2
+            # in one step, so there is no blank frame.)
+            if not overlay_model:
+                return
+            try:
+                enc = urllib.parse.quote(overlay_model)
+                requests.put(f"{fpp_host}/api/overlays/model/{enc}/state", json={"State": 0}, timeout=3)
+                logging.info("🧹 Overlay cleared (State 0)")
+            except Exception as e:
+                logging.warning(f"Could not clear overlay: {e}")
 
         if not name_playlist:
-            # No names content. img: content was paused/replaced for overlay display —
-            # restart it now. seq:/playlist content was never stopped.
-            _default = config.get('default_playlist', '')
-            if _default.startswith('img:'):
-                start_default_playlist()
-                logging.info("ℹ️  No names playlist — restarted default img content after overlay")
+            # No names content configured. Nothing on the output to stop (seq:/playlist
+            # waiting was never stopped); just restore the overlay for the waiting content.
+            if returning_to_image:
+                start_default_playlist(default_content)   # image + State 2, overwrites overlay, no blank
+                logging.info("ℹ️  No names playlist — restored img waiting (no blank)")
             else:
-                logging.info("ℹ️  No names playlist — waiting content unchanged, overlay cleared")
+                _clear_overlay()
+                logging.info("ℹ️  No names playlist — overlay cleared, waiting content shows")
             return
 
+        # 1) Stop the NAME content by type. Never a blanket Stop Now — the main
+        #    scheduler and any coexisting foreground must keep running.
         if name_playlist.startswith('seq:'):
-            # Stop the names FSEQ Effect — waiting FSEQ keeps running underneath
+            # Stop the names FSEQ Effect — waiting FSEQ (if any) keeps running underneath
             seq_name = name_playlist[4:].removesuffix('.fseq')
             r = requests.get(f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(seq_name)}", timeout=3)
             logging.info(f"⏹️  FSEQ Effect Stop (names): {r.status_code} - {r.text}")
-
         elif name_playlist.startswith('img:'):
-            # Image mode: overlay was used, nothing extra to stop.
-            # Re-apply default img content (it won't auto-resume)
-            if default_content.startswith('img:'):
-                start_default_playlist()
-
+            # Image name used the overlay only — nothing on the output to stop.
+            pass
         else:
-            r = requests.get(f"{fpp_host}/api/command/{urllib.parse.quote('Stop Now')}", timeout=3)
-            logging.info(f"⏹️  Stop Now ({r.status_code})")
-            if default_content.startswith('img:'):
-                start_default_playlist()
+            # Names content is a foreground playlist — stop just that playlist
+            # (not a blanket Stop Now), so any coexisting foreground isn't killed.
+            r = requests.get(f"{fpp_host}/api/playlists/stop", timeout=3)
+            logging.info(f"⏹️  Stopped names playlist ({r.status_code})")
+
+        # 2) Restore WAITING content on the overlay.
+        #    - img: waiting → re-render it and set State 2 Opaque. The name display
+        #      overwrote the overlay buffer (text frames or a name image), so this must
+        #      run for every name type. start_default_playlist writes the image and flips
+        #      to State 2 in one step, so an image→image return has NO blank frame.
+        #    - seq:/none waiting → just turn the overlay off; the seq (still looping
+        #      underneath) or the bare output shows through. No blank either (the
+        #      background was there the whole time).
+        if returning_to_image:
+            start_default_playlist(default_content)
+            logging.info("🖼️  Restored img waiting content (no blank)")
+        else:
+            _clear_overlay()
 
     except Exception as e:
         logging.error(f"Error in return_to_default_playlist: {e}")
 
 
 def stop_show_playback():
-    """Stop the waiting content and any current sequence/playlist/overlay text.
-    This is the 'lights off' action shared by Stop and the end of a graceful
-    drain — it does NOT touch config['enabled'] (the caller owns that)."""
+    """Stop ONLY the plugin's own content — its background FSEQ effect(s) and its
+    text/image overlay. The plugin always runs as a BACKGROUND layer, so this
+    deliberately never issues 'Stop Now' or a blanket playlist stop: any OTHER
+    foreground sequence on the Pi (e.g. a static house display running the pixels)
+    keeps playing. This is the 'lights off' action shared by Stop and the end of a
+    graceful drain — it does NOT touch config['enabled'] (the caller owns that).
+
+    (If the plugin's own waiting content is itself a foreground playlist/video —
+    not a background effect — we stop that one playlist, since in that case it IS
+    the plugin's own foreground.)"""
+    global stop_rotator, _active_waiting_content
+    # Pause the waiting rotator and hold its lock across teardown so it can't start a new
+    # item mid-stop (it re-checks the pause flag under this same lock before switching).
+    stop_rotator = True
+    try:
+        with rotator_lock:
+            _stop_show_playback_locked()
+    except Exception as e:
+        logging.warning(f"Could not stop FPP playback: {e}")
+
+
+def _stop_show_playback_locked():
+    """Teardown body of stop_show_playback, run while holding rotator_lock."""
+    global _active_waiting_content
     try:
         import urllib.parse
-        default = config.get('default_playlist', '')
-        if default.startswith('seq:'):
-            # FSEQ Effect Stop uses the display name without .fseq
-            seq_name = default[4:].removesuffix('.fseq')
-            effect_stop_url = f"{FPP_HOST}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(seq_name)}"
-            r = requests.get(effect_stop_url, timeout=3)
-            logging.info(f"🛑 FSEQ Effect Stop: {r.status_code} - {r.text}")
 
-        # Stop Now catches playlists, videos, and foreground sequences
-        r2 = requests.get(f"{FPP_HOST}/api/command/{urllib.parse.quote('Stop Now')}", timeout=3)
-        logging.info(f"🛑 Stop Now: {r2.status_code} - {r2.text}")
+        # Stop any running name scroll animation first so it can't rewrite the overlay
+        # buffer after we clear it below.
+        _stop_scroll_thread()
 
-        # Clear the text/image overlay so nothing is left on the model
+        # Stop the plugin's own background FSEQ effects: the single waiting content, every
+        # seq: item in the WAITING rotation list, the flat name content, and every seq: item
+        # in the names list (any could be the one currently looping). FSEQ Effect Stop on a
+        # non-running seq is harmless.
+        _wait_seq = [it.get('content', '') for it in (config.get('default_content_list', []) or [])]
+        _names_seq = [it.get('content', '') for it in (config.get('names_content_list', []) or [])]
+        for content in [config.get('default_playlist', ''), config.get('name_display_playlist', ''), *_wait_seq, *_names_seq]:
+            if content.startswith('seq:'):
+                seq_name = content[4:].removesuffix('.fseq')
+                r = requests.get(f"{FPP_HOST}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(seq_name)}", timeout=3)
+                logging.info(f"🛑 FSEQ Effect Stop ({seq_name}): {r.status_code}")
+
+        # Clear the plugin's text/image overlay so nothing is left on the model.
         overlay_model = config.get('overlay_model_name', '')
         if overlay_model:
             encoded = urllib.parse.quote(overlay_model)
             requests.put(f"{FPP_HOST}/api/overlays/model/{encoded}/state", json={"State": 0}, timeout=3)
             logging.info("🛑 Overlay cleared")
+
+        # Only if the plugin's OWN waiting content is a foreground playlist/video
+        # (not a background seq:/img:) do we stop the foreground — that playlist is
+        # the plugin's own. Never for seq:/img:, so a coexisting show is untouched.
+        default = config.get('default_playlist', '')
+        if default and not default.startswith(('seq:', 'img:')):
+            r = requests.get(f"{FPP_HOST}/api/playlists/stop", timeout=3)
+            logging.info(f"🛑 Stopped plugin foreground playlist: {r.status_code}")
+
+        # Nothing is on the output now — clear the active-waiting marker so a later restart
+        # brings its first item up as a clean switch rather than a same-file no-op.
+        _active_waiting_content = ''
     except Exception as e:
         logging.warning(f"Could not stop FPP playback: {e}")
 
@@ -2656,11 +3248,12 @@ def display_worker():
             except Exception as e:
                 logging.error(f"💥 Error sending to FPP: {e}")
             
-            display_duration = int(config.get('display_duration', 30))
+            # Per-content duration chosen by send_to_fpp for the item actually shown.
+            display_duration = int(_active_display_duration or config.get('display_duration', 30))
             logging.info(f"⏱️  Displaying for {display_duration} seconds...")
 
             try:
-                name_playlist_chk = config.get('name_display_playlist', '')
+                name_playlist_chk = _active_name_content or ''
                 overlay_model_chk = config.get('overlay_model_name', '')
                 if not name_playlist_chk and overlay_model_chk:
                     # No names content — FPP can reset the overlay state while the waiting
@@ -3472,19 +4065,105 @@ def index():
                             🔴 <strong>Plugin is Live</strong> — run Text My Lights Stop to edit
                         </div>
                         <div id="fpp_content_inputs">
-                            <label>Default "Waiting" Content: <span style="color:#f44336;font-size:12px;">* required</span> <span class="help-text" style="font-weight:normal;margin-left:6px;">📺 This content loops while waiting for text messages</span></label>
-                            <select id="default_playlist">
+                            <div style="display:flex; gap:20px; flex-wrap:wrap; align-items:flex-start;">
+                              <div style="flex:1; min-width:280px;">
+                            <label>Default "Waiting" Content: <span style="color:#f44336;font-size:12px;">* required</span> <span class="help-text" style="font-weight:normal;margin-left:6px;">📺 Loops while waiting for texts. Add 2+ to rotate between them (each sequence plays fully, then the next starts with no black gap).</span></label>
+                            <!-- Hidden legacy single-value select: kept in sync with the first
+                                 list item. Drives the canvas preview background + the
+                                 deleted-file prune, and is the value saved as default_playlist. -->
+                            <select id="default_playlist" style="display:none;">
                                 <option value="">-- Select content --</option>
                             </select>
+                            <div id="waiting_content_list_box" style="border:1px solid #ddd; border-radius:5px; padding:10px; background:#fff;">
+                                <div id="waiting_content_items"></div>
+                                <button type="button" onclick="openManageWaitingModal()" style="margin-top:8px; font-size:13px; padding:6px 14px; cursor:pointer; background:#1976d2; color:#fff; border:none; border-radius:4px;">🗂️ Add / Arrange Waiting Content</button>
+                                <div id="waiting_mode_row" style="display:none; margin-top:12px; padding-top:10px; border-top:1px solid #eee;">
+                                    <span style="font-size:13px; color:#555; margin-right:10px;">When a sequence ends, play:</span>
+                                    <label style="margin-right:14px; cursor:pointer; color:#333; font-size:13px;"><input type="radio" name="waiting_mode" value="roundrobin" onchange="onWaitingModeChange('roundrobin')" style="width:auto;margin:0 5px 0 0;vertical-align:middle;">Round Robin (in order)</label>
+                                    <label style="cursor:pointer; color:#333; font-size:13px;"><input type="radio" name="waiting_mode" value="random" onchange="onWaitingModeChange('random')" style="width:auto;margin:0 5px 0 0;vertical-align:middle;">Random</label>
+                                </div>
+                            </div>
+                            <div id="waiting_content_none_warning" style="display:none; background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:5px; padding:8px 12px; margin-top:6px; font-size:13px;">
+                                ⚠️ No Waiting content selected — required before you can Start the show.
+                            </div>
+                              </div>
+                              <div style="flex:1; min-width:280px;">
+                            <label>Name Display Content: <span class="help-text" style="font-weight:normal;margin-left:6px;">🎬 Background(s) shown when a name appears. Add one or more — each gets its own text layout on the Display tab.</span></label>
+                            <div id="names_content_list_box" style="border:1px solid #ddd; border-radius:5px; padding:10px; background:#fff;">
+                                <div id="names_content_items"></div>
+                                <button type="button" onclick="openManageContentModal()" style="margin-top:8px; font-size:13px; padding:6px 14px; cursor:pointer; background:#1976d2; color:#fff; border:none; border-radius:4px;">🗂️ Add / Arrange Content</button>
+                                <div id="names_mode_row" style="display:none; margin-top:12px; padding-top:10px; border-top:1px solid #eee;">
+                                    <span style="font-size:13px; color:#555; margin-right:10px;">When a name arrives, pick:</span>
+                                    <label style="margin-right:14px; cursor:pointer; color:#333; font-size:13px;"><input type="radio" name="names_mode" value="roundrobin" onchange="onNamesModeChange('roundrobin')" style="width:auto;margin:0 5px 0 0;vertical-align:middle;">Round Robin</label>
+                                    <label style="cursor:pointer; color:#333; font-size:13px;"><input type="radio" name="names_mode" value="random" onchange="onNamesModeChange('random')" style="width:auto;margin:0 5px 0 0;vertical-align:middle;">Random</label>
+                                </div>
+                            </div>
+                            <div id="name_display_none_warning" style="display:none; background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:5px; padding:8px 12px; margin-top:6px; font-size:13px;">
+                                ⚠️ No Names content — names will appear directly over the Waiting content (using the Display-tab text layout).
+                            </div>
+                              </div>
+                            </div>
 
-                            <label>Name Display Content: <span class="help-text" style="font-weight:normal;margin-left:6px;">🎬 This content plays when displaying a name</span></label>
-                            <select id="name_display_playlist">
-                                <option value="">-- None (Same as "Waiting" Content) --</option>
-                                {% set _np = config.get('name_display_playlist', '') %}
-                                {% if _np %}<option value="{{ _np }}" selected>{{ _np }}</option>{% endif %}
-                            </select>
-                            <div id="name_display_none_warning" style="display:none; background:#3a2f00; border:1px solid #ffc107; color:#ffc107; border-radius:5px; padding:8px 12px; margin-top:6px; font-size:13px;">
-                                ⚠️ Left as None — names will appear directly over the Waiting content.
+                            <!-- Manage Names Content modal: Available (left) → Names list (right), with arrows.
+                                 Top-aligned + high z-index (matching the export modal's overlay) and paired with
+                                 a scroll-to-top on open, so it lands in view inside the auto-height FPP iframe
+                                 where position:fixed is relative to the full plugin height, not the viewport. -->
+                            <div id="manage_content_modal" onclick="if(event.target===this)closeManageContentModal()" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:100000; align-items:flex-start; justify-content:center; padding-top:24px; box-sizing:border-box;">
+                                <div onclick="event.stopPropagation()" style="background:#fff; color:#333; border-radius:8px; padding:22px; width:94%; max-width:740px; box-shadow:0 8px 30px rgba(0,0,0,0.35); max-height:90vh; overflow:auto; box-sizing:border-box;">
+                                    <h3 style="margin-top:0;">Manage Names Content</h3>
+                                    <p class="help-text" style="margin-top:4px;">Select content on the left and click ▶ to add it to your Names list. Reorder the list with ▲ / ▼ (order matters for Round Robin). Remove with ◀.</p>
+                                    <div style="display:flex; gap:10px; align-items:stretch;">
+                                        <div style="flex:1; min-width:0;">
+                                            <label style="font-size:13px;">Available Content</label>
+                                            <select id="mng_available" multiple size="12" style="width:100%; height:280px; box-sizing:border-box;"></select>
+                                        </div>
+                                        <div style="display:flex; flex-direction:column; justify-content:center; gap:10px;">
+                                            <button type="button" onclick="mngAdd()" title="Add to Names list" style="padding:6px 10px; cursor:pointer;">▶</button>
+                                            <button type="button" onclick="mngRemove()" title="Remove from Names list" style="padding:6px 10px; cursor:pointer;">◀</button>
+                                        </div>
+                                        <div style="flex:1; min-width:0;">
+                                            <label style="font-size:13px;">Names List (in order)</label>
+                                            <select id="mng_selected" multiple size="12" style="width:100%; height:280px; box-sizing:border-box;"></select>
+                                        </div>
+                                        <div style="display:flex; flex-direction:column; justify-content:center; gap:10px;">
+                                            <button type="button" onclick="mngMoveUp()" title="Move up" style="padding:6px 10px; cursor:pointer;">▲</button>
+                                            <button type="button" onclick="mngMoveDown()" title="Move down" style="padding:6px 10px; cursor:pointer;">▼</button>
+                                        </div>
+                                    </div>
+                                    <div style="margin-top:16px; display:flex; justify-content:flex-end; gap:8px;">
+                                        <button type="button" onclick="closeManageContentModal()" style="background:#2e7d32; color:#fff; padding:8px 20px; border:none; border-radius:4px; cursor:pointer;">Done</button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Manage Waiting Content modal — same two-pane picker as Names, but the
+                                 right list is the waiting-content rotation (no per-item text layout). -->
+                            <div id="manage_waiting_modal" onclick="if(event.target===this)closeManageWaitingModal()" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:100000; align-items:flex-start; justify-content:center; padding-top:24px; box-sizing:border-box;">
+                                <div onclick="event.stopPropagation()" style="background:#fff; color:#333; border-radius:8px; padding:22px; width:94%; max-width:740px; box-shadow:0 8px 30px rgba(0,0,0,0.35); max-height:90vh; overflow:auto; box-sizing:border-box;">
+                                    <h3 style="margin-top:0;">Manage Waiting Content</h3>
+                                    <p class="help-text" style="margin-top:4px;">Select content on the left and click ▶ to add it. With 2+ items the plugin rotates them while idle — each sequence plays its full length, then the next starts seamlessly (no black gap). Reorder with ▲ / ▼ (order matters for Round Robin). Remove with ◀.</p>
+                                    <div style="display:flex; gap:10px; align-items:stretch;">
+                                        <div style="flex:1; min-width:0;">
+                                            <label style="font-size:13px;">Available Content</label>
+                                            <select id="wmng_available" multiple size="12" style="width:100%; height:280px; box-sizing:border-box;"></select>
+                                        </div>
+                                        <div style="display:flex; flex-direction:column; justify-content:center; gap:10px;">
+                                            <button type="button" onclick="wmngAdd()" title="Add to Waiting list" style="padding:6px 10px; cursor:pointer;">▶</button>
+                                            <button type="button" onclick="wmngRemove()" title="Remove from Waiting list" style="padding:6px 10px; cursor:pointer;">◀</button>
+                                        </div>
+                                        <div style="flex:1; min-width:0;">
+                                            <label style="font-size:13px;">Waiting List (in order)</label>
+                                            <select id="wmng_selected" multiple size="12" style="width:100%; height:280px; box-sizing:border-box;"></select>
+                                        </div>
+                                        <div style="display:flex; flex-direction:column; justify-content:center; gap:10px;">
+                                            <button type="button" onclick="wmngMoveUp()" title="Move up" style="padding:6px 10px; cursor:pointer;">▲</button>
+                                            <button type="button" onclick="wmngMoveDown()" title="Move down" style="padding:6px 10px; cursor:pointer;">▼</button>
+                                        </div>
+                                    </div>
+                                    <div style="margin-top:16px; display:flex; justify-content:flex-end; gap:8px;">
+                                        <button type="button" onclick="closeManageWaitingModal()" style="background:#2e7d32; color:#fff; padding:8px 20px; border:none; border-radius:4px; cursor:pointer;">Done</button>
+                                    </div>
+                                </div>
                             </div>
 
                             <label>Overlay Model Name: <button type="button" onclick="refreshFPPLists(this)" style="font-size:11px;padding:2px 7px;margin-left:8px;cursor:pointer;">↻ Refresh Lists</button> <span class="help-text" style="font-weight:normal;margin-left:6px;">📝 The pixel overlay model for text (e.g., "Texting Matrix")</span></label>
@@ -3496,10 +4175,10 @@ def index():
                         <hr style="border: none; border-top: 1px solid #ddd; margin: 15px 0;">
                         <h2 style="margin-top: 0;">Message Settings</h2>
 
-                        <label>Display Duration (seconds):</label>
-                        <input type="number" id="display_duration" value="{{ config.display_duration }}" min="5" max="300" onchange="if(window.renderCanvasPreview)window.renderCanvasPreview();">
-                        <p class="help-text">⏱️ Each message displays for this many seconds before moving to the next</p>
-                        <p class="help-text">💡 Scrolling lines set to "Fit to time" use this as their scroll window.</p>
+                        <!-- Display Duration moved to the Display tab (it is now per Names
+                             content). This hidden field holds the fallback used when no Names
+                             content is configured, and keeps import/export compatible. -->
+                        <input type="hidden" id="display_duration" value="{{ config.display_duration }}">
 
                         <label>Max Messages Per Phone (0 = unlimited):</label>
                         <input type="number" id="max_messages" value="{{ config.max_messages_per_phone }}" min="0" max="100">
@@ -3980,7 +4659,7 @@ def index():
                     <div class="section">
                         <h2>Message Lines</h2>
 
-                        <label>Message Lines: <span style="font-size:11px; color:#888; font-weight:normal;">Use {name} in any line. Empty lines are skipped.</span></label>
+                        <label style="font-size:11px; color:#888; font-weight:normal;">Use {name} in any line. Empty lines are skipped.</label>
                         <style>
                             .line-card { background:#3a3a3a; border:1px solid #555; border-radius:5px; padding:8px 8px 6px; margin-bottom:6px; }
                             .line-row { display:flex; align-items:center; gap:6px; }
@@ -4009,18 +4688,23 @@ def index():
                             .line-speed-auto input[type="checkbox"] { width:auto; margin:0; cursor:pointer; }
                             .line-speed-sub { display:inline-flex; align-items:center; gap:6px; }
                         </style>
-                        {% set ml = config.get('message_lines') or ['Merry Christmas', '{name}!', '', ''] %}
-                        {% set lc = config.get('line_colors') or ['', '', '', ''] %}
-                        {% set lm = config.get('line_movements') or ['Center', 'Center', 'Center', 'Center'] %}
-                        {% set ls = config.get('line_speeds') or [50, 50, 50, 50] %}
+                        {# The editor renders the ACTIVE names-content item (item 0 when a
+                           list exists) or the flat config when the list is empty. JS handles
+                           switching to other items after fonts have loaded. #}
+                        {% set _ncl = config.get('names_content_list') or [] %}
+                        {% set _active = _ncl[0] if _ncl else config %}
+                        {% set ml = _active.get('message_lines') or ['Merry Christmas', '{name}!', '', ''] %}
+                        {% set lc = _active.get('line_colors') or ['', '', '', ''] %}
+                        {% set lm = _active.get('line_movements') or ['Center', 'Center', 'Center', 'Center'] %}
+                        {% set ls = _active.get('line_speeds') or [50, 50, 50, 50] %}
                         {# Per-line speed value with a safe fallback. speed <= 0 encodes
                            fit-to-time: 0/-1 = 1 pass, -N = N passes. #}
                         {% set s0 = ls[0] if ls|length > 0 else 50 %}
                         {% set s1 = ls[1] if ls|length > 1 else 50 %}
                         {% set s2 = ls[2] if ls|length > 2 else 50 %}
                         {% set s3 = ls[3] if ls|length > 3 else 50 %}
-                        {% set lf = config.get('line_fonts') or ['FreeSans', 'FreeSans', 'FreeSans', 'FreeSans'] %}
-                        {% set lo = config.get('line_orientations') or ['horizontal', 'horizontal', 'horizontal', 'horizontal'] %}
+                        {% set lf = _active.get('line_fonts') or ['FreeSans', 'FreeSans', 'FreeSans', 'FreeSans'] %}
+                        {% set lo = _active.get('line_orientations') or ['horizontal', 'horizontal', 'horizontal', 'horizontal'] %}
                         <div id="message_lines_section">
                             <div class="line-card">
                                 <div class="line-row">
@@ -4242,7 +4926,6 @@ def index():
 
                         <!-- Canvas: per-line drag in static mode; block preview in scroll modes -->
                         <div id="canvas_section">
-                            <label>Position Preview:</label>
                             <p id="canvas_hint" style="font-weight:bold; font-size:13px; color:#4fc3f7; margin:4px 0 8px;">🖱️ Click a line to select it, then drag inside its box to move it, or drag an edge/corner to resize. Text auto-sizes to fill the box — the box is the MAX size text can be.</p>
                             <p class="help-text" style="margin:-4px 0 8px;">↔️ For scrolling text (Left/Right/Top/Bottom movement), the box is also where the text is allowed to show — it enters and exits at the box's own edges, not the display's, and always starts fully off-page before scrolling in.</p>
                             <canvas id="matrix_canvas" style="width:100%; display:block; background:#000; border:2px solid #555; border-radius:4px; cursor:default;"></canvas>
@@ -4251,14 +4934,25 @@ def index():
                                 <span id="pos_display" style="font-size:12px; color:#888;"></span>
                             </div>
 
+                            <div style="margin-top:10px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                                <label style="margin:0;">Display Duration (seconds):</label>
+                                <input type="number" id="content_duration" min="1" max="600" style="width:90px; margin:0;" onchange="onContentDurationChange()">
+                                <span class="help-text" id="content_duration_scope" style="margin:0;"></span>
+                            </div>
+                            <p class="help-text" style="margin:6px 0 0;">💡 Scrolling lines set to "Fit to time" use this as their scroll window.</p>
+
                             <!-- Canvas background preview (FSEQ / video / image) -->
                             <div style="margin-top:10px; padding:10px; background:#616161; border:1px solid #777; border-radius:4px;">
                                 <span style="font-size:13px; font-weight:bold; color:#eee;">Background Preview</span>
                                 <span id="fseq_scrub_hint" style="font-weight:normal; font-size:11px; color:#bbb; margin-left:6px;">Use scroll bar to move preview.</span>
                                 <div id="fseq_preview_controls" style="margin-top:8px;">
-                                    <div style="margin-bottom:6px;">
-                                        <span id="fseq_seq_label" style="font-size:12px; color:#ccc;">Sequence: —</span>
+
+                                    <!-- Per-content editor: pick which Names content's text you are
+                                         arranging/previewing. Shown only when >1 content is configured. -->
+                                    <div id="preview_content_row" style="display:none; margin-bottom:8px; padding:8px; background:#3a3a3a; border:1px solid #555; border-radius:4px;">
+                                        <select id="preview_content_select" onchange="onPreviewContentChange()" style="width:100%;"></select>
                                     </div>
+
                                     <div id="fseq_scrubber_row" style="display:none;">
                                         <div style="display:flex; align-items:center; gap:8px;">
                                             <span id="fseq_time_display" style="font-size:12px; color:#aaa; min-width:85px; white-space:nowrap;">0:00 / 0:00</span>
@@ -4276,12 +4970,21 @@ def index():
                         <input type="hidden" id="overlay_model_width" value="{{ config.get('overlay_model_width', 0) }}">
                         <input type="hidden" id="overlay_model_height" value="{{ config.get('overlay_model_height', 0) }}">
                         <script>
-                            window._lineBoxesInit = {{ config.get('line_boxes', [{'x':-1,'y':-1,'w':300,'h':60},{'x':-1,'y':-1,'w':300,'h':60},{'x':-1,'y':-1,'w':300,'h':60},{'x':-1,'y':-1,'w':300,'h':60}]) | tojson }};
-                            window._lineMovementsInit = {{ config.get('line_movements', ['Center', 'Center', 'Center', 'Center']) | tojson }};
-                            window._lineSpeedsInit = {{ config.get('line_speeds', [50, 50, 50, 50]) | tojson }};
-                            window._lineFontsInit = {{ config.get('line_fonts', ['FreeSans', 'FreeSans', 'FreeSans', 'FreeSans']) | tojson }};
-                            window._lineOrientationsInit = {{ config.get('line_orientations', ['horizontal', 'horizontal', 'horizontal', 'horizontal']) | tojson }};
+                            {% set _ncl2 = config.get('names_content_list') or [] %}
+                            {% set _active2 = _ncl2[0] if _ncl2 else config %}
+                            window._lineBoxesInit = {{ (_active2.get('line_boxes') or [{'x':-1,'y':-1,'w':300,'h':60},{'x':-1,'y':-1,'w':300,'h':60},{'x':-1,'y':-1,'w':300,'h':60},{'x':-1,'y':-1,'w':300,'h':60}]) | tojson }};
+                            window._lineMovementsInit = {{ (_active2.get('line_movements') or ['Center', 'Center', 'Center', 'Center']) | tojson }};
+                            window._lineSpeedsInit = {{ (_active2.get('line_speeds') or [50, 50, 50, 50]) | tojson }};
+                            window._lineFontsInit = {{ (_active2.get('line_fonts') or ['FreeSans', 'FreeSans', 'FreeSans', 'FreeSans']) | tojson }};
+                            window._lineOrientationsInit = {{ (_active2.get('line_orientations') or ['horizontal', 'horizontal', 'horizontal', 'horizontal']) | tojson }};
                             window._customColorsInit = {{ config.get('custom_colors', []) | tojson }};
+                            window._namesContentListInit = {{ (config.get('names_content_list') or []) | tojson }};
+                            window._namesContentModeInit = {{ config.get('names_content_mode', 'roundrobin') | tojson }};
+                            window._flatNameContentInit = {{ config.get('name_display_playlist', '') | tojson }};
+                            window._flatDisplayDurationInit = {{ config.get('display_duration', 30) | tojson }};
+                            window._waitingContentListInit = {{ (config.get('default_content_list') or []) | tojson }};
+                            window._waitingContentModeInit = {{ config.get('default_content_mode', 'roundrobin') | tojson }};
+                            window._flatDefaultContentInit = {{ config.get('default_playlist', '') | tojson }};
                         </script>
                     </div>
                 </div>
@@ -4910,7 +5613,8 @@ def index():
                     return pos;
                 }
                 function getDisplayDuration() {
-                    var el = document.getElementById('display_duration');
+                    // Per-content duration field (falls back to the hidden global field).
+                    var el = document.getElementById('content_duration') || document.getElementById('display_duration');
                     return (el && parseInt(el.value, 10)) || 10;
                 }
 
@@ -4967,6 +5671,16 @@ def index():
                 function renderCanvasPreview() {
                     var mw = window._canvasModelW || 640;
                     var mh = window._canvasModelH || 360;
+
+                    // Kick off loading of every line's font (no-op if already loaded/loading).
+                    // ensureFontLoaded repaints when a font finishes, so a preview drawn before
+                    // a custom font is ready — the common post-reboot / two-different-fonts case
+                    // — corrects itself without needing to toggle the font dropdown.
+                    if (typeof ensureFontLoaded === 'function') {
+                        for (var _ff = 0; _ff < 4; _ff++) {
+                            try { ensureFontLoaded(getLineFont(_ff)); } catch(e) {}
+                        }
+                    }
 
                     // The model fills the whole canvas -- no off-page margin. Scrolling text
                     // already starts fully hidden on its own (see the scroll-position
@@ -5476,10 +6190,18 @@ def index():
 
                 // Returns {type, file} for the configured Names Display content, or null.
                 function getConfiguredContent() {
-                    var dp = document.getElementById('name_display_playlist');
-                    var defaultDp = document.getElementById('default_playlist');
-                    // Fall back to waiting content when names content is "None"
-                    var val = (dp && dp.value) ? dp.value : (defaultDp ? defaultDp.value : '');
+                    // Background for the preview = the SELECTED names content item, or the
+                    // waiting content when no names content is configured.
+                    var val = '';
+                    var lst = window._namesContentList || [];
+                    var idx = window._namesSelectedIndex;
+                    if (lst.length > 0 && idx != null && idx >= 0 && idx < lst.length) {
+                        val = lst[idx].content || '';
+                    }
+                    if (!val) {
+                        var defaultDp = document.getElementById('default_playlist');
+                        val = defaultDp ? defaultDp.value : '';
+                    }
                     if (!val) return null;
                     if (val.startsWith('seq:')) {
                         return { type: 'seq', file: val.replace(/^seq:/, '').replace(/\.fseq$/, '') };
@@ -5493,17 +6215,480 @@ def index():
                     return null;  // plain playlist — no canvas preview
                 }
 
+                // ===================== Names Content List =====================
+                window._namesContentList = Array.isArray(window._namesContentListInit) ? window._namesContentListInit : [];
+                window._namesMode = window._namesContentModeInit || 'roundrobin';
+                window._namesSelectedIndex = (window._namesContentList.length > 0) ? 0 : -1;
+
+                function _blankLayout() {
+                    return {
+                        message_lines: ['', '', '', ''],
+                        line_boxes: [{x:-1,y:-1,w:300,h:60},{x:-1,y:-1,w:300,h:60},{x:-1,y:-1,w:300,h:60},{x:-1,y:-1,w:300,h:60}],
+                        line_colors: ['','','',''],
+                        line_movements: ['Center','Center','Center','Center'],
+                        line_speeds: [50,50,50,50],
+                        line_fonts: ['FreeSans','FreeSans','FreeSans','FreeSans'],
+                        line_orientations: ['horizontal','horizontal','horizontal','horizontal'],
+                        display_duration: parseInt(window._flatDisplayDurationInit) || 30
+                    };
+                }
+
+                // Read the current editor DOM + window buffers into a layout object.
+                function collectEditorLayout() {
+                    function gv(id){ var el=document.getElementById(id); return el?el.value:''; }
+                    return {
+                        message_lines: [gv('line_1'),gv('line_2'),gv('line_3'),gv('line_4')],
+                        line_boxes: (window._lineBoxes||[]).slice(0,4).map(function(b){return {x:b.x,y:b.y,w:b.w,h:b.h};}),
+                        line_colors: [1,2,3,4].map(function(n){var el=document.getElementById('line_'+n+'_color'); return el?el.value.toUpperCase():'';}),
+                        line_movements: (window._lineMovements||['Center','Center','Center','Center']).slice(0,4),
+                        line_speeds: (window._lineSpeeds||[50,50,50,50]).slice(0,4),
+                        line_fonts: [1,2,3,4].map(function(n){var el=document.getElementById('line_'+n+'_font'); return (el&&el.value)?el.value:'FreeSans';}),
+                        line_orientations: (window._lineOrientations||['horizontal','horizontal','horizontal','horizontal']).slice(0,4),
+                        display_duration: parseInt(gv('content_duration'))||30
+                    };
+                }
+
+                // Write a layout into the editor DOM + window buffers, then refresh preview.
+                function applyLayoutToEditor(L) {
+                    L = L || _blankLayout();
+                    var lb = L.line_boxes || [];
+                    window._lineBoxes = [];
+                    for (var i=0;i<4;i++){ var b=lb[i]||{x:-1,y:-1,w:300,h:60}; window._lineBoxes.push({x:b.x,y:b.y,w:b.w,h:b.h}); }
+                    window._lineMovements = (L.line_movements||[]).slice(0,4); while(window._lineMovements.length<4) window._lineMovements.push('Center');
+                    window._lineSpeeds = (L.line_speeds||[]).slice(0,4); while(window._lineSpeeds.length<4) window._lineSpeeds.push(50);
+                    window._lineOrientations = (L.line_orientations||[]).slice(0,4); while(window._lineOrientations.length<4) window._lineOrientations.push('horizontal');
+                    var ml=L.message_lines||[], lc=L.line_colors||[], lf=L.line_fonts||[];
+                    for (var n=0;n<4;n++){
+                        var t=document.getElementById('line_'+(n+1)); if(t) t.value=ml[n]||'';
+                        var c=document.getElementById('line_'+(n+1)+'_color'); if(c) c.value=(lc[n]||'#FF0000');
+                        var mv=document.getElementById('line_'+(n+1)+'_movement'); if(mv) mv.value=window._lineMovements[n];
+                        var fo=document.getElementById('line_'+(n+1)+'_font'); if(fo && lf[n]) fo.value=lf[n];
+                        var oro=document.getElementById('line_'+(n+1)+'_orientation'); if(oro) oro.value=window._lineOrientations[n];
+                        var sp=window._lineSpeeds[n];
+                        var au=document.getElementById('line_'+(n+1)+'_speed_auto'); if(au) au.checked=(sp<=0);
+                        var se=document.getElementById('line_'+(n+1)+'_speed'); if(se) se.value=(sp>0?sp:50);
+                        var pa=document.getElementById('line_'+(n+1)+'_passes'); if(pa) pa.value=(sp<0?(-sp):1);
+                        var sw=document.getElementById('line_'+(n+1)+'_speed_wrap'); if(sw) sw.style.display=(sp<=0)?'none':'';
+                        var pw=document.getElementById('line_'+(n+1)+'_passes_wrap'); if(pw) pw.style.display=(sp<=0)?'':'none';
+                        if (typeof updateLineSpeedRowVisibility==='function') updateLineSpeedRowVisibility(n);
+                        if (typeof updateLineOrientationRowVisibility==='function') updateLineOrientationRowVisibility(n);
+                    }
+                    var d=document.getElementById('content_duration'); if(d) d.value=L.display_duration||30;
+                    if (typeof window.renderCanvasPreview==='function') window.renderCanvasPreview();
+                }
+
+                // Flush the editor into the currently-selected item (mirror duration to the
+                // hidden global field when there is no list).
+                function flushEditorToSelected() {
+                    var lst=window._namesContentList||[];
+                    var idx=window._namesSelectedIndex;
+                    if (lst.length>0 && idx>=0 && idx<lst.length) {
+                        var L=collectEditorLayout(); var it=lst[idx];
+                        it.message_lines=L.message_lines; it.line_boxes=L.line_boxes; it.line_colors=L.line_colors;
+                        it.line_movements=L.line_movements; it.line_speeds=L.line_speeds;
+                        it.line_orientations=L.line_orientations; it.display_duration=L.display_duration;
+                        // Only capture fonts once the font dropdowns are populated, else an
+                        // early autosave would overwrite real fonts with the FreeSans default.
+                        if (window._fontsReady) it.line_fonts=L.line_fonts;
+                    } else {
+                        var d=document.getElementById('content_duration'); var hd=document.getElementById('display_duration');
+                        if (d && hd) hd.value = parseInt(d.value)||30;
+                    }
+                }
+
+                // Render the Name Display list + preview dropdown + mode toggle + none warning.
+                function renderNamesList() {
+                    var lst=window._namesContentList||[];
+                    var box=document.getElementById('names_content_items');
+                    if (box) {
+                        box.innerHTML='';
+                        if (lst.length===0) {
+                            box.innerHTML='<div style="font-size:13px;color:#777;">No content added — names show over the Waiting content.</div>';
+                        } else {
+                            lst.forEach(function(it, i){
+                                var row=document.createElement('div');
+                                var isSel=(i===window._namesSelectedIndex);
+                                row.style.cssText='display:flex;align-items:center;gap:8px;padding:5px 6px;border-bottom:1px solid #eee;border-radius:3px;'+(isSel?'background:#e3f2fd;':'');
+                                var label=document.createElement('span');
+                                label.style.cssText='flex:1;font-size:13px;color:#333;cursor:pointer;';
+                                label.textContent=(i+1)+'. '+(it.content||'(none)');
+                                label.title='Click to edit this content’s text on the Display tab';
+                                label.onclick=function(){ selectNamesItem(i); };
+                                var del=document.createElement('button');
+                                del.type='button'; del.textContent='✕'; del.title='Remove';
+                                del.style.cssText='background:#f44336;border:none;color:#fff;padding:2px 9px;border-radius:3px;cursor:pointer;font-size:12px;';
+                                del.onclick=function(){ removeNamesItem(i); };
+                                row.appendChild(label); row.appendChild(del);
+                                box.appendChild(row);
+                            });
+                        }
+                    }
+                    var modeRow=document.getElementById('names_mode_row');
+                    if (modeRow) modeRow.style.display=(lst.length>1)?'block':'none';
+                    var rr=document.querySelector('input[name="names_mode"][value="roundrobin"]');
+                    var rnd=document.querySelector('input[name="names_mode"][value="random"]');
+                    if (rr) rr.checked=(window._namesMode!=='random');
+                    if (rnd) rnd.checked=(window._namesMode==='random');
+                    var warn=document.getElementById('name_display_none_warning');
+                    if (warn) warn.style.display=(lst.length===0)?'block':'none';
+                    var sel=document.getElementById('preview_content_select');
+                    if (sel) { sel.innerHTML=''; lst.forEach(function(it,i){ sel.appendChild(new Option((i+1)+'. '+(it.content||'(none)'), i, false, i===window._namesSelectedIndex)); }); }
+                    var prow=document.getElementById('preview_content_row');
+                    if (prow) prow.style.display=(lst.length>1)?'block':'none';
+                    var scope=document.getElementById('content_duration_scope');
+                    if (scope) scope.textContent=(lst.length>0)?('— for content '+(window._namesSelectedIndex+1)):'— shown over waiting content';
+                }
+
+                // ---- Manage Content modal (Available <-> Names list, with arrows) ----
+                function _mngAvailableOptions() {
+                    // Hide content already in the Names list (right side).
+                    var used={}; (window._namesContentList||[]).forEach(function(it){ used[it.content]=true; });
+                    var out=[];
+                    (window._fppSeqList||[]).forEach(function(s){ var v='seq:'+s; if(!used[v]) out.push({val:v, label:'🎬 '+s}); });
+                    (window._fppImgList||[]).forEach(function(im){ var v='img:'+im; if(!used[v]) out.push({val:v, label:'🖼️ '+im}); });
+                    return out;
+                }
+                function _mngRenderAvailable() {
+                    var sel=document.getElementById('mng_available'); if(!sel) return;
+                    sel.innerHTML='';
+                    _mngAvailableOptions().forEach(function(o){ sel.appendChild(new Option(o.label, o.val)); });
+                }
+                function _mngRenderSelected(keepIdx) {
+                    var sel=document.getElementById('mng_selected'); if(!sel) return;
+                    sel.innerHTML='';
+                    (window._namesContentList||[]).forEach(function(it,i){ sel.appendChild(new Option((i+1)+'. '+(it.content||'(none)'), i)); });
+                    if (keepIdx!=null && keepIdx>=0 && keepIdx<sel.options.length) sel.options[keepIdx].selected=true;
+                }
+                function openManageContentModal() {
+                    flushEditorToSelected();          // don't lose current edits
+                    _mngRenderAvailable();
+                    _mngRenderSelected();
+                    // Scroll to top so the top-aligned fixed modal is in view inside the iframe.
+                    try { window.scrollTo(0,0); window.parent.postMessage({type:'scrollTop'},'*'); } catch(e) {}
+                    var m=document.getElementById('manage_content_modal'); if(m) m.style.display='flex';
+                }
+                function closeManageContentModal() {
+                    var m=document.getElementById('manage_content_modal'); if(m) m.style.display='none';
+                    var lst=window._namesContentList||[];
+                    if (window._namesSelectedIndex>=lst.length) window._namesSelectedIndex=lst.length-1;
+                    if (lst.length>0 && window._namesSelectedIndex<0) window._namesSelectedIndex=0;
+                    renderNamesList();
+                    if (window._namesSelectedIndex>=0) applyLayoutToEditor(lst[window._namesSelectedIndex]);
+                    if (typeof window.toggleFseqPreview==='function') window.toggleFseqPreview();
+                    saveConfig();
+                }
+                // A freshly-added content defaults to showing the texter's {name} on
+                // line 1, centered (position + movement). Never clobber text the user
+                // has already typed into any line.
+                function _seedNamePlaceholder(item) {
+                    var ml = item.message_lines || ['','','',''];
+                    var hasText = ml.some(function(s){ return (s||'').trim() !== ''; });
+                    if (!hasText) {
+                        item.message_lines = ['{name}','','',''];
+                        item.line_boxes = item.line_boxes || [];
+                        item.line_boxes[0] = {x:-1,y:-1,w:300,h:60};   // -1,-1 = centered
+                        item.line_movements = item.line_movements || ['Center','Center','Center','Center'];
+                        item.line_movements[0] = 'Center';
+                    }
+                    return item;
+                }
+                function mngAdd() {
+                    var av=document.getElementById('mng_available'); if(!av) return;
+                    var chosen=Array.prototype.filter.call(av.options,function(o){return o.selected;}).map(function(o){return o.value;});
+                    if (!chosen.length) return;
+                    var lst=window._namesContentList;
+                    chosen.forEach(function(val){
+                        var item;
+                        if (lst.length===0) { item=collectEditorLayout(); item.content=val; }  // seed first from current editor
+                        else { item=_blankLayout(); item.content=val; }
+                        _seedNamePlaceholder(item);
+                        lst.push(item);
+                    });
+                    _mngRenderSelected(lst.length-1);
+                    _mngRenderAvailable();   // hide the newly-added items from the left list
+                }
+                function mngRemove() {
+                    var sel=document.getElementById('mng_selected'); if(!sel) return;
+                    var idxs=Array.prototype.filter.call(sel.options,function(o){return o.selected;}).map(function(o){return parseInt(o.value);});
+                    if (!idxs.length) return;
+                    idxs.sort(function(a,b){return b-a;}).forEach(function(i){ window._namesContentList.splice(i,1); });
+                    _mngRenderSelected();
+                    _mngRenderAvailable();   // removed items become available again
+                }
+                function mngMoveUp() {
+                    var sel=document.getElementById('mng_selected'); if(!sel) return;
+                    var i=sel.selectedIndex; if(i<=0) return;
+                    var lst=window._namesContentList;
+                    var tmp=lst[i-1]; lst[i-1]=lst[i]; lst[i]=tmp;
+                    _mngRenderSelected(i-1);
+                }
+                function mngMoveDown() {
+                    var sel=document.getElementById('mng_selected'); if(!sel) return;
+                    var i=sel.selectedIndex; var lst=window._namesContentList;
+                    if(i<0||i>=lst.length-1) return;
+                    var tmp=lst[i+1]; lst[i+1]=lst[i]; lst[i]=tmp;
+                    _mngRenderSelected(i+1);
+                }
+                function removeNamesItem(i) {
+                    var lst=window._namesContentList; if (i<0||i>=lst.length) return;
+                    flushEditorToSelected();
+                    lst.splice(i,1);
+                    if (window._namesSelectedIndex>=lst.length) window._namesSelectedIndex=lst.length-1;
+                    if (lst.length===0) window._namesSelectedIndex=-1;
+                    renderNamesList();
+                    if (window._namesSelectedIndex>=0) applyLayoutToEditor(lst[window._namesSelectedIndex]);
+                    if (typeof window.toggleFseqPreview==='function') window.toggleFseqPreview();
+                    saveConfig();
+                }
+                function selectNamesItem(i) {
+                    var lst=window._namesContentList; if (i<0||i>=lst.length) return;
+                    flushEditorToSelected();      // capture edits to the item we're leaving
+                    window._namesSelectedIndex=i;
+                    applyLayoutToEditor(lst[i]);
+                    renderNamesList();
+                    if (typeof window.toggleFseqPreview==='function') window.toggleFseqPreview();
+                    if (typeof saveConfig==='function') saveConfig();  // persist the flushed edits
+                }
+                function onPreviewContentChange(){ var sel=document.getElementById('preview_content_select'); if(sel) selectNamesItem(parseInt(sel.value)); }
+                function onNamesModeChange(mode){ window._namesMode=(mode==='random')?'random':'roundrobin'; saveConfig(); }
+                function onContentDurationChange(){
+                    flushEditorToSelected();
+                    // Re-cap the background scrubber and re-fit "Fit to time" scroll lines to
+                    // the new duration.
+                    if (typeof window.toggleFseqPreview==='function') window.toggleFseqPreview();
+                    else if (typeof window.renderCanvasPreview==='function') window.renderCanvasPreview();
+                    saveConfig();
+                }
+
+                function initNamesUI() {
+                    var lst=window._namesContentList||[];
+                    // Only pick the initial selection / duration ONCE (loadFPPData may re-run
+                    // on a list refresh; don't stomp the user's current editor selection then).
+                    if (!window._namesUIInited) {
+                        // Migrate a pre-list single Name content into the list on first load,
+                        // seeded with the flat text layout the server just rendered, so an
+                        // upgrading user's existing setup appears as content #1 and is editable.
+                        if (lst.length===0 && window._flatNameContentInit) {
+                            var seed = collectEditorLayout();
+                            seed.content = window._flatNameContentInit;
+                            seed.display_duration = parseInt(window._flatDisplayDurationInit)||30;
+                            if (window._lineFontsInit && window._lineFontsInit.length) seed.line_fonts = window._lineFontsInit.slice(0,4);
+                            lst.push(seed);
+                            window._namesContentList = lst;
+                        }
+                        window._namesSelectedIndex=(lst.length>0)?0:-1;
+                        var d=document.getElementById('content_duration');
+                        if (d) d.value=(lst.length>0)?(lst[0].display_duration||30):(parseInt(window._flatDisplayDurationInit)||30);
+                        window._namesUIInited=true;
+                    }
+                    if (window._namesSelectedIndex>=lst.length) window._namesSelectedIndex=lst.length-1;
+                    renderNamesList();
+                }
+
+                window.openManageContentModal=openManageContentModal;
+                window.closeManageContentModal=closeManageContentModal;
+                window.mngAdd=mngAdd;
+                window.mngRemove=mngRemove;
+                window.mngMoveUp=mngMoveUp;
+                window.mngMoveDown=mngMoveDown;
+                window.removeNamesItem=removeNamesItem;
+                window.selectNamesItem=selectNamesItem;
+                window.onPreviewContentChange=onPreviewContentChange;
+                window.onNamesModeChange=onNamesModeChange;
+                window.onContentDurationChange=onContentDurationChange;
+                window.initNamesUI=initNamesUI;
+                window.renderNamesList=renderNamesList;
+                window.flushEditorToSelected=flushEditorToSelected;
+                window.collectEditorLayout=collectEditorLayout;
+                window.applyLayoutToEditor=applyLayoutToEditor;
+
+                // ===================== Waiting Content Rotation List =====================
+                window._waitingContentList = Array.isArray(window._waitingContentListInit) ? window._waitingContentListInit : [];
+                window._waitingMode = window._waitingContentModeInit || 'roundrobin';
+
+                // A content value is "missing" if it names a seq:/img: file FPP no longer has.
+                function _waitingIsMissing(val) {
+                    if (!val) return false;
+                    if (val.indexOf('seq:')===0) return (window._fppSeqList||[]).indexOf(val.slice(4))<0;
+                    if (val.indexOf('img:')===0) return (window._fppImgList||[]).indexOf(val.slice(4))<0;
+                    return false;
+                }
+
+                // Render the Waiting list rows + mode toggle + none-warning, and keep the hidden
+                // legacy default_playlist select synced to the first item (drives preview + save).
+                function renderWaitingList() {
+                    var lst=window._waitingContentList||[];
+                    var box=document.getElementById('waiting_content_items');
+                    if (box) {
+                        box.innerHTML='';
+                        if (lst.length===0) {
+                            box.innerHTML='<div style="font-size:13px;color:#777;">No content added yet — click below to choose the sequence(s) that loop while waiting.</div>';
+                        } else {
+                            lst.forEach(function(it, i){
+                                var row=document.createElement('div');
+                                row.style.cssText='display:flex;align-items:center;gap:8px;padding:5px 6px;border-bottom:1px solid #eee;border-radius:3px;';
+                                var label=document.createElement('span');
+                                label.style.cssText='flex:1;font-size:13px;color:#333;';
+                                var miss=_waitingIsMissing(it.content);
+                                label.textContent=(i+1)+'. '+(it.content||'(none)')+(miss?'  ⚠ missing':'');
+                                if (miss) label.style.color='#c62828';
+                                row.appendChild(label);
+                                // Duration control: sequences play their full length; images have
+                                // no natural length, so expose an editable seconds field (default 30).
+                                if ((it.content||'').indexOf('img:')===0) {
+                                    var dwrap=document.createElement('span');
+                                    dwrap.style.cssText='font-size:12px;color:#555;display:flex;align-items:center;gap:4px;';
+                                    var dnum=document.createElement('input');
+                                    dnum.type='number'; dnum.min='1'; dnum.max='3600';
+                                    dnum.value=parseInt(it.display_duration)||30;
+                                    dnum.style.cssText='width:56px;padding:2px 4px;font-size:12px;';
+                                    dnum.title='How long this image shows before rotating';
+                                    dnum.onchange=function(){
+                                        var v=parseInt(dnum.value)||30; if(v<1)v=1;
+                                        dnum.value=v; it.display_duration=v; saveConfig();
+                                    };
+                                    dwrap.appendChild(dnum);
+                                    var secs=document.createElement('span'); secs.textContent='sec';
+                                    dwrap.appendChild(secs);
+                                    row.appendChild(dwrap);
+                                } else if ((it.content||'').indexOf('seq:')===0) {
+                                    var note=document.createElement('span');
+                                    note.style.cssText='font-size:11px;color:#999;';
+                                    note.textContent='full length';
+                                    row.appendChild(note);
+                                }
+                                var del=document.createElement('button');
+                                del.type='button'; del.textContent='✕'; del.title='Remove';
+                                del.style.cssText='background:#f44336;border:none;color:#fff;padding:2px 9px;border-radius:3px;cursor:pointer;font-size:12px;';
+                                del.onclick=function(){ removeWaitingItem(i); };
+                                row.appendChild(del);
+                                box.appendChild(row);
+                            });
+                        }
+                    }
+                    var modeRow=document.getElementById('waiting_mode_row');
+                    if (modeRow) modeRow.style.display=(lst.length>1)?'block':'none';
+                    var rr=document.querySelector('input[name="waiting_mode"][value="roundrobin"]');
+                    var rnd=document.querySelector('input[name="waiting_mode"][value="random"]');
+                    if (rr) rr.checked=(window._waitingMode!=='random');
+                    if (rnd) rnd.checked=(window._waitingMode==='random');
+                    var warn=document.getElementById('waiting_content_none_warning');
+                    if (warn) warn.style.display=(lst.length===0)?'block':'none';
+                    // Sync hidden legacy select to the first item so the preview background and
+                    // the saved default_playlist both track the list.
+                    var dp=document.getElementById('default_playlist');
+                    if (dp) {
+                        var first=(lst.length>0)?(lst[0].content||''):'';
+                        var has=Array.prototype.some.call(dp.options,function(o){return o.value===first;});
+                        if (!has && first) dp.add(new Option(first, first));
+                        dp.value=first;
+                    }
+                    if (typeof window.toggleFseqPreview==='function') window.toggleFseqPreview();
+                }
+
+                function _wmngAvailableOptions() {
+                    var used={}; (window._waitingContentList||[]).forEach(function(it){ used[it.content]=true; });
+                    var out=[];
+                    (window._fppSeqList||[]).forEach(function(s){ var v='seq:'+s; if(!used[v]) out.push({val:v, label:'🎬 '+s}); });
+                    (window._fppImgList||[]).forEach(function(im){ var v='img:'+im; if(!used[v]) out.push({val:v, label:'🖼️ '+im}); });
+                    return out;
+                }
+                function _wmngRenderAvailable() {
+                    var sel=document.getElementById('wmng_available'); if(!sel) return;
+                    sel.innerHTML='';
+                    _wmngAvailableOptions().forEach(function(o){ sel.appendChild(new Option(o.label, o.val)); });
+                }
+                function _wmngRenderSelected(keepIdx) {
+                    var sel=document.getElementById('wmng_selected'); if(!sel) return;
+                    sel.innerHTML='';
+                    (window._waitingContentList||[]).forEach(function(it,i){ sel.appendChild(new Option((i+1)+'. '+(it.content||'(none)'), i)); });
+                    if (keepIdx!=null && keepIdx>=0 && keepIdx<sel.options.length) sel.options[keepIdx].selected=true;
+                }
+                function openManageWaitingModal() {
+                    _wmngRenderAvailable();
+                    _wmngRenderSelected();
+                    try { window.scrollTo(0,0); window.parent.postMessage({type:'scrollTop'},'*'); } catch(e) {}
+                    var m=document.getElementById('manage_waiting_modal'); if(m) m.style.display='flex';
+                }
+                function closeManageWaitingModal() {
+                    var m=document.getElementById('manage_waiting_modal'); if(m) m.style.display='none';
+                    renderWaitingList();
+                    saveConfig();
+                }
+                function wmngAdd() {
+                    var av=document.getElementById('wmng_available'); if(!av) return;
+                    var chosen=Array.prototype.filter.call(av.options,function(o){return o.selected;}).map(function(o){return o.value;});
+                    if (!chosen.length) return;
+                    var lst=window._waitingContentList;
+                    chosen.forEach(function(val){ lst.push({content:val, display_duration:30}); });
+                    _wmngRenderSelected(lst.length-1);
+                    _wmngRenderAvailable();
+                }
+                function wmngRemove() {
+                    var sel=document.getElementById('wmng_selected'); if(!sel) return;
+                    var idxs=Array.prototype.filter.call(sel.options,function(o){return o.selected;}).map(function(o){return parseInt(o.value);});
+                    if (!idxs.length) return;
+                    idxs.sort(function(a,b){return b-a;}).forEach(function(i){ window._waitingContentList.splice(i,1); });
+                    _wmngRenderSelected();
+                    _wmngRenderAvailable();
+                }
+                function wmngMoveUp() {
+                    var sel=document.getElementById('wmng_selected'); if(!sel) return;
+                    var i=sel.selectedIndex; if(i<=0) return;
+                    var lst=window._waitingContentList;
+                    var tmp=lst[i-1]; lst[i-1]=lst[i]; lst[i]=tmp;
+                    _wmngRenderSelected(i-1);
+                }
+                function wmngMoveDown() {
+                    var sel=document.getElementById('wmng_selected'); if(!sel) return;
+                    var i=sel.selectedIndex; var lst=window._waitingContentList;
+                    if(i<0||i>=lst.length-1) return;
+                    var tmp=lst[i+1]; lst[i+1]=lst[i]; lst[i]=tmp;
+                    _wmngRenderSelected(i+1);
+                }
+                function removeWaitingItem(i) {
+                    var lst=window._waitingContentList; if (i<0||i>=lst.length) return;
+                    lst.splice(i,1);
+                    renderWaitingList();
+                    saveConfig();
+                }
+                function onWaitingModeChange(mode){ window._waitingMode=(mode==='random')?'random':'roundrobin'; saveConfig(); }
+
+                function initWaitingUI() {
+                    var lst=window._waitingContentList||[];
+                    if (!window._waitingUIInited) {
+                        // Migrate a pre-list single Waiting content into the list on first load so
+                        // an upgrading user's existing selection becomes item #1.
+                        if (lst.length===0 && window._flatDefaultContentInit) {
+                            lst.push({content:window._flatDefaultContentInit, display_duration:30});
+                            window._waitingContentList=lst;
+                        }
+                        window._waitingUIInited=true;
+                    }
+                    renderWaitingList();
+                }
+
+                window.openManageWaitingModal=openManageWaitingModal;
+                window.closeManageWaitingModal=closeManageWaitingModal;
+                window.wmngAdd=wmngAdd;
+                window.wmngRemove=wmngRemove;
+                window.wmngMoveUp=wmngMoveUp;
+                window.wmngMoveDown=wmngMoveDown;
+                window.removeWaitingItem=removeWaitingItem;
+                window.onWaitingModeChange=onWaitingModeChange;
+                window.initWaitingUI=initWaitingUI;
+                window.renderWaitingList=renderWaitingList;
+
                 window.toggleFseqPreview = function() {
                     var ct = getConfiguredContent();
-                    var label = document.getElementById('fseq_seq_label');
+                    var loadEl = document.getElementById('fseq_load_status');
                     if (!ct) {
-                        label.textContent = '\u26a0 Select a .fseq, video, or image as Waiting or Names content for background preview.';
-                        label.style.color = '#ff9800';
+                        if (loadEl) {
+                            loadEl.textContent = '\u26a0 Select a .fseq, video, or image as Waiting or Names content for background preview.';
+                            loadEl.style.color = '#ff9800';
+                        }
                         return;
                     }
-                    var icon = ct.type === 'seq' ? '🎬 ' : ct.type === 'vid' ? '🎥 ' : '🖼️ ';
-                    label.textContent = icon + ct.file;
-                    label.style.color = '#ccc';
                     loadBgPreview();
                 };
 
@@ -5553,7 +6738,8 @@ def index():
                                 // send_to_fpp/display loop) -- anything past that point in the
                                 // FSEQ is never actually seen behind a message, so cap the
                                 // scrubber there instead of the file's full length.
-                                var displayDur = parseInt(document.getElementById('display_duration').value) || 30;
+                                var _durEl = document.getElementById('content_duration') || document.getElementById('display_duration');
+                                var displayDur = (_durEl && parseInt(_durEl.value)) || 30;
                                 var totalSec = Math.min(displayDur, Math.max(1, Math.floor(data.duration_ms / 1000)));
                                 var scrubber = document.getElementById('fseq_scrubber');
                                 scrubber.max = totalSec;
@@ -5577,7 +6763,8 @@ def index():
                         // Capped to display_duration, not the video's own length -- playback
                         // always restarts from 0 and is cut off after display_duration seconds
                         // each time a message shows, so nothing past that point is ever seen.
-                        scrubber.max = parseInt(document.getElementById('display_duration').value) || 30;
+                        var _vDurEl = document.getElementById('content_duration') || document.getElementById('display_duration');
+                        scrubber.max = (_vDurEl && parseInt(_vDurEl.value)) || 30;
                         scrubber.value = 0;
                         window._scrubSeconds = 0;
                         document.getElementById('fseq_scrubber_row').style.display = '';
@@ -5693,12 +6880,14 @@ def index():
                     document.getElementById('fseq_status').textContent = '';
                     document.getElementById('fseq_load_status').textContent = '';
                 };
+
             })();
 
             function updateNameDisplayWarning() {
-                var el = document.getElementById('name_display_playlist');
+                // The names list drives the warning + list UI now.
+                if (window.renderNamesList) { window.renderNamesList(); return; }
                 var warn = document.getElementById('name_display_none_warning');
-                if (el && warn) warn.style.display = el.value ? 'none' : 'block';
+                if (warn) warn.style.display = ((window._namesContentList || []).length === 0) ? 'block' : 'none';
             }
 
             // All DOM elements are above this script block — call init functions directly.
@@ -5760,6 +6949,11 @@ def index():
                 var ff = new FontFace(name, 'url("/api/fonts/file/' + encodeURIComponent(name) + '")');
                 var p = ff.load().then(function(loaded) {
                     document.fonts.add(loaded);
+                    // Repaint once this font is actually available. The preview may have been
+                    // drawn with a fallback before the font finished loading (e.g. right after
+                    // a reboot / fresh page load); this makes it self-heal instead of sticking
+                    // on the wrong font until the user toggles the dropdown. Runs once per font.
+                    if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
                 }).catch(function(err) {
                     console.warn('Font preview load failed for "' + name + '":', err);
                 });
@@ -5814,85 +7008,47 @@ def index():
                 .then(data => {
                     if (data.error) console.warn('FPP data partial error:', data.error);
                     const defaultSelect = document.getElementById('default_playlist');
-                    const nameSelect = document.getElementById('name_display_playlist');
                     const currentDefault = "{{ config.get('default_playlist', '') }}";
-                    const currentName = "{{ config.get('name_display_playlist', '') }}";
 
-                    defaultSelect.innerHTML = '<option value="">-- Select a playlist --</option>';
-                    nameSelect.innerHTML = '<option value="">-- None (No Playlist Change) --</option>';
+                    defaultSelect.innerHTML = '<option value="">-- Select a sequence --</option>';
 
-                    if (data.playlists && data.playlists.length > 0) {
-                        const pg1 = document.createElement('optgroup');
-                        pg1.label = '📋 Playlists';
-                        const pg2 = document.createElement('optgroup');
-                        pg2.label = '📋 Playlists';
-                        data.playlists.forEach(playlist => {
-                            pg1.appendChild(new Option(playlist, playlist, false, playlist === currentDefault));
-                            pg2.appendChild(new Option(playlist, playlist, false, playlist === currentName));
-                        });
-                        defaultSelect.add(pg1);
-                        nameSelect.add(pg2);
-                    }
-
+                    // Content types: sequences (.fseq, background FSEQ effect) and images
+                    // (static overlay) are enabled for BOTH the Waiting dropdown and the
+                    // Names content list (built from _fppSeqList/_fppImgList in the Manage
+                    // Content modal). Playlists/videos remain disabled (foreground).
                     if (data.sequences && data.sequences.length > 0) {
                         const sg1 = document.createElement('optgroup');
                         sg1.label = '🎬 Sequences (.fseq)';
-                        const sg2 = document.createElement('optgroup');
-                        sg2.label = '🎬 Sequences (.fseq)';
                         data.sequences.forEach(seq => {
                             const val = 'seq:' + seq;
                             sg1.appendChild(new Option(seq, val, false, val === currentDefault));
-                            sg2.appendChild(new Option(seq, val, false, val === currentName));
                         });
                         defaultSelect.add(sg1);
-                        nameSelect.add(sg2);
-                    }
-
-                    if (data.videos && data.videos.length > 0) {
-                        const vg1 = document.createElement('optgroup');
-                        vg1.label = '🎥 Videos';
-                        const vg2 = document.createElement('optgroup');
-                        vg2.label = '🎥 Videos';
-                        data.videos.forEach(vid => {
-                            const val = 'vid:' + vid;
-                            vg1.appendChild(new Option(vid, val, false, val === currentDefault));
-                            vg2.appendChild(new Option(vid, val, false, val === currentName));
-                        });
-                        defaultSelect.add(vg1);
-                        nameSelect.add(vg2);
                     }
 
                     if (data.images && data.images.length > 0) {
                         const ig1 = document.createElement('optgroup');
                         ig1.label = '🖼️ Images';
-                        const ig2 = document.createElement('optgroup');
-                        ig2.label = '🖼️ Images';
                         data.images.forEach(img => {
                             const val = 'img:' + img;
                             ig1.appendChild(new Option(img, val, false, val === currentDefault));
-                            ig2.appendChild(new Option(img, val, false, val === currentName));
                         });
                         defaultSelect.add(ig1);
-                        nameSelect.add(ig2);
                     }
 
-                    // If a stored content selection no longer exists in FPP (e.g. the
-                    // Waiting or Name sequence was deleted in the file manager), revert
-                    // it to None and persist that so the plugin stops referencing a file
-                    // that's gone. Guarded by !data.error so a partial FPP fetch can
-                    // never wipe a still-valid choice.
+                    // If the stored Waiting selection no longer exists in FPP (deleted in
+                    // the file manager), revert it to None so we stop referencing a gone
+                    // file. Guarded by !data.error so a partial fetch can't wipe a valid one.
                     if (!data.error) {
                         var _hasOpt = function(sel, val) {
-                            if (!val) return true;   // '' (None) is always valid
+                            if (!val) return true;
                             return Array.prototype.some.call(sel.options, function(o) { return o.value === val; });
                         };
-                        var _stale = false;
-                        if (!_hasOpt(defaultSelect, currentDefault)) { defaultSelect.value = ''; _stale = true; }
-                        if (!_hasOpt(nameSelect, currentName))       { nameSelect.value = '';    _stale = true; }
-                        if (_stale) { saveConfig(); updateNameDisplayWarning(); }
+                        if (!_hasOpt(defaultSelect, currentDefault)) { defaultSelect.value = ''; saveConfig(); }
                     }
 
                     window._fppSeqList = data.sequences || [];
+                    window._fppImgList = data.images || [];
 
                     const modelSelect = document.getElementById('overlay_model_name');
                     const currentModel = "{{ config.get('overlay_model_name', 'Texting Matrix') }}";
@@ -5926,6 +7082,10 @@ def index():
                         saveConfig();
                     });
 
+                    // Names list UI (and the modal picker) are ready — render them.
+                    try { if (window.initNamesUI) window.initNamesUI(); } catch(e) { console.error('Names UI init error:', e); }
+                    // Waiting content rotation list UI (needs _fppSeqList/_fppImgList populated).
+                    try { if (window.initWaitingUI) window.initWaitingUI(); } catch(e) { console.error('Waiting UI init error:', e); }
                     // Load background preview now that dropdowns are populated
                     try { if (window.toggleFseqPreview) window.toggleFseqPreview(); } catch(e) { console.error('Preview error:', e); }
                     updateNameDisplayWarning();
@@ -5947,6 +7107,10 @@ var _saveTimer = null;
                 status.style.color = '#888';
                 status.textContent = 'Saving...';
 
+                // Capture the current editor into the selected names item (or mirror the
+                // duration to the hidden global field when there's no list) before saving.
+                if (typeof window.flushEditorToSelected === 'function') window.flushEditorToSelected();
+
                 const data = {
                     message_source: document.getElementById('message_source').value,
                     twilio_account_sid: document.getElementById('account_sid').value,
@@ -5964,7 +7128,15 @@ var _saveTimer = null;
                     profanity_filter: document.getElementById('profanity_filter').checked,
                     use_whitelist: document.getElementById('use_whitelist').checked,
                     default_playlist: document.getElementById('default_playlist').value,
-                    name_display_playlist: document.getElementById('name_display_playlist').value,
+                    // Waiting content is a rotation list; default_playlist above is kept in
+                    // sync with its first item server-side for the required-field/legacy paths.
+                    default_content_list: window._waitingContentList || [],
+                    default_content_mode: window._waitingMode || 'roundrobin',
+                    // Names content is now a list; the flat key stays '' (only used as the
+                    // fallback when the list is empty = names over the waiting content).
+                    name_display_playlist: '',
+                    names_content_list: window._namesContentList || [],
+                    names_content_mode: window._namesMode || 'roundrobin',
                     overlay_model_name: document.getElementById('overlay_model_name').value,
                     overlay_model_width: parseInt(document.getElementById('overlay_model_width').value) || 0,
                     overlay_model_height: parseInt(document.getElementById('overlay_model_height').value) || 0,
@@ -6367,6 +7539,38 @@ def update_config():
                 new_config.pop(_sk, None)
         config.update(new_config)
 
+        # Sanitize the names content list — never trust client array shapes/lengths.
+        if 'names_content_list' in new_config:
+            raw_list = new_config.get('names_content_list')
+            if not isinstance(raw_list, list):
+                raw_list = []
+            config['names_content_list'] = [_sanitize_names_item(it) for it in raw_list]
+        if config.get('names_content_mode') not in ('roundrobin', 'random'):
+            config['names_content_mode'] = 'roundrobin'
+        # Keep the round-robin cursor valid if the list changed/shrank.
+        _lst_len = len(config.get('names_content_list', []) or [])
+        if _lst_len == 0 or int(config.get('names_content_rr_index', -1) or -1) >= _lst_len:
+            config['names_content_rr_index'] = -1
+
+        # Sanitize the WAITING content rotation list the same way.
+        if 'default_content_list' in new_config:
+            raw_wlist = new_config.get('default_content_list')
+            if not isinstance(raw_wlist, list):
+                raw_wlist = []
+            # Drop items with no content so an empty picker row can't wedge the rotator.
+            config['default_content_list'] = [d for d in (_sanitize_default_item(it) for it in raw_wlist) if d['content']]
+        if config.get('default_content_mode') not in ('roundrobin', 'random'):
+            config['default_content_mode'] = 'roundrobin'
+        _wlst = config.get('default_content_list', []) or []
+        if len(_wlst) == 0 or int(config.get('default_content_rr_index', -1) or -1) >= len(_wlst):
+            config['default_content_rr_index'] = -1
+        # Keep the single default_playlist in sync with the list's first item so the
+        # required-field check, export/validation, and every legacy single-content code
+        # path still resolve to a real value. Only mirror when a list is configured; an
+        # empty list leaves the user's single default_playlist untouched.
+        if _wlst:
+            config['default_playlist'] = _wlst[0]['content']
+
         # Normalize phone number to E.164 (strip spaces, dashes, parens — keep + and digits)
         if config.get('twilio_phone_number'):
             config['twilio_phone_number'] = re.sub(r'[^\d+]', '', config['twilio_phone_number'])
@@ -6506,8 +7710,13 @@ def export_config():
         # is set to use and the files they reference. Never all of FPP's media.
         content_files = []
         if inc_content:
-            for cv in (config.get('default_playlist', ''), config.get('name_display_playlist', '')):
-                content_files.extend(_content_source_files(cv, warnings))
+            _list_content = [it.get('content', '') for it in (config.get('names_content_list', []) or [])]
+            _wait_content = [it.get('content', '') for it in (config.get('default_content_list', []) or [])]
+            _seen_cv = set()
+            for cv in [config.get('default_playlist', ''), config.get('name_display_playlist', ''), *_wait_content, *_list_content]:
+                if cv and cv not in _seen_cv:
+                    _seen_cv.add(cv)
+                    content_files.extend(_content_source_files(cv, warnings))
 
         # Overlay model ("matrix") — just the selected model's entry, not the whole
         # channel-output config (written to the zip as a small JSON payload below).
@@ -6926,17 +8135,46 @@ def fseq_debug():
         hdr = parse_fseq_header(filepath)
         comp_names = {0: 'uncompressed', 1: 'zlib', 2: 'zstd'}
         result['fseq'] = {
-            'channel_count':     hdr['channel_count'],
-            'frame_count':       hdr['frame_count'],
-            'fps':               round(hdr['fps'], 2),
-            'step_time_ms':      hdr['step_time_ms'],
-            'compression_type':  hdr['compression_type'],
-            'compression_name':  comp_names.get(hdr['compression_type'], 'unknown'),
-            'chan_data_offset':   hdr['chan_data_offset'],
-            'num_comp_blocks':   len(hdr['comp_blocks']),
-            'num_sparse_ranges': hdr['num_sparse_ranges'],
-            'sparse_ranges':     hdr['sparse_ranges'],
-            'sparse_sum':        sum(sr['count'] for sr in hdr['sparse_ranges']),
+            'channel_count':        hdr['channel_count'],
+            'frame_count':          hdr['frame_count'],
+            'fps':                  round(hdr['fps'], 2),
+            'step_time_ms':         hdr['step_time_ms'],
+            'compression_type':     hdr['compression_type'],
+            'compression_name':     comp_names.get(hdr['compression_type'], 'unknown'),
+            'raw_compression_type': hdr['raw_compression_type'],
+            'raw_compression_name': comp_names.get(hdr['raw_compression_type'], 'unknown'),
+            'chan_data_offset':     hdr['chan_data_offset'],
+            'num_comp_blocks':      len(hdr['comp_blocks']),
+            'header_num_comp_blocks':   hdr['num_comp_blocks'],
+            'num_sparse_ranges':    hdr['num_sparse_ranges'],
+            'sparse_ranges':        hdr['sparse_ranges'],
+            'sparse_sum':           sum(sr['count'] for sr in hdr['sparse_ranges']),
+            'comp_blocks_preview':  hdr['comp_blocks'][:6],
+        }
+
+        # ── Decisive raw bytes ──────────────────────────────────────────────
+        # These let us tell (without SSH) whether the channel data is actually
+        # zlib / zstd / raw, and whether the header's compression byte lies.
+        with open(filepath, 'rb') as _f:
+            _hdr_raw = _f.read(32)
+            _f.seek(hdr['chan_data_offset'])
+            _data_probe = _f.read(8)
+        probe_guess = 'unknown'
+        if _data_probe[:4] == b'\x28\xB5\x2F\xFD':
+            probe_guess = 'zstd'
+        elif _data_probe[:1] == b'\x78':
+            # zlib stream: 0x78 followed by 0x01/0x9C/0xDA typically
+            probe_guess = 'zlib'
+        elif hdr['compression_type'] == 0:
+            probe_guess = 'raw/uncompressed'
+        result['raw'] = {
+            'header_hex':          _hdr_raw.hex(),
+            'byte18_step_time':    _hdr_raw[18] if len(_hdr_raw) > 18 else None,
+            'byte19_compression':  _hdr_raw[19] if len(_hdr_raw) > 19 else None,
+            'byte20_num_blocks':   _hdr_raw[20] if len(_hdr_raw) > 20 else None,
+            'byte21_num_sparse':   _hdr_raw[21] if len(_hdr_raw) > 21 else None,
+            'data_probe_hex':      _data_probe.hex(),
+            'data_looks_like':     probe_guess,
         }
     except Exception as e:
         result['fseq_error'] = str(e)
@@ -8434,9 +9672,11 @@ def api_activate():
     """FPP scheduler hook: enable the plugin, start SMS polling, and start the waiting playlist."""
     global polling_thread, stop_polling
 
-    # Require a default waiting playlist — without one the show has no defined state
-    if not config.get('default_playlist', '').strip():
-        msg = "ERROR: No Default Waiting Playlist configured. Set one in the plugin settings before running Text My Lights Start."
+    # Require waiting content — a single default_playlist or a rotation list. Without one
+    # the show has no defined state.
+    _has_list = len(config.get('default_content_list', []) or []) > 0
+    if not config.get('default_playlist', '').strip() and not _has_list:
+        msg = "ERROR: No Default Waiting Content configured. Set one in the plugin settings before running Text My Lights Start."
         logging.error(msg)
         return jsonify({"success": False, "error": msg}), 400
 
@@ -8448,8 +9688,8 @@ def api_activate():
     if not start_polling_if_needed():
         logging.warning("⚠️  Activate: message source not configured, polling not started")
 
-    # Start the default waiting playlist
-    result = start_default_playlist()
+    # Start the waiting content (single, or the rotator for a 2+ item list)
+    result = start_waiting_content()
 
     logging.info(f"✅ Text My Lights Start activated — playlist {'started' if result else 'FAILED to start'}")
     return jsonify({"success": True, "playlist_started": result,
@@ -8521,17 +9761,22 @@ if __name__ == '__main__':
     display_thread = threading.Thread(target=display_worker, daemon=True)
     display_thread.start()
 
+    # Waiting-content rotator runs for the whole process, idling unless the show is enabled
+    # and a 2+ item rotation list is configured.
+    rotator_thread = threading.Thread(target=waiting_rotator, daemon=True)
+    rotator_thread.start()
+
     # Polling thread starts if the selected source is configured — runs in
     # standby (show_not_live replies) when disabled, and processes names normally
     # when enabled. Picks Twilio or Google Voice based on message_source.
     start_polling_if_needed()
 
-    # Start the default waiting playlist on launch if the plugin is already enabled
+    # Start the waiting content on launch if the plugin is already enabled
     if config['enabled']:
         def _start_default():
             import time
             time.sleep(3)  # brief delay to let FPP settle before sending commands
-            start_default_playlist()
+            start_waiting_content()
         threading.Thread(target=_start_default, daemon=True).start()
 
     logging.info("Text My Lights plugin starting...")

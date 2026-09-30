@@ -150,6 +150,7 @@ function tml_shot($file, $alt) {
         <tr><th>Setting</th><th>What it does</th></tr>
         <tr><td>Message Source</td><td>Twilio or Google Voice. Changing it swaps which credential fields are shown, the rate-limit default, and the allowed responses.</td></tr>
         <tr><td>Start / Stop</td><td>The show is started and stopped by the <code>Start</code> / <code>Stop</code> scheduler commands — no manual enable toggle.</td></tr>
+        <tr><td>Runs as a background layer</td><td>Text My Lights always plays its content as a <strong>background effect</strong> (+ overlay), never as a foreground playlist, and <strong>Stop</strong> only stops <em>its own</em> content. So it can run on the projector while a separate foreground sequence drives your house pixels — the plugin never stops that other show. For this, set your <strong>Waiting</strong> and <strong>Name Display</strong> content to <strong>sequences (.fseq)</strong>, which run as background effects. (A playlist/video is foreground and will take over.)</td></tr>
         <tr><td>Credentials</td><td>Twilio: Account SID, Auth Token, Phone Number. Google Voice: Gmail Address + App Password.</td></tr>
         <tr><td>Poll Interval</td><td>How often (seconds) to check for new messages. 2–5 is typical.</td></tr>
         <tr><td>Default “Waiting” Content</td><td><strong>Required.</strong> The playlist/sequence that loops while waiting for texts.</td></tr>

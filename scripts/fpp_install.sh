@@ -17,6 +17,19 @@ log_and_show() {
     echo "$1" | tee -a "$LOG"
 }
 
+# This whole script re-runs on every plugin UPDATE, not just first install, so
+# it must skip work that's already done or updates take as long as a fresh
+# install. Run `apt-get update` at most once, and only when we actually need to
+# apt-install something missing.
+APT_UPDATED=0
+apt_update_once() {
+    if [ "$APT_UPDATED" = "0" ]; then
+        log_and_show "Updating package lists... please wait"
+        apt-get update -qq >> "$LOG" 2>&1
+        APT_UPDATED=1
+    fi
+}
+
 log_and_show "========================================"
 log_and_show "Text My Lights Plugin Installer"
 log_and_show "$(date)"
@@ -26,12 +39,10 @@ log_and_show "NOTE: Installation can take 3-5 minutes."
 log_and_show "Please do not close this window."
 log_and_show ""
 
-log_and_show "Updating package lists... please wait"
-apt-get update -qq >> "$LOG" 2>&1
-
 # Install pip3 if needed
 if ! command -v pip3 &> /dev/null; then
     log_and_show "Installing pip3... please wait"
+    apt_update_once
     DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip >> "$LOG" 2>&1
 fi
 
@@ -40,6 +51,7 @@ fi
 # silently fall back to a tiny built-in bitmap font instead of a real one.
 if [ ! -f /usr/share/fonts/truetype/freefont/FreeSans.ttf ]; then
     log_and_show "[1/7] Installing fonts (fonts-freefont-ttf)... please wait"
+    apt_update_once
     DEBIAN_FRONTEND=noninteractive apt-get install -y fonts-freefont-ttf >> "$LOG" 2>&1
     log_and_show "[1/7] Fonts complete"
 else
@@ -53,53 +65,80 @@ fi
 # indexes them for fc-match resolution in sms_plugin.py's _find_font(). Every
 # category subfolder under fonts/ (christmas/, halloween/, etc.) is picked up
 # automatically — no script changes needed when a new category is added.
-log_and_show "[2/7] Installing bundled theme fonts... please wait"
-if ! command -v fc-cache &> /dev/null; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y fontconfig >> "$LOG" 2>&1
+# Skip the copy + fc-cache rebuild (the slow part) when the bundled fonts are
+# unchanged since last run — otherwise every update pays the fc-cache cost.
+FONT_MARKER="/usr/local/share/fonts/.tml-fonts-hash"
+FONT_HASH=$(find "$PLUGIN_DIR/fonts" -type f \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.pfb' \) -exec md5sum {} \; 2>/dev/null | sort | md5sum | cut -d' ' -f1)
+if [ -f "$FONT_MARKER" ] && [ "$(cat "$FONT_MARKER" 2>/dev/null)" = "$FONT_HASH" ] && command -v fc-cache &> /dev/null; then
+    log_and_show "[2/7] Theme fonts already up to date"
+else
+    log_and_show "[2/7] Installing bundled theme fonts... please wait"
+    if ! command -v fc-cache &> /dev/null; then
+        apt_update_once
+        DEBIAN_FRONTEND=noninteractive apt-get install -y fontconfig >> "$LOG" 2>&1
+    fi
+    mkdir -p /usr/local/share/fonts
+    # Clear previous runs' copies first so /usr/local/share/fonts always exactly
+    # mirrors the current repo — otherwise a renamed/removed bundled font (e.g.
+    # "Santa Christmas" -> "Present Snow") leaves its old file behind forever,
+    # and _enumerate_fonts() then miscategorizes it as a "System" font since its
+    # name no longer matches anything under fonts/<category>/. This directory is
+    # exclusively managed by this plugin, so it's safe to clear.
+    find /usr/local/share/fonts -maxdepth 1 -type f \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.pfb' \) -delete 2>> "$LOG"
+    find "$PLUGIN_DIR/fonts" -type f \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.pfb' \) \
+        -exec cp {} /usr/local/share/fonts/ \; 2>> "$LOG"
+    fc-cache -f /usr/local/share/fonts >> "$LOG" 2>&1
+    echo "$FONT_HASH" > "$FONT_MARKER"
+    log_and_show "[2/7] Theme fonts complete"
 fi
-mkdir -p /usr/local/share/fonts
-# Clear previous runs' copies first so /usr/local/share/fonts always exactly
-# mirrors the current repo — otherwise a renamed/removed bundled font (e.g.
-# "Santa Christmas" -> "Present Snow") leaves its old file behind forever,
-# and _enumerate_fonts() then miscategorizes it as a "System" font since its
-# name no longer matches anything under fonts/<category>/. This directory is
-# exclusively managed by this plugin, so it's safe to clear on every install.
-find /usr/local/share/fonts -maxdepth 1 -type f \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.pfb' \) -delete 2>> "$LOG"
-find "$PLUGIN_DIR/fonts" -type f \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.pfb' \) \
-    -exec cp {} /usr/local/share/fonts/ \; 2>> "$LOG"
-fc-cache -f /usr/local/share/fonts >> "$LOG" 2>&1
-log_and_show "[2/7] Theme fonts complete"
 
-# Install packages
-log_and_show "[3/7] Installing Flask... please wait"
-pip3 install --break-system-packages --no-cache-dir flask==3.0.0 >> "$LOG" 2>&1
-log_and_show "[3/7] Flask complete"
-
-log_and_show "[4/7] Installing Twilio... please wait (this is the slow one)"
-pip3 install --break-system-packages --no-cache-dir twilio==8.10.0 >> "$LOG" 2>&1
-TWILIO_EXIT=$?
-if [ $TWILIO_EXIT -ne 0 ]; then
-    log_and_show "ERROR: Twilio installation failed with exit code $TWILIO_EXIT"
-    exit 1
+# Install packages — each is skipped instantly if already importable.
+if python3 -c "import flask" >/dev/null 2>&1; then
+    log_and_show "[3/7] Flask already installed"
+else
+    log_and_show "[3/7] Installing Flask... please wait"
+    pip3 install --break-system-packages --no-cache-dir flask==3.0.0 >> "$LOG" 2>&1
+    log_and_show "[3/7] Flask complete"
 fi
-log_and_show "[4/7] Twilio complete"
 
-log_and_show "[5/7] Installing Requests... please wait"
-pip3 install --break-system-packages --no-cache-dir requests==2.31.0 >> "$LOG" 2>&1
-log_and_show "[5/7] Requests complete"
+if python3 -c "import twilio" >/dev/null 2>&1; then
+    log_and_show "[4/7] Twilio already installed"
+else
+    log_and_show "[4/7] Installing Twilio... please wait (this is the slow one)"
+    pip3 install --break-system-packages --no-cache-dir twilio==8.10.0 >> "$LOG" 2>&1
+    TWILIO_EXIT=$?
+    if [ $TWILIO_EXIT -ne 0 ]; then
+        log_and_show "ERROR: Twilio installation failed with exit code $TWILIO_EXIT"
+        exit 1
+    fi
+    log_and_show "[4/7] Twilio complete"
+fi
 
-log_and_show "[6/7] Installing Pillow (image rendering)... please wait"
-pip3 install --break-system-packages --no-cache-dir pillow >> "$LOG" 2>&1
-log_and_show "[6/7] Pillow complete"
+if python3 -c "import requests" >/dev/null 2>&1; then
+    log_and_show "[5/7] Requests already installed"
+else
+    log_and_show "[5/7] Installing Requests... please wait"
+    pip3 install --break-system-packages --no-cache-dir requests==2.31.0 >> "$LOG" 2>&1
+    log_and_show "[5/7] Requests complete"
+fi
 
-log_and_show "[7/7] Installing zstandard (FSEQ zstd decompression)... please wait"
+if python3 -c "import PIL" >/dev/null 2>&1; then
+    log_and_show "[6/7] Pillow already installed"
+else
+    log_and_show "[6/7] Installing Pillow (image rendering)... please wait"
+    pip3 install --break-system-packages --no-cache-dir pillow >> "$LOG" 2>&1
+    log_and_show "[6/7] Pillow complete"
+fi
+
 # zstandard is OPTIONAL — only used to preview zstd-compressed FSEQ files; the
 # plugin runs fine without it (ZSTD_AVAILABLE=False). Its pip build is a C
 # extension that can take many minutes or hang/OOM on a Pi with no prebuilt
-# wheel, which would stall the whole installer. So: prefer the prebuilt Debian
-# package, fall back to a time-bounded pip install, and never let this step
-# block the installer from finishing.
-if DEBIAN_FRONTEND=noninteractive apt-get install -y python3-zstandard >> "$LOG" 2>&1; then
+# wheel. Skip entirely if already importable (so updates don't re-attempt it);
+# otherwise prefer the prebuilt Debian package, fall back to a time-bounded pip
+# install, and never let this step block the installer from finishing.
+if python3 -c "import zstandard" >/dev/null 2>&1; then
+    log_and_show "[7/7] zstandard already installed"
+elif { apt_update_once; DEBIAN_FRONTEND=noninteractive apt-get install -y python3-zstandard >> "$LOG" 2>&1; }; then
     log_and_show "[7/7] zstandard complete (system package)"
 elif timeout 180 pip3 install --break-system-packages --no-cache-dir zstandard >> "$LOG" 2>&1; then
     log_and_show "[7/7] zstandard complete (pip)"
@@ -118,7 +157,8 @@ mkdir -p "$PLUGIN_DATA_DIR/secrets"
 chown -R fpp:fpp "$PLUGIN_DATA_DIR" 2>/dev/null
 chmod 700 "$PLUGIN_DATA_DIR/secrets" 2>/dev/null
 [ -f "$PLUGIN_DATA_DIR/secrets/credentials.json" ] && chmod 600 "$PLUGIN_DATA_DIR/secrets/credentials.json" 2>/dev/null
-log_and_show "Secrets folder ready: $PLUGIN_DATA_DIR/secrets (owner-only)"
+# Log only (not shown in the installer UI) — don't advertise the credentials path.
+echo "Secrets folder ready: $PLUGIN_DATA_DIR/secrets (owner-only)" >> "$LOG"
 
 # whitelist.txt and blacklist.txt ship with the plugin via git.
 # Force git checkout to ensure they are present (FPP update may not pull all files).

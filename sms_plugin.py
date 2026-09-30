@@ -474,6 +474,7 @@ def fpp_mode_watcher():
     remote the plugin becomes a remote; when FPP switches to player the plugin becomes master.
     Acts only on an actual FPP mode CHANGE, so a manual toggle persists until FPP changes next."""
     global _last_fpp_mode, _resolved_role
+    logging.info("🔀 FPP mode watcher started (plugin role will follow FPP player↔remote)")
     while True:
         try:
             role = _fpp_mode_role()   # None while FPP is unreachable → ignore
@@ -481,9 +482,10 @@ def fpp_mode_watcher():
             if role is not None and role != _last_fpp_mode:
                 first = _last_fpp_mode is None
                 _last_fpp_mode = role
+                logging.info(f"🔀 FPP mode is '{role}' "
+                             f"({'startup' if first else 'changed'}); plugin_role='{config.get('plugin_role') or '(unset)'}'")
                 if (config.get('plugin_role') or '') != role:
-                    logging.info(f"🔀 {'Following FPP mode at startup' if first else 'FPP mode changed'} "
-                                 f"→ plugin role now '{role}'")
+                    logging.info(f"🔀 Setting plugin role → '{role}' to match FPP")
                     config['plugin_role'] = role
                     _resolved_role = None
                     try:
@@ -492,7 +494,7 @@ def fpp_mode_watcher():
                         pass
         except Exception as e:
             logging.debug(f"fpp_mode_watcher: {e}")
-        time.sleep(15)
+        time.sleep(10)
 
 
 def get_plugin_role():
@@ -4332,8 +4334,8 @@ def index():
             <button class="tab-btn active" onclick="showTab('settings', this)">⚙️ Settings</button>
             <button class="tab-btn" onclick="showTab('display', this)">🖥️ Display</button>
             <button class="tab-btn" id="tabbtn-sms" onclick="showTab('sms', this)">📱 SMS Responses</button>
-            <button class="tab-btn" onclick="showTab('testing', this)">🧪 Testing</button>
-            <button class="view-btn" onclick="viewMessages()" style="margin:0 0 0 10px; padding:7px 14px; font-size:13px;">📋 View Message Queue</button>
+            <button class="tab-btn" id="tabbtn-testing" onclick="showTab('testing', this)">🧪 Testing</button>
+            <button class="view-btn" id="btn_view_queue" onclick="viewMessages()" style="margin:0 0 0 10px; padding:7px 14px; font-size:13px;">📋 View Message Queue</button>
             <span id="autosave_status" style="font-size:13px; margin-left:8px;"></span>
             <div style="margin-left:auto; display:flex; gap:4px; align-items:center;">
                 <button id="btn_plugin_toggle" onclick="pluginToggle()" style="background:#2e7d32; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-size:12px; font-weight:bold; cursor:pointer;">▶ Start</button>
@@ -4562,7 +4564,7 @@ def index():
             </div>
 
             <!-- Filters — full width -->
-            <div class="section" style="margin-top:12px;">
+            <div class="section" id="filters_section" style="margin-top:12px;">
                 <h2>Filters</h2>
                 <div style="display:flex; gap:24px; align-items:flex-start; flex-wrap:wrap;">
 
@@ -4810,16 +4812,37 @@ def index():
                                    : (two && two.checked) ? '2 words'
                                    : '1-2 words';
                 }
-                // Show/hide the master-only vs remote-only bits based on the role select.
+                // A Remote only displays names the Master pushes — everything else (texts,
+                // replies, limits, filters, testing, queue, Start) is handled on the Master,
+                // so hide it here to avoid confusion.
+                function applyRoleVisibility(remote) {
+                    var showIf = function(id, show){ var el=document.getElementById(id); if(el) el.style.display = show ? '' : 'none'; };
+                    showIf('message_source_section', !remote);
+                    showIf('master_discovery_box', !remote);
+                    showIf('filters_section', !remote);
+                    showIf('tabbtn-sms', !remote);
+                    showIf('tabbtn-testing', !remote);
+                    showIf('btn_view_queue', !remote);
+                    showIf('btn_plugin_toggle', !remote);
+                    // Live/not-live banners are master-only status; the remote is push-driven.
+                    var lb=document.getElementById('plugin_live_banner'); if(lb && remote) lb.style.display='none';
+                    var nb=document.getElementById('plugin_not_live_banner'); if(nb && remote) nb.style.display='none';
+                    var note = document.getElementById('remote_mode_note');
+                    if (note) note.style.display = remote ? 'block' : 'none';
+                    // If a now-hidden tab is active, fall back to Settings.
+                    if (remote) {
+                        var active = document.querySelector('.tab-content.active');
+                        if (active && (active.id === 'tab-sms' || active.id === 'tab-testing')) {
+                            var sbtn = document.querySelector('.tab-btn'); // first = Settings
+                            if (typeof showTab === 'function' && sbtn) showTab('settings', sbtn);
+                        }
+                    }
+                }
+                window.applyRoleVisibility = applyRoleVisibility;
                 function onRoleChange() {
                     var sel = document.getElementById('plugin_role');
                     var remote = sel && sel.value === 'remote';
-                    var src = document.getElementById('message_source_section');
-                    if (src) src.style.display = remote ? 'none' : '';
-                    var disc = document.getElementById('master_discovery_box');
-                    if (disc) disc.style.display = remote ? 'none' : '';
-                    var note = document.getElementById('remote_mode_note');
-                    if (note) note.style.display = remote ? 'block' : 'none';
+                    applyRoleVisibility(remote);
                     var hint = document.getElementById('role_default_hint');
                     if (hint) hint.style.display = 'none';  // user made an explicit choice
                     if (typeof saveConfig === 'function') saveConfig();
@@ -4828,13 +4851,20 @@ def index():
                 // Apply role visibility on load WITHOUT saving (don't stamp a default on first paint).
                 (function(){
                     var sel = document.getElementById('plugin_role');
-                    var remote = sel && sel.value === 'remote';
-                    var src = document.getElementById('message_source_section');
-                    if (src) src.style.display = remote ? 'none' : '';
-                    var disc = document.getElementById('master_discovery_box');
-                    if (disc) disc.style.display = remote ? 'none' : '';
-                    var note = document.getElementById('remote_mode_note');
-                    if (note) note.style.display = remote ? 'block' : 'none';
+                    applyRoleVisibility(sel && sel.value === 'remote');
+                    // Reconcile with the LIVE role in case the FPP-mode watcher changed it after
+                    // this page was rendered (so a remote box shows the remote view without a
+                    // manual reload). Does not autosave.
+                    try {
+                        fetch('/api/plugin_role').then(function(r){return r.json();}).then(function(d){
+                            if (d && d.role && sel && sel.value !== d.role) {
+                                sel.value = d.role;
+                                applyRoleVisibility(d.role === 'remote');
+                                var hint = document.getElementById('role_default_hint');
+                                if (hint) hint.style.display = 'none';
+                            }
+                        }).catch(function(){});
+                    } catch(e) {}
                 })();
                 updateFormatRules();
                 checkFiltersState();
@@ -5573,6 +5603,15 @@ def index():
             }
 
             function updateLiveStatus() {
+                // On a Remote there is no Start/Stop or live state — the Master runs the show.
+                // Keep those controls hidden and skip the master-only status UI entirely.
+                var _rs = document.getElementById('plugin_role');
+                if (_rs && _rs.value === 'remote') {
+                    var t=document.getElementById('btn_plugin_toggle'); if(t) t.style.display='none';
+                    var lb=document.getElementById('plugin_live_banner'); if(lb) lb.style.display='none';
+                    var nb=document.getElementById('plugin_not_live_banner'); if(nb) nb.style.display='none';
+                    return;
+                }
                 fetch('/api/queue/status').then(r => r.json()).then(data => {
                     const live = data.show_live === true;
                     _pluginLive = live;
@@ -8929,6 +8968,13 @@ def get_messages_by_date(date_str):
     except Exception as e:
         return _client_error("get_messages_by_date", e, 500)
     return jsonify(redact_messages(list(reversed(messages)), date_str))
+
+@app.route('/api/plugin_role')
+def api_plugin_role():
+    """Current effective role (master/remote), so the config page can reflect the live value
+    even if the FPP-mode watcher updated it after the page was rendered."""
+    return jsonify({"role": get_plugin_role()})
+
 
 @app.route('/api/queue/status')
 def queue_status():

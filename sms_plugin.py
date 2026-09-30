@@ -72,7 +72,7 @@ CONFIG_FILE     = os.path.join(PLUGIN_DATA_DIR, "plugin.json")
 # the same card. This keeps them out of the shared config and off casual view.)
 SECRETS_DIR     = os.path.join(PLUGIN_DATA_DIR, "secrets")
 SECRETS_FILE    = os.path.join(SECRETS_DIR, "credentials.json")
-SECRET_KEYS     = ("twilio_auth_token", "gv_app_password")
+SECRET_KEYS     = ("twilio_auth_token", "gv_app_password", "sync_key")
 # Placeholder shown in a saved secret field. Submitting it unchanged means
 # "keep the stored secret"; clearing the field to empty means "remove it";
 # any other value updates it. Must be something a real secret never equals.
@@ -232,6 +232,15 @@ def _require_access_token():
                             "reachable WITHOUT a token by anyone on the network. Remove "
                             f"{AUTH_DISABLE_FILE} to re-enable access control.")
         return None
+    # Inter-instance calls (a master pushing to a remote's /api/tml/* endpoints) come from
+    # a different IP, so the per-instance access token won't match. Authenticate them with
+    # the shared sync_key instead — constant-time, and only when one is configured.
+    _sk = (config.get('sync_key') or '').strip()
+    if _sk and request.path.startswith('/api/tml/'):
+        hdr = request.headers.get('X-TML-Sync-Key', '')
+        if hdr and _secrets.compare_digest(hdr, _sk):
+            return None
+        return Response("Invalid sync key.", status=403, mimetype='text/plain')
     # First load carries the token as a query param (embedded by the FPP UI);
     # we then set a cookie so subsequent same-origin fetches are authorized.
     qtok = request.args.get('token', '')
@@ -291,6 +300,21 @@ FPP_HOST = 'http://127.0.0.1'
 # Default configuration
 DEFAULT_CONFIG = {
     "enabled": False,
+    # Multi-instance role (independent of FPP's own player/remote mode). "" = not yet
+    # chosen → resolved to a default from the FPP instance's mode on first load.
+    #   "master" — polls Twilio/GV, filters, responds, counts, AND pushes the chosen
+    #              name/content to remotes (the single selection authority).
+    #   "remote" — never polls/responds/counts; only renders name + content pushed by the
+    #              master, using this instance's OWN overlay model / fonts / layout.
+    "plugin_role": "",
+    # Shared secret, identical on every instance, authenticating inter-instance /api/tml/*
+    # calls (a master calling a remote comes from a non-loopback IP, so the per-instance
+    # access token wouldn't match). Treated as a secret (masked, owner-only file).
+    "sync_key": "",
+    # Discovery of peer instances for the master's push. Auto uses FPP MultiSync
+    # (/api/fppd/multiSyncSystems); manual list is a fallback / override (IPs or host:port).
+    "auto_discover_remotes": True,
+    "remote_targets": [],
     # Which inbound message source feeds the pipeline: "twilio" | "google_voice"
     "message_source": "twilio",
     "twilio_account_sid": "",
@@ -414,6 +438,185 @@ rotator_thread = None
 stop_rotator = True               # pause flag: True = don't switch/idle. Cleared on start.
 rotator_lock = threading.Lock()   # serializes a rotator switch against stop_show_playback teardown
 _fseq_dur_cache = {}              # {seq_name: duration_seconds} — parsed FSEQ lengths
+
+# ── Multi-instance (master/remote) ──────────────────────────────────────────
+_resolved_role = None            # cached effective role ("master"/"remote")
+_remotes_cache = []              # cached list of remote base URLs the master pushes to
+_remotes_cache_time = 0.0
+_REMOTES_CACHE_TTL = 30          # seconds between MultiSync discovery refreshes
+_remote_last_state = None        # remote side: last state applied from a master push
+_remote_last_state_time = 0.0
+
+
+def _default_plugin_role():
+    """Suggested default role from the FPP instance's own mode: 'remote' when FPP is in
+    remote mode, else 'master'. Queried from /api/fppd/status; defaults to 'master' (the
+    full-function role, correct for a lone box) if FPP can't be reached."""
+    try:
+        r = requests.get(f"{FPP_HOST}/api/fppd/status", timeout=3)
+        if r.status_code == 200:
+            data = r.json()
+            mode_name = str(data.get('mode_name', '')).lower()
+            mode_num = data.get('mode')
+            # FPP mode: 'remote' by name, or the legacy numeric remote mode (8).
+            if 'remote' in mode_name or mode_num == 8:
+                return 'remote'
+    except Exception as e:
+        logging.debug(f"_default_plugin_role: FPP status unavailable ({e})")
+    return 'master'
+
+
+def get_plugin_role():
+    """Effective role. An explicit config choice ('master'/'remote') always wins; when unset,
+    fall back to the FPP-mode default (resolved once, then cached for the process)."""
+    global _resolved_role
+    role = (config.get('plugin_role') or '').strip().lower()
+    if role in ('master', 'remote'):
+        return role
+    if _resolved_role is None:
+        _resolved_role = _default_plugin_role()
+    return _resolved_role
+
+
+def is_remote():
+    return get_plugin_role() == 'remote'
+
+
+def _local_ips():
+    """Best-effort set of this host's own addresses, to exclude self from discovery."""
+    import socket
+    ips = {'127.0.0.1', '::1', 'localhost'}
+    try:
+        hn = socket.gethostname()
+        ips.add(hn)
+        ips.add(socket.gethostbyname(hn))
+    except Exception:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ips.add(s.getsockname()[0])
+        s.close()
+    except Exception:
+        pass
+    return ips
+
+
+def _parse_host_port(target, default_port=5000):
+    """Split a manual 'host' or 'host:port' target into (host, port)."""
+    t = str(target).strip()
+    if not t:
+        return None
+    if ':' in t and not t.startswith('['):
+        host, _, p = t.rpartition(':')
+        try:
+            return host, int(p)
+        except ValueError:
+            return t, default_port
+    return t, default_port
+
+
+def discover_remotes(force=False):
+    """Return the base URLs of peer instances the master should push to — ONLY FPP systems
+    that actually run this plugin AND are set to remote mode (confirmed via /api/tml/ping).
+    Candidates come from FPP MultiSync (/api/fppd/multiSyncSystems) and the manual
+    remote_targets list. Cached briefly. Returns [] when no sync_key is configured."""
+    global _remotes_cache, _remotes_cache_time
+    now = time.time()
+    if not force and _remotes_cache and (now - _remotes_cache_time) < _REMOTES_CACHE_TTL:
+        return _remotes_cache
+
+    sk = (config.get('sync_key') or '').strip()
+    if not sk:
+        _remotes_cache, _remotes_cache_time = [], now
+        return []
+
+    candidates = []
+    for t in (config.get('remote_targets') or []):
+        hp = _parse_host_port(t)
+        if hp:
+            candidates.append(hp)
+
+    if config.get('auto_discover_remotes', True):
+        try:
+            r = requests.get(f"{FPP_HOST}/api/fppd/multiSyncSystems", timeout=3)
+            if r.status_code == 200:
+                data = r.json()
+                systems = data.get('systems') if isinstance(data, dict) else data
+                local = _local_ips()
+                for s in (systems or []):
+                    if not isinstance(s, dict):
+                        continue
+                    addr = str(s.get('address') or s.get('ip') or '').strip()
+                    if not addr or addr in local or s.get('local'):
+                        continue
+                    candidates.append((addr, 5000))
+        except Exception as e:
+            logging.debug(f"discover_remotes: multiSyncSystems failed ({e})")
+
+    # Probe each candidate: keep only confirmed textmylights instances in REMOTE mode.
+    seen, remotes = set(), []
+    hdr = {'X-TML-Sync-Key': sk}
+    for host, port in candidates:
+        h = f"[{host}]" if (':' in host and not host.startswith('[')) else host  # bracket IPv6
+        base = f"http://{h}:{port}"
+        if base in seen:
+            continue
+        seen.add(base)
+        try:
+            pr = requests.get(f"{base}/api/tml/ping", headers=hdr, timeout=2)
+            if pr.status_code == 200:
+                j = pr.json()
+                if j.get('plugin') == 'textmylights' and j.get('role') == 'remote':
+                    remotes.append(base)
+        except Exception:
+            pass  # unreachable / not the plugin / not remote — skip silently
+
+    _remotes_cache, _remotes_cache_time = remotes, now
+    return remotes
+
+
+def push_state_to_remotes(payload):
+    """Master only: fire-and-forget the chosen display state (name + content id + timing —
+    never sequence bytes) to every confirmed remote. Runs in a background thread so it never
+    delays the master's own display or SMS reply. No-op unless master with a sync_key set."""
+    if get_plugin_role() != 'master':
+        return
+    sk = (config.get('sync_key') or '').strip()
+    if not sk:
+        return
+
+    def _worker():
+        try:
+            remotes = discover_remotes()
+            if not remotes:
+                return
+            hdr = {'X-TML-Sync-Key': sk}
+            for base in remotes:
+                try:
+                    requests.post(f"{base}/api/tml/state", json=payload, headers=hdr, timeout=2)
+                except Exception as e:
+                    logging.debug(f"push to {base} failed: {e}")
+        except Exception as e:
+            logging.warning(f"push_state_to_remotes error: {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+_last_pushed_waiting = None
+
+def _push_waiting_state():
+    """Master: tell remotes which waiting/background content is now active (a 'waiting event'
+    — content id only, no name), so remotes mirror rotation picks. Deduped so the repeated
+    image-restore after each name doesn't spam the network."""
+    global _last_pushed_waiting
+    if get_plugin_role() != 'master':
+        return
+    cur = _active_waiting_content
+    if cur == _last_pushed_waiting:
+        return
+    _last_pushed_waiting = cur
+    push_state_to_remotes({'content': cur})
 
 
 def _coerce_len(seq, n, fill):
@@ -2563,10 +2766,11 @@ def update_message_status(phone, name, new_status):
     except Exception as e:
         logging.error(f"Error updating message status: {e}")
 
-def add_to_queue(name, phone, message):
-    """Add a message to the display queue"""
+def add_to_queue(name, phone, message, override=None):
+    """Add a message to the display queue. `override` (remote path) carries the master's
+    pushed {content, duration} so the display uses that selection instead of choosing one."""
     global message_queue
-    
+
     try:
         queue_item = {
             "name": name,
@@ -2576,6 +2780,8 @@ def add_to_queue(name, phone, message):
             "timestamp": datetime.now().isoformat(),
             "status": "queued"
         }
+        if override is not None:
+            queue_item["override"] = override
         
         logging.info(f"📋 Created queue item: {queue_item}")
         
@@ -2593,8 +2799,28 @@ def add_to_queue(name, phone, message):
         logging.error(traceback.format_exc())
         return False
 
-def send_to_fpp(name):
-    """Send name to FPP - Start name sequence and display text overlay"""
+def _content_exists_locally(content):
+    """True if the plugin content id (seq:/img:) exists on THIS instance. Empty content (no
+    background) and non-seq/img values are treated as present. Used by the remote to decide
+    whether it can honor a master-pushed content or must keep its current background."""
+    if not content:
+        return True
+    if content.startswith('seq:'):
+        nm = os.path.basename(content[4:].removesuffix('.fseq'))
+        return os.path.exists(os.path.join(FSEQ_SEQUENCE_PATH, nm + '.fseq'))
+    if content.startswith('img:'):
+        nm = os.path.basename(content[4:])
+        return os.path.exists(os.path.join(FPP_IMAGES_PATH, nm))
+    return True
+
+
+def send_to_fpp(name, override=None):
+    """Send name to FPP - Start name sequence and display text overlay.
+
+    override (remote path): {'content': <id>, 'duration': <int>} — the master's chosen
+    content/timing. The remote renders it with ITS OWN layout (matched item, else flat) and
+    falls back to no background switch when it lacks the pushed content. When override is
+    None (master / standalone), content is selected locally exactly as before."""
     try:
         fpp_host = FPP_HOST
         # Pick which names content (with its OWN text layout + duration) to use for THIS
@@ -2602,7 +2828,20 @@ def send_to_fpp(name):
         # waiting content), exactly as before. The chosen content + duration are stashed in
         # module globals for display_worker() and the return/stop paths.
         global _active_name_content, _active_display_duration
-        _item = select_names_content_item()
+        _forced_content = None
+        if override is not None:
+            # Remote: content/timing pushed by the master. Keep the local look: match the
+            # pushed content to THIS instance's own names_content_list item for its layout.
+            _forced_content = override.get('content', '') or ''
+            if _forced_content and not _content_exists_locally(_forced_content):
+                logging.info(f"ℹ️  Remote: pushed content '{_forced_content}' not present here "
+                             f"— overlaying name on current background")
+                _forced_content = ''
+            _item = next((it for it in (config.get('names_content_list', []) or [])
+                          if it.get('content', '') == _forced_content), None)
+        else:
+            _item = select_names_content_item()
+
         if _item is not None:
             name_playlist         = _item.get('content', '')
             message_lines         = _item.get('message_lines', ['', '', '', ''])
@@ -2623,7 +2862,19 @@ def send_to_fpp(name):
             line_fonts_cfg        = config.get('line_fonts', [])
             line_orientations_cfg = config.get('line_orientations', [])
             _active_display_duration = int(config.get('display_duration', 30) or 30)
+        if override is not None:
+            # Background + timing are the master's selection; layout above stays local.
+            name_playlist = _forced_content
+            if override.get('duration'):
+                _active_display_duration = int(override['duration'])
         _active_name_content = name_playlist
+        # Master: mirror this exact name + chosen content + duration to the remotes so every
+        # projector shows the same selection (incl. random/round-robin picks). Skipped when
+        # override is set (this IS a remote applying a push) so remotes never re-push.
+        if override is None and get_plugin_role() == 'master':
+            push_state_to_remotes({'name': name,
+                                   'content': _active_name_content,
+                                   'duration': _active_display_duration})
         overlay_model = config.get('overlay_model_name', 'Texting Matrix')
 
         global_text_color = config.get('text_color', '#FF0000')
@@ -2977,12 +3228,16 @@ def _switch_waiting_content(new_content, prev_content):
             # img: → img: needs nothing (new render already overwrote the overlay buffer).
     except Exception as e:
         logging.warning(f"Rotator teardown of previous waiting content failed: {e}")
+    _push_waiting_state()   # master: mirror this waiting selection to the remotes
     return ok
 
 
 def _rotator_should_idle():
     """The rotator only rotates when NOT paused, the show is enabled, and 2+ waiting items
-    are configured. Otherwise it idles (single-content / disabled / stopped)."""
+    are configured. Otherwise it idles (single-content / disabled / stopped). Remotes never
+    self-rotate — their waiting content is chosen by the master and applied via a push."""
+    if is_remote():
+        return True
     if stop_rotator or not config.get('enabled', False):
         return True
     return len((config.get('default_content_list', []) or [])) < 2
@@ -3079,8 +3334,11 @@ def start_waiting_content():
 
     # 0–1 items: single-content behavior. A 1-item list uses that item; else default_playlist.
     if len(lst) == 1 and lst[0].get('content'):
-        return start_default_playlist(lst[0]['content'])
-    return start_default_playlist()
+        ok = start_default_playlist(lst[0]['content'])
+    else:
+        ok = start_default_playlist()
+    _push_waiting_state()   # master: mirror the single waiting content to the remotes
+    return ok
 
 
 def return_to_default_playlist():
@@ -3277,7 +3535,8 @@ def display_worker():
             
             try:
                 logging.info(f"📺 Sending to FPP display...")
-                send_to_fpp(name)
+                # On a remote, the item carries the master's pushed {content, duration}.
+                send_to_fpp(name, override=currently_displaying.get('override'))
                 logging.info(f"✅ Sent to FPP display")
             except Exception as e:
                 logging.error(f"💥 Error sending to FPP: {e}")
@@ -3939,6 +4198,10 @@ def start_polling_if_needed():
     provider be switched from the UI without a service restart."""
     global polling_thread, polling_source, polling_generation
 
+    # Remotes never talk to Twilio/Google — they only render names the master pushes.
+    if is_remote():
+        return False
+
     source = config.get('message_source', 'twilio')
     if source == 'google_voice':
         if not (config.get('gv_email') and config.get('gv_app_password')):
@@ -4048,6 +4311,27 @@ def index():
                 <!-- LEFT COLUMN: Twilio + FPP Display + Message Settings -->
                 <div class="column">
                     <div class="section">
+                        <h2>🖥️ Projector Role (Master / Remote)</h2>
+                        <p class="help-text">Running the plugin on more than one FPP? The <strong>Master</strong> receives the texts, sends replies, and counts limits; each <strong>Remote</strong> only displays the names the Master pushes to it. One text = one name — no duplicate replies, no double counting.</p>
+                        <label>This instance is:</label>
+                        <select id="plugin_role" onchange="onRoleChange()">
+                            <option value="master" {{ 'selected' if effective_role != 'remote' else '' }}>Master — handles texts &amp; pushes names</option>
+                            <option value="remote" {{ 'selected' if effective_role == 'remote' else '' }}>Remote — only displays pushed names</option>
+                        </select>
+                        <p class="help-text" id="role_default_hint" style="margin-top:4px;">{% if not config.get('plugin_role') %}Defaulting to <strong>{{ effective_role }}</strong> because this FPP is in <strong>{{ fpp_mode_default_reason }}</strong> mode. Change it above if needed.{% endif %}</p>
+                        <label style="margin-top:10px;">Sync Key <span class="help-text" style="font-weight:normal;">— set the SAME value on every instance; it authenticates the master↔remote connection.</span></label>
+                        <input type="password" id="sync_key" value="{{ secret_sentinel if config.get('sync_key') else '' }}" placeholder="A shared secret, e.g. a random phrase">
+                        <div id="master_discovery_box">
+                            <label class="toggle-switch" style="margin-top:10px;"><input type="checkbox" id="auto_discover_remotes" {{ 'checked' if config.get('auto_discover_remotes', True) else '' }} onchange="saveConfig()"><span class="toggle-slider"></span></label>
+                            <label class="checkbox-label">Auto-discover remotes via FPP MultiSync</label>
+                            <label style="margin-top:8px;">Manual remote IPs <span class="help-text" style="font-weight:normal;">(optional, one per line — used in addition to auto-discovery)</span></label>
+                            <textarea id="remote_targets" rows="2" placeholder="192.168.1.50">{{ remote_targets_text }}</textarea>
+                        </div>
+                        <div id="remote_mode_note" style="display:none; background:#e3f2fd; border:1px solid #90caf9; color:#0d47a1; border-radius:5px; padding:8px 12px; margin-top:10px; font-size:13px;">
+                            ℹ️ <strong>Remote mode:</strong> texts, replies, and per-phone limits are configured on the <strong>Master</strong> — they're ignored here. This instance only displays the names the Master pushes, using <em>this projector's</em> own overlay model, fonts, and content. Make sure the same sequences/images exist on this Pi (use <strong>Config → Export/Import</strong>); if a pushed sequence is missing, this instance simply keeps showing its current content.
+                        </div>
+                    </div>
+                    <div class="section" id="message_source_section">
                         <h2>Message Source</h2>
                         <label>SMS Provider:</label>
                         <select id="message_source">
@@ -4479,6 +4763,32 @@ def index():
                                    : (two && two.checked) ? '2 words'
                                    : '1-2 words';
                 }
+                // Show/hide the master-only vs remote-only bits based on the role select.
+                function onRoleChange() {
+                    var sel = document.getElementById('plugin_role');
+                    var remote = sel && sel.value === 'remote';
+                    var src = document.getElementById('message_source_section');
+                    if (src) src.style.display = remote ? 'none' : '';
+                    var disc = document.getElementById('master_discovery_box');
+                    if (disc) disc.style.display = remote ? 'none' : '';
+                    var note = document.getElementById('remote_mode_note');
+                    if (note) note.style.display = remote ? 'block' : 'none';
+                    var hint = document.getElementById('role_default_hint');
+                    if (hint) hint.style.display = 'none';  // user made an explicit choice
+                    if (typeof saveConfig === 'function') saveConfig();
+                }
+                window.onRoleChange = onRoleChange;
+                // Apply role visibility on load WITHOUT saving (don't stamp a default on first paint).
+                (function(){
+                    var sel = document.getElementById('plugin_role');
+                    var remote = sel && sel.value === 'remote';
+                    var src = document.getElementById('message_source_section');
+                    if (src) src.style.display = remote ? 'none' : '';
+                    var disc = document.getElementById('master_discovery_box');
+                    if (disc) disc.style.display = remote ? 'none' : '';
+                    var note = document.getElementById('remote_mode_note');
+                    if (note) note.style.display = remote ? 'block' : 'none';
+                })();
                 updateFormatRules();
                 checkFiltersState();
                 checkDuplicateState();
@@ -7146,6 +7456,10 @@ var _saveTimer = null;
                 if (typeof window.flushEditorToSelected === 'function') window.flushEditorToSelected();
 
                 const data = {
+                    plugin_role: (document.getElementById('plugin_role')||{}).value || 'master',
+                    sync_key: (document.getElementById('sync_key')||{}).value || '',
+                    auto_discover_remotes: (document.getElementById('auto_discover_remotes')||{}).checked ?? true,
+                    remote_targets: ((document.getElementById('remote_targets')||{}).value || '').split('\\n').map(function(s){return s.trim();}).filter(Boolean),
                     message_source: document.getElementById('message_source').value,
                     twilio_account_sid: document.getElementById('account_sid').value,
                     twilio_auth_token: document.getElementById('auth_token').value,
@@ -7556,7 +7870,12 @@ var _saveTimer = null;
     </html>
     """
 
-    return render_template_string(html, config=config, secret_sentinel=SECRET_SENTINEL)
+    _eff_role = get_plugin_role()
+    _remote_targets_text = "\n".join(config.get('remote_targets') or [])
+    return render_template_string(html, config=config, secret_sentinel=SECRET_SENTINEL,
+                                  effective_role=_eff_role,
+                                  fpp_mode_default_reason=('remote' if _eff_role == 'remote' else 'player'),
+                                  remote_targets_text=_remote_targets_text)
 
 @app.route('/api/config', methods=['POST'])
 def update_config():
@@ -7604,6 +7923,23 @@ def update_config():
         # empty list leaves the user's single default_playlist untouched.
         if _wlst:
             config['default_playlist'] = _wlst[0]['content']
+
+        # Multi-instance role/discovery keys.
+        if 'plugin_role' in new_config:
+            _r = str(new_config.get('plugin_role') or '').strip().lower()
+            config['plugin_role'] = _r if _r in ('master', 'remote') else ''
+            global _resolved_role
+            _resolved_role = None   # re-resolve the FPP-mode default next time if unset
+        if 'auto_discover_remotes' in new_config:
+            config['auto_discover_remotes'] = bool(new_config.get('auto_discover_remotes'))
+        if 'remote_targets' in new_config:
+            raw_rt = new_config.get('remote_targets')
+            if not isinstance(raw_rt, list):
+                raw_rt = []
+            config['remote_targets'] = [str(t).strip() for t in raw_rt if str(t).strip()][:32]
+        # A role/discovery change invalidates the master's cached remote list.
+        global _remotes_cache_time
+        _remotes_cache_time = 0
 
         # Normalize phone number to E.164 (strip spaces, dashes, parens — keep + and digits)
         if config.get('twilio_phone_number'):
@@ -9726,10 +10062,67 @@ def view_messages():
     return render_template_string(html, config=config, tabs=tabs, today_messages=today_messages)
 
 
+# ── Multi-instance (master/remote) endpoints ────────────────────────────────
+# Authenticated by the shared sync_key in _require_access_token (the /api/tml/ prefix).
+
+@app.route('/api/tml/ping', methods=['GET'])
+def api_tml_ping():
+    """Identify this instance to a discovering master: plugin name + effective role. A master
+    pushes only to peers that answer here with role == 'remote'."""
+    return jsonify({"plugin": "textmylights", "role": get_plugin_role()})
+
+
+def _apply_remote_waiting(content):
+    """Remote: switch the base waiting/background layer to the master-pushed content — unless
+    this instance lacks that content, in which case keep whatever is currently showing."""
+    content = content or ''
+    if content and not _content_exists_locally(content):
+        logging.info(f"ℹ️  Remote: pushed waiting content '{content}' not present — keeping current")
+        return
+    with rotator_lock:
+        _switch_waiting_content(content, _active_waiting_content)
+
+
+@app.route('/api/tml/state', methods=['POST'])
+def api_tml_state():
+    """Remote: apply the master's chosen display state. A name event ({name, content,
+    duration}) shows that name over the content using THIS instance's own layout; a waiting
+    event ({content}) switches the background. Only remotes act on it."""
+    if not is_remote():
+        return jsonify({"success": False, "error": "not in remote mode"}), 409
+    data = request.json or {}
+    content = str(data.get('content', '') or '')
+    name = str(data.get('name', '') or '').strip()
+    duration = data.get('duration')
+    global _remote_last_state, _remote_last_state_time
+    _remote_last_state = {"name": name, "content": content}
+    _remote_last_state_time = time.time()
+    try:
+        if name:
+            add_to_queue(name, "REMOTE", name,
+                         override={"content": content, "duration": duration})
+        else:
+            _apply_remote_waiting(content)
+        return jsonify({"success": True})
+    except Exception as e:
+        return _client_error("api_tml_state", e)
+
+
 @app.route('/api/activate', methods=['GET', 'POST'])
 def api_activate():
     """FPP scheduler hook: enable the plugin, start SMS polling, and start the waiting playlist."""
     global polling_thread, stop_polling
+
+    # A remote never polls/responds — it just needs to be enabled to render pushed names and
+    # show its own waiting content as a fallback until the master pushes. Skip the
+    # content-required check + polling for remotes.
+    if is_remote():
+        config['enabled'] = True
+        save_config()
+        result = start_waiting_content()
+        logging.info("✅ Text My Lights Start (remote) — ready to receive names from the master")
+        return jsonify({"success": True, "playlist_started": result, "role": "remote",
+                        "message": "Text My Lights remote activated"})
 
     # Require waiting content — a single default_playlist or a rotation list. Without one
     # the show has no defined state.

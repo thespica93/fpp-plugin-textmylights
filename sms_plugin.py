@@ -717,6 +717,27 @@ def _push_waiting_state():
     push_state_to_remotes({'content': _active_waiting_content})
 
 
+def broadcast_stop_to_remotes():
+    """Master only: tell every confirmed remote to Stop too, so pressing Stop on the master
+    takes the whole show down. Fire-and-forget in a background thread; each remote drains its
+    own queue (any names the master already pushed finish first) before going dark."""
+    if get_plugin_role() != 'master':
+        return
+
+    def _worker():
+        try:
+            remotes = discover_remotes()
+            for base in remotes:
+                try:
+                    requests.post(f"{base}/api/tml/stop", timeout=2)
+                except Exception as e:
+                    logging.debug(f"stop broadcast to {base} failed: {e}")
+        except Exception as e:
+            logging.warning(f"broadcast_stop_to_remotes error: {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 def master_sync_heartbeat():
     """Master: re-assert the current WAITING content to remotes every few seconds so a remote
     that joins late (rebooted, powered on after the master) converges to the same background.
@@ -10369,6 +10390,19 @@ def api_tml_state():
         return _client_error("api_tml_state", e)
 
 
+@app.route('/api/tml/stop', methods=['POST'])
+def api_tml_stop():
+    """Remote: the master was Stopped, so stop here too. Same graceful behavior as the local
+    Stop — any names the master already pushed drain first, then the waiting content stops.
+    Only remotes act on it (the peer-IP allowlist in before_request gates who may call it)."""
+    if not is_remote():
+        return jsonify({"success": False, "error": "not in remote mode"}), 409
+    try:
+        return jsonify(_deactivate_local())
+    except Exception as e:
+        return _client_error("api_tml_stop", e)
+
+
 @app.route('/api/activate', methods=['GET', 'POST'])
 def api_activate():
     """FPP scheduler hook: enable the plugin, start SMS polling, and start the waiting playlist."""
@@ -10409,12 +10443,12 @@ def api_activate():
                     "message": "Text My Lights plugin activated"})
 
 
-@app.route('/api/deactivate', methods=['GET', 'POST'])
-def api_deactivate():
-    """FPP scheduler hook: disable the plugin and stop the show. If names are
-    still displaying or queued, let them finish first (the display worker stops
-    the waiting content once the queue drains); only stop immediately when the
-    queue is idle. The polling thread keeps running to send show_not_live replies."""
+def _deactivate_local():
+    """Disable the plugin and stop the show on THIS instance. If names are still displaying
+    or queued, let them finish first (the display worker stops the waiting content once the
+    queue drains); only stop immediately when the queue is idle. Returns the JSON response
+    body. Shared by the scheduler hook (/api/deactivate) and the master's stop broadcast
+    (/api/tml/stop)."""
     config['enabled'] = False    # stop accepting new names right away
     save_config()
 
@@ -10426,13 +10460,24 @@ def api_deactivate():
     if draining:
         logging.info("🛑 Text My Lights Stop: draining — names still playing/queued; "
                      "waiting content will stop after they finish")
-        return jsonify({"success": True, "draining": True,
-                        "message": "Stopping after current names finish"})
+        return {"success": True, "draining": True,
+                "message": "Stopping after current names finish"}
 
     # Nothing queued or displaying — stop the waiting content now.
     stop_show_playback()
     logging.info("🛑 Text My Lights Stop: disabled and playback stopped")
-    return jsonify({"success": True, "message": "Text My Lights plugin deactivated"})
+    return {"success": True, "message": "Text My Lights plugin deactivated"}
+
+
+@app.route('/api/deactivate', methods=['GET', 'POST'])
+def api_deactivate():
+    """FPP scheduler hook: disable the plugin and stop the show. The polling thread keeps
+    running to send show_not_live replies. When this is the master, the Stop is also
+    broadcast to every remote so pressing Stop here takes the whole show down."""
+    # Tell the remotes to stop too (no-op unless this instance is the master). Fire this
+    # first so they begin draining in parallel with the master.
+    broadcast_stop_to_remotes()
+    return jsonify(_deactivate_local())
 
 
 if __name__ == '__main__':

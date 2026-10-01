@@ -439,6 +439,11 @@ _tml_peer_cache = set()          # cached IPs allowed to call /api/tml/* (FPP pe
 _tml_peer_cache_time = 0.0
 _remote_last_state = None        # remote side: last state applied from a master push
 _remote_last_state_time = 0.0
+_remote_stop_requested = False   # remote side: True once the master broadcasts Stop. A remote
+                                 # never self-stops on its local `enabled` flag (it's usually
+                                 # never activated locally — only the master is Started); it
+                                 # keeps returning to its waiting content between names and
+                                 # only tears the show down when the master says to.
 _last_fpp_mode = None            # last-seen FPP mode role, for the auto-follow watcher
 
 
@@ -744,7 +749,11 @@ def master_sync_heartbeat():
     Only fires while idle (no name showing); the remote no-ops if already on that content."""
     while True:
         try:
-            if get_plugin_role() == 'master' and currently_displaying is None:
+            # Only re-assert while the master's own show is live and idle. A STOPPED or
+            # draining master must not keep pushing waiting content — that would re-arm a
+            # remote that was just told to stop (the waiting push clears its stop flag).
+            if (get_plugin_role() == 'master' and config.get('enabled', False)
+                    and currently_displaying is None):
                 push_state_to_remotes({'content': _active_waiting_content})
         except Exception as e:
             logging.debug(f"master_sync_heartbeat: {e}")
@@ -3713,11 +3722,16 @@ def display_worker():
             except Exception as e:
                 logging.error(f"💥 Error during display: {e}")
             
-            # Graceful stop: if the show was stopped (enabled=False) while names were
-            # still displaying/queued, keep showing each one, but once this was the
-            # LAST queued name, stop the waiting content instead of resuming it.
+            # Graceful stop: if the show was stopped while names were still displaying/queued,
+            # keep showing each one, but once this was the LAST queued name, stop the waiting
+            # content instead of resuming it. A REMOTE is driven by the master, not its own
+            # `enabled` flag (it's usually never Started locally) — it only stops when the
+            # master has broadcast Stop; otherwise it always returns to its waiting content.
             try:
-                stopping = not config.get('enabled', False)
+                if is_remote():
+                    stopping = _remote_stop_requested
+                else:
+                    stopping = not config.get('enabled', False)
                 with queue_lock:
                     more_queued = len(message_queue) > 0
                 if stopping and not more_queued:
@@ -10376,7 +10390,7 @@ def api_tml_state():
     content = str(data.get('content', '') or '')
     name = str(data.get('name', '') or '').strip()
     duration = data.get('duration')
-    global _remote_last_state, _remote_last_state_time
+    global _remote_last_state, _remote_last_state_time, _remote_stop_requested
     _remote_last_state = {"name": name, "content": content}
     _remote_last_state_time = time.time()
     try:
@@ -10384,6 +10398,11 @@ def api_tml_state():
             add_to_queue(name, "REMOTE", name,
                          override={"content": content, "duration": duration})
         else:
+            # A waiting push with real content means the master is live — clear any prior
+            # stop request so this remote resumes returning to its waiting content between
+            # names. (An empty-content push is a stopped/cleared master; don't re-arm on it.)
+            if content:
+                _remote_stop_requested = False
             _apply_remote_waiting(content)
         return jsonify({"success": True})
     except Exception as e:
@@ -10397,6 +10416,8 @@ def api_tml_stop():
     Only remotes act on it (the peer-IP allowlist in before_request gates who may call it)."""
     if not is_remote():
         return jsonify({"success": False, "error": "not in remote mode"}), 409
+    global _remote_stop_requested
+    _remote_stop_requested = True   # the display worker tears down once its queue drains
     try:
         return jsonify(_deactivate_local())
     except Exception as e:

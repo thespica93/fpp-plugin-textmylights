@@ -445,7 +445,18 @@ _last_fpp_mode = None            # last-seen FPP mode role, for the auto-follow 
 def _fpp_mode_role():
     """The plugin role implied by FPP's CURRENT mode — 'remote' when FPP is in remote mode,
     else 'master' — or None when FPP can't be reached (so callers don't act on a transient
-    failure). Read from /api/fppd/status (mode_name/mode; REMOTE_MODE == 8)."""
+    failure). Primary source is the fppMode setting (string 'remote'/'player'); falls back to
+    /api/fppd/status (mode_name / mode==8=REMOTE_MODE)."""
+    # Primary: the fppMode setting value itself (most direct).
+    try:
+        r = requests.get(f"{FPP_HOST}/api/settings/fppMode", timeout=3)
+        if r.status_code == 200:
+            txt = (r.text or '').strip().strip('"').lower()   # may be "remote" or remote
+            if txt:
+                return 'remote' if 'remote' in txt else 'master'
+    except Exception as e:
+        logging.debug(f"_fpp_mode_role: settings/fppMode unavailable ({e})")
+    # Fallback: fppd status.
     try:
         r = requests.get(f"{FPP_HOST}/api/fppd/status", timeout=3)
         if r.status_code == 200:
@@ -453,9 +464,10 @@ def _fpp_mode_role():
             mode_name = str(data.get('mode_name', '')).lower()
             if 'remote' in mode_name or data.get('mode') == 8:
                 return 'remote'
-            return 'master'
+            if mode_name or data.get('mode') is not None:
+                return 'master'
     except Exception as e:
-        logging.debug(f"_fpp_mode_role: FPP status unavailable ({e})")
+        logging.debug(f"_fpp_mode_role: fppd status unavailable ({e})")
     return None
 
 
@@ -470,16 +482,16 @@ def fpp_mode_watcher():
     remote the plugin becomes a remote; when FPP switches to player the plugin becomes master.
     Acts only on an actual FPP mode CHANGE, so a manual toggle persists until FPP changes next."""
     global _last_fpp_mode, _resolved_role
-    logging.info("🔀 FPP mode watcher started (plugin role will follow FPP player↔remote)")
+    logging.info("🔀 FPP mode watcher started (plugin role follows FPP player↔remote)")
     while True:
         try:
-            role = _fpp_mode_role()   # None while FPP is unreachable → ignore
-            # Adopt FPP's mode on the first successful read (startup) and whenever it changes.
-            if role is not None and role != _last_fpp_mode:
-                first = _last_fpp_mode is None
-                _last_fpp_mode = role
-                logging.info(f"🔀 FPP mode is '{role}' "
-                             f"({'startup' if first else 'changed'}); plugin_role='{config.get('plugin_role') or '(unset)'}'")
+            role = _fpp_mode_role()   # None while FPP is unreachable → leave role as-is
+            if role is not None:
+                if role != _last_fpp_mode:
+                    logging.info(f"🔀 FPP mode detected: '{role}'")
+                    _last_fpp_mode = role
+                # Authoritative: the plugin role ALWAYS matches FPP's mode — correct any drift
+                # (stale config, a stray save) each pass, not only on a transition.
                 if (config.get('plugin_role') or '') != role:
                     logging.info(f"🔀 Setting plugin role → '{role}' to match FPP")
                     config['plugin_role'] = role
@@ -4410,13 +4422,13 @@ def index():
                 <div class="column">
                     <div class="section">
                         <h2>🖥️ Projector Role (Master / Remote)</h2>
-                        <p class="help-text">Running the plugin on more than one FPP? The <strong>Master</strong> receives the texts, sends replies, and counts limits; each <strong>Remote</strong> only displays the names the Master pushes to it. One text = one name — no duplicate replies, no double counting. This follows your FPP's mode automatically (FPP <em>Player</em> → Master, FPP <em>Remote</em> → Remote) and updates if you change FPP's mode; override it here if you need to.</p>
-                        <label>This instance is:</label>
-                        <select id="plugin_role" onchange="onRoleChange()">
+                        <p class="help-text">Running the plugin on more than one FPP? The <strong>Master</strong> receives the texts, sends replies, and counts limits; each <strong>Remote</strong> only displays the names the Master pushes to it. One text = one name — no duplicate replies, no double counting.</p>
+                        <label>This instance is: <span class="help-text" style="font-weight:normal;">— set automatically from this FPP's mode (Player → Master, Remote → Remote). Change the FPP mode in the top-right FPP menu.</span></label>
+                        <select id="plugin_role" disabled style="opacity:0.85; cursor:not-allowed;">
                             <option value="master" {{ 'selected' if effective_role != 'remote' else '' }}>Master — handles texts &amp; pushes names</option>
                             <option value="remote" {{ 'selected' if effective_role == 'remote' else '' }}>Remote — only displays pushed names</option>
                         </select>
-                        <p class="help-text" id="role_default_hint" style="margin-top:4px;">{% if not config.get('plugin_role') %}Defaulting to <strong>{{ effective_role }}</strong> because this FPP is in <strong>{{ fpp_mode_default_reason }}</strong> mode. Change it above if needed.{% endif %}</p>
+                        <p class="help-text" id="role_default_hint" style="margin-top:4px;">Following this FPP's mode (<strong>{{ fpp_mode_default_reason }}</strong>).</p>
                         <div id="master_discovery_box">
                             <p class="help-text" style="margin-top:8px;">🔎 Remotes are found automatically over FPP MultiSync — just set each other FPP instance to <strong>Remote</strong> mode. Nothing to enter here.</p>
                         </div>
@@ -7647,7 +7659,6 @@ var _saveTimer = null;
                 if (typeof window.flushEditorToSelected === 'function') window.flushEditorToSelected();
 
                 const data = {
-                    plugin_role: (document.getElementById('plugin_role')||{}).value || 'master',
                     message_source: document.getElementById('message_source').value,
                     twilio_account_sid: document.getElementById('account_sid').value,
                     twilio_auth_token: document.getElementById('auth_token').value,
@@ -9064,8 +9075,9 @@ def get_messages_by_date(date_str):
 @app.route('/api/plugin_role')
 def api_plugin_role():
     """Current effective role (master/remote), so the config page can reflect the live value
-    even if the FPP-mode watcher updated it after the page was rendered."""
-    return jsonify({"role": get_plugin_role()})
+    even if the FPP-mode watcher updated it after the page was rendered. `fpp_mode` is the
+    last mode the watcher read from FPP (diagnostic)."""
+    return jsonify({"role": get_plugin_role(), "fpp_mode": _last_fpp_mode})
 
 
 @app.route('/api/plugin/master-layout')

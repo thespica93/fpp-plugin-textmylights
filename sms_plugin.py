@@ -3512,10 +3512,22 @@ def return_to_default_playlist():
         # 1) Stop the NAME content by type. Never a blanket Stop Now — the main
         #    scheduler and any coexisting foreground must keep running.
         if name_playlist.startswith('seq:'):
-            # Stop the names FSEQ Effect — waiting FSEQ (if any) keeps running underneath
             seq_name = name_playlist[4:].removesuffix('.fseq')
-            r = requests.get(f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(seq_name)}", timeout=3)
-            logging.info(f"⏹️  FSEQ Effect Stop (names): {r.status_code} - {r.text}")
+            # CRITICAL: don't stop the name seq if it's the SAME sequence as the active
+            # waiting background. This is the common case on remotes (and any setup that
+            # reuses one background for both names and waiting): the master pushes a name
+            # whose content id equals the waiting content, so the single looping FSEQ is
+            # serving as both layers. Stopping it here would tear down the waiting
+            # background, leaving the output black until the master's ~10s heartbeat
+            # re-pushes it. Just leave it looping and clear the overlay below.
+            waiting_seq = default_content[4:].removesuffix('.fseq') if default_content.startswith('seq:') else None
+            if seq_name == waiting_seq:
+                logging.info(f"⏭️  Name seq '{seq_name}' is also the waiting background — leaving it "
+                             f"running, only clearing the overlay")
+            else:
+                # Stop the names FSEQ Effect — waiting FSEQ (if any) keeps running underneath
+                r = requests.get(f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(seq_name)}", timeout=3)
+                logging.info(f"⏹️  FSEQ Effect Stop (names): {r.status_code} - {r.text}")
         elif name_playlist.startswith('img:'):
             # Image name used the overlay only — nothing on the output to stop.
             pass

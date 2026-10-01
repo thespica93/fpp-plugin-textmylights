@@ -306,10 +306,6 @@ DEFAULT_CONFIG = {
     #   "remote" — never polls/responds/counts; only renders name + content pushed by the
     #              master, using this instance's OWN overlay model / fonts / layout.
     "plugin_role": "",
-    # Discovery of peer instances for the master's push. Auto uses FPP MultiSync
-    # (/api/fppd/multiSyncSystems); manual list is a fallback / override (IPs or host:port).
-    "auto_discover_remotes": True,
-    "remote_targets": [],
     # Which inbound message source feeds the pipeline: "twilio" | "google_voice"
     "message_source": "twilio",
     "twilio_account_sid": "",
@@ -568,47 +564,27 @@ def _multisync_addresses():
 
 
 def _trusted_tml_peers():
-    """IPs allowed to call this instance's /api/tml/* endpoints WITHOUT the access token:
-    the FPP MultiSync peers this box already recognizes, plus any manual remote_targets.
-    No shared secret — trust follows FPP's own sync network. Cached briefly."""
+    """IPs allowed to call this instance's /api/tml/* endpoints WITHOUT the access token: the
+    FPP MultiSync peers this box already recognizes. No shared secret — trust follows FPP's
+    own sync network. Cached briefly."""
     global _tml_peer_cache, _tml_peer_cache_time
     now = time.time()
     if _tml_peer_cache and (now - _tml_peer_cache_time) < _REMOTES_CACHE_TTL:
         return _tml_peer_cache
     peers = set(_multisync_addresses())
-    for t in (config.get('remote_targets') or []):
-        hp = _parse_host_port(t)
-        if hp:
-            peers.add(hp[0])
     _tml_peer_cache, _tml_peer_cache_time = peers, now
     return peers
 
 
-def discover_remotes(force=False):
-    """Return the base URLs of peer instances the master should push to — ONLY FPP systems
-    that actually run this plugin AND are set to remote mode (confirmed via /api/tml/ping).
-    Candidates come from FPP MultiSync (/api/fppd/multiSyncSystems) and the manual
-    remote_targets list. Cached briefly."""
-    global _remotes_cache, _remotes_cache_time
-    now = time.time()
-    if not force and _remotes_cache and (now - _remotes_cache_time) < _REMOTES_CACHE_TTL:
-        return _remotes_cache
-
-    candidates = []
-    for t in (config.get('remote_targets') or []):
-        hp = _parse_host_port(t)
-        if hp:
-            candidates.append(hp)
-
-    if config.get('auto_discover_remotes', True):
-        for addr in _multisync_addresses():
-            candidates.append((addr, 5000))
-
-    # Probe each candidate: keep only confirmed textmylights instances in REMOTE mode.
-    seen, remotes = set(), []
-    for host, port in candidates:
+def _probe_plugin_peers():
+    """Probe the FPP MultiSync systems and group the ones running this plugin by role:
+    {'master': [base URLs], 'remote': [base URLs]}. Discovery is automatic — peers come from
+    FPP's own MultiSync network, so the user only has to set each FPP's player/remote mode."""
+    out = {'master': [], 'remote': []}
+    seen = set()
+    for host in _multisync_addresses():
         h = f"[{host}]" if (':' in host and not host.startswith('[')) else host  # bracket IPv6
-        base = f"http://{h}:{port}"
+        base = f"http://{h}:5000"
         if base in seen:
             continue
         seen.add(base)
@@ -616,13 +592,84 @@ def discover_remotes(force=False):
             pr = requests.get(f"{base}/api/tml/ping", timeout=2)
             if pr.status_code == 200:
                 j = pr.json()
-                if j.get('plugin') == 'textmylights' and j.get('role') == 'remote':
-                    remotes.append(base)
+                if j.get('plugin') == 'textmylights' and j.get('role') in out:
+                    out[j['role']].append(base)
         except Exception:
-            pass  # unreachable / not the plugin / not remote — skip silently
+            pass  # unreachable / not the plugin — skip silently
+    return out
 
+
+def discover_remotes(force=False):
+    """Base URLs of peer instances the master should push to — ONLY FPP systems running this
+    plugin in REMOTE mode. Cached briefly."""
+    global _remotes_cache, _remotes_cache_time
+    now = time.time()
+    if not force and _remotes_cache and (now - _remotes_cache_time) < _REMOTES_CACHE_TTL:
+        return _remotes_cache
+    remotes = _probe_plugin_peers()['remote']
     _remotes_cache, _remotes_cache_time = remotes, now
     return remotes
+
+
+def _find_master_base():
+    """Remote: base URL of the FPP peer running this plugin in MASTER mode, or None."""
+    masters = _probe_plugin_peers()['master']
+    return masters[0] if masters else None
+
+
+def sync_names_content_from_master():
+    """Remote: mirror the MASTER's Name Display content ids into this instance's own list so
+    the Display-tab dropdown shows them — but only content that physically exists on this
+    remote, and KEEPING this remote's own per-content overlay layout (different model size /
+    positioning). Returns True if the list changed."""
+    if not is_remote():
+        return False
+    master = _find_master_base()
+    if not master:
+        return False
+    try:
+        r = requests.get(f"{master}/api/tml/content-list", timeout=3)
+        if r.status_code != 200:
+            return False
+        master_ids = [c for c in (r.json().get('names') or []) if c]
+    except Exception as e:
+        logging.debug(f"sync_names_content_from_master: fetch failed ({e})")
+        return False
+
+    # Only content physically present on THIS remote, in the master's order.
+    target = [c for c in master_ids if _content_exists_locally(c)]
+    lst = config.get('names_content_list', []) or []
+    existing = {it.get('content'): it for it in lst if it.get('content')}
+    new_list = []
+    for cid in target:
+        if cid in existing:
+            new_list.append(existing[cid])          # keep this remote's own layout
+        else:
+            item = _names_item_defaults()
+            item['content'] = cid
+            item['message_lines'] = ['{name}', '', '', '']   # sensible starting layout
+            new_list.append(item)
+
+    if [it.get('content') for it in new_list] != [it.get('content') for it in lst]:
+        config['names_content_list'] = new_list
+        if int(config.get('names_content_rr_index', -1) or -1) >= len(new_list):
+            config['names_content_rr_index'] = -1
+        save_config()
+        logging.info(f"🔁 Remote: synced Name content list from master ({len(new_list)} item(s) "
+                     f"present locally)")
+        return True
+    return False
+
+
+def remote_content_sync():
+    """Remote daemon: keep the Name-content dropdown mirrored from the master (~every 15s)."""
+    while True:
+        try:
+            if is_remote():
+                sync_names_content_from_master()
+        except Exception as e:
+            logging.debug(f"remote_content_sync: {e}")
+        time.sleep(15)
 
 
 def push_state_to_remotes(payload):
@@ -4371,10 +4418,7 @@ def index():
                         </select>
                         <p class="help-text" id="role_default_hint" style="margin-top:4px;">{% if not config.get('plugin_role') %}Defaulting to <strong>{{ effective_role }}</strong> because this FPP is in <strong>{{ fpp_mode_default_reason }}</strong> mode. Change it above if needed.{% endif %}</p>
                         <div id="master_discovery_box">
-                            <label class="toggle-switch" style="margin-top:10px;"><input type="checkbox" id="auto_discover_remotes" {{ 'checked' if config.get('auto_discover_remotes', True) else '' }} onchange="saveConfig()"><span class="toggle-slider"></span></label>
-                            <label class="checkbox-label">Auto-discover remotes via FPP MultiSync</label>
-                            <label style="margin-top:8px;">Manual remote IPs <span class="help-text" style="font-weight:normal;">(optional, one per line — used in addition to auto-discovery)</span></label>
-                            <textarea id="remote_targets" rows="2" placeholder="192.168.1.50">{{ remote_targets_text }}</textarea>
+                            <p class="help-text" style="margin-top:8px;">🔎 Remotes are found automatically over FPP MultiSync — just set each other FPP instance to <strong>Remote</strong> mode. Nothing to enter here.</p>
                         </div>
                         <div id="remote_mode_note" style="display:none; background:#e3f2fd; border:1px solid #90caf9; color:#0d47a1; border-radius:5px; padding:8px 12px; margin-top:10px; font-size:13px;">
                             ℹ️ <strong>Remote mode:</strong> texts, replies, and per-phone limits are configured on the <strong>Master</strong> — they're ignored here. This instance only displays the names the Master pushes, using <em>this projector's</em> own overlay model, fonts, and content. Make sure the same sequences/images exist on this Pi (use <strong>Config → Export/Import</strong>); if a pushed sequence is missing, this instance simply keeps showing its current content.
@@ -4433,7 +4477,7 @@ def index():
                         </div>
                         <div id="fpp_content_inputs">
                             <div style="display:flex; gap:20px; flex-wrap:wrap; align-items:flex-start;">
-                              <div style="flex:1; min-width:280px;">
+                              <div style="flex:1; min-width:280px;" id="waiting_config_col">
                             <label>Default "Waiting" Content: <span style="color:#f44336;font-size:12px;">* required</span> <span class="help-text" style="font-weight:normal;margin-left:6px;">📺 Loops while waiting for texts. Add 2+ to rotate between them (each sequence plays full length.)</span></label>
                             <!-- Hidden legacy single-value select: kept in sync with the first
                                  list item. Drives the canvas preview background + the
@@ -4456,9 +4500,12 @@ def index():
                               </div>
                               <div style="flex:1; min-width:280px;">
                             <label>Name Display Content: <span class="help-text" style="font-weight:normal;margin-left:6px;">🎬 Background(s) shown when a name appears. Add one or more — each gets its own text layout on the Display tab.</span></label>
+                            <div id="names_content_remote_note" style="display:none; background:#e3f2fd; border:1px solid #90caf9; color:#0d47a1; border-radius:5px; padding:8px 12px; margin-bottom:6px; font-size:13px;">
+                                ℹ️ This list is <strong>synced from the Master</strong> (only content that also exists on this Pi appears). Pick a content below to set <em>this</em> projector's text layout for it on the Display tab — your overlay model, sizing, and positioning are independent of the Master.
+                            </div>
                             <div id="names_content_list_box" style="border:1px solid #ddd; border-radius:5px; padding:10px; background:#fff;">
                                 <div id="names_content_items"></div>
-                                <button type="button" onclick="openManageContentModal()" style="margin-top:8px; font-size:13px; padding:6px 14px; cursor:pointer; background:#1976d2; color:#fff; border:none; border-radius:4px;">🗂️ Add / Arrange Content</button>
+                                <button type="button" id="btn_manage_names" onclick="openManageContentModal()" style="margin-top:8px; font-size:13px; padding:6px 14px; cursor:pointer; background:#1976d2; color:#fff; border:none; border-radius:4px;">🗂️ Add / Arrange Content</button>
                                 <div id="names_mode_row" style="display:none; margin-top:12px; padding-top:10px; border-top:1px solid #eee;">
                                     <span style="font-size:13px; color:#555; margin-right:10px;">When a name arrives, pick:</span>
                                     <label style="margin-right:14px; cursor:pointer; color:#333; font-size:13px;"><input type="radio" name="names_mode" value="roundrobin" onchange="onNamesModeChange('roundrobin')" style="width:auto;margin:0 5px 0 0;vertical-align:middle;">Round Robin</label>
@@ -4820,6 +4867,14 @@ def index():
                     showIf('message_source_section', !remote);
                     showIf('master_discovery_box', !remote);
                     showIf('filters_section', !remote);
+                    // Waiting content + the Names add/arrange are master-driven; the remote's
+                    // Names list is synced from the master. Keep the Overlay Model selector
+                    // (this projector's own model) and per-content layout editing.
+                    showIf('waiting_config_col', !remote);
+                    showIf('btn_manage_names', !remote);
+                    showIf('names_mode_row', !remote);
+                    showIf('names_content_remote_note', remote);
+                    showIf('btn_sync_pos_master', remote);   // remote-only: copy master's layout
                     showIf('tabbtn-sms', !remote);
                     showIf('tabbtn-testing', !remote);
                     showIf('btn_view_queue', !remote);
@@ -4848,23 +4903,10 @@ def index():
                     if (typeof saveConfig === 'function') saveConfig();
                 }
                 window.onRoleChange = onRoleChange;
-                // Apply role visibility on load WITHOUT saving (don't stamp a default on first paint).
+                // Apply role visibility on first paint (reconcileRole() below keeps it live).
                 (function(){
                     var sel = document.getElementById('plugin_role');
                     applyRoleVisibility(sel && sel.value === 'remote');
-                    // Reconcile with the LIVE role in case the FPP-mode watcher changed it after
-                    // this page was rendered (so a remote box shows the remote view without a
-                    // manual reload). Does not autosave.
-                    try {
-                        fetch('/api/plugin_role').then(function(r){return r.json();}).then(function(d){
-                            if (d && d.role && sel && sel.value !== d.role) {
-                                sel.value = d.role;
-                                applyRoleVisibility(d.role === 'remote');
-                                var hint = document.getElementById('role_default_hint');
-                                if (hint) hint.style.display = 'none';
-                            }
-                        }).catch(function(){});
-                    } catch(e) {}
                 })();
                 updateFormatRules();
                 checkFiltersState();
@@ -5352,7 +5394,9 @@ def index():
                             <canvas id="matrix_canvas" style="width:100%; display:block; background:#000; border:2px solid #555; border-radius:4px; cursor:default;"></canvas>
                             <div style="display:flex; gap:8px; margin-top:6px; align-items:center;">
                                 <button type="button" onclick="resetAllLines()" style="background:#555; padding:6px 12px; font-size:12px;">Reset All to Center</button>
+                                <button type="button" id="btn_sync_pos_master" onclick="syncPositionFromMaster(this)" style="display:none; background:#1976d2; color:#fff; padding:6px 12px; font-size:12px;" title="Copy the Master's text layout for this content, scaled to this projector's model">🔗 Sync Position to Master</button>
                                 <span id="pos_display" style="font-size:12px; color:#888;"></span>
+                                <span id="sync_pos_status" style="font-size:12px; color:#888;"></span>
                             </div>
 
                             <div style="margin-top:10px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
@@ -6932,6 +6976,52 @@ def index():
                 window.collectEditorLayout=collectEditorLayout;
                 window.applyLayoutToEditor=applyLayoutToEditor;
 
+                // Remote only: copy the Master's text layout for the selected content, scaling
+                // the box positions/sizes from the Master's overlay model to THIS projector's
+                // model so it lands in the same relative spot. Auto-centered boxes (x/y = -1)
+                // stay auto, so they adapt regardless of model size.
+                function syncPositionFromMaster(btn) {
+                    var lst = window._namesContentList || [];
+                    var idx = window._namesSelectedIndex;
+                    var content = (lst[idx] && lst[idx].content) || '';
+                    var status = document.getElementById('sync_pos_status');
+                    if (!content) { if(status){status.style.color='#f44336'; status.textContent='Pick a content first.';} return; }
+                    if (btn) btn.disabled = true;
+                    if (status){ status.style.color='#888'; status.textContent='Fetching from master…'; }
+                    fetch('/api/plugin/master-layout?content=' + encodeURIComponent(content))
+                      .then(function(r){ return r.json(); })
+                      .then(function(d){
+                        if (!d || !d.found) {
+                            if(status){ status.style.color='#f44336'; status.textContent = (d && d.error) ? d.error : 'Master has no layout for this content.'; }
+                            return;
+                        }
+                        var L = d.layout || {};
+                        var rw = parseInt(document.getElementById('overlay_model_width').value)||0;
+                        var rh = parseInt(document.getElementById('overlay_model_height').value)||0;
+                        var sx = (d.model_w>0 && rw>0) ? (rw/d.model_w) : 1;
+                        var sy = (d.model_h>0 && rh>0) ? (rh/d.model_h) : 1;
+                        var boxes = (L.line_boxes||[]).map(function(b){
+                            b = b || {x:-1,y:-1,w:300,h:60};
+                            return { x: (b.x<0?b.x:Math.round(b.x*sx)),
+                                     y: (b.y<0?b.y:Math.round(b.y*sy)),
+                                     w: Math.max(1, Math.round((b.w||300)*sx)),
+                                     h: Math.max(1, Math.round((b.h||60)*sy)) };
+                        });
+                        applyLayoutToEditor({
+                            message_lines: L.message_lines, line_boxes: boxes, line_colors: L.line_colors,
+                            line_movements: L.line_movements, line_speeds: L.line_speeds,
+                            line_fonts: L.line_fonts, line_orientations: L.line_orientations,
+                            display_duration: L.display_duration
+                        });
+                        flushEditorToSelected();
+                        if (typeof saveConfig==='function') saveConfig();
+                        if(status){ status.style.color='#4CAF50'; status.textContent = (sx===1&&sy===1) ? '✓ Synced from master' : '✓ Synced + scaled to this model'; }
+                      })
+                      .catch(function(){ if(status){ status.style.color='#f44336'; status.textContent='Could not reach master.'; } })
+                      .finally(function(){ if (btn) btn.disabled = false; });
+                }
+                window.syncPositionFromMaster = syncPositionFromMaster;
+
                 // ===================== Waiting Content Rotation List =====================
                 window._waitingContentList = Array.isArray(window._waitingContentListInit) ? window._waitingContentListInit : [];
                 window._waitingMode = window._waitingContentModeInit || 'roundrobin';
@@ -7340,6 +7430,21 @@ def index():
             _init('duplicateResp', checkDuplicateState);
             _init('wordsPreview', updateWordsPreview);
             _init('autoSave', setupAutoSave);
+            // Keep the role toggle + remote view in sync with the LIVE role while the page is
+            // open, so switching FPP player↔remote flips the UI without a manual refresh.
+            function reconcileRole() {
+                fetch('/api/plugin_role').then(function(r){return r.json();}).then(function(d){
+                    if (!d || !d.role) return;
+                    var sel = document.getElementById('plugin_role');
+                    if (sel && sel.value !== d.role) {
+                        sel.value = d.role;
+                        if (typeof window.applyRoleVisibility === 'function') window.applyRoleVisibility(d.role === 'remote');
+                        var hint = document.getElementById('role_default_hint'); if (hint) hint.style.display = 'none';
+                    }
+                }).catch(function(){});
+            }
+            reconcileRole();
+            setInterval(reconcileRole, 5000);
             _init('liveStatus', updateLiveStatus);
             setInterval(updateLiveStatus, 5000);
             for (var _li = 0; _li < 4; _li++) { updateLineSpeedRowVisibility(_li); updateLineOrientationRowVisibility(_li); }
@@ -7543,8 +7648,6 @@ var _saveTimer = null;
 
                 const data = {
                     plugin_role: (document.getElementById('plugin_role')||{}).value || 'master',
-                    auto_discover_remotes: (document.getElementById('auto_discover_remotes')||{}).checked ?? true,
-                    remote_targets: ((document.getElementById('remote_targets')||{}).value || '').split('\\n').map(function(s){return s.trim();}).filter(Boolean),
                     message_source: document.getElementById('message_source').value,
                     twilio_account_sid: document.getElementById('account_sid').value,
                     twilio_auth_token: document.getElementById('auth_token').value,
@@ -7956,11 +8059,9 @@ var _saveTimer = null;
     """
 
     _eff_role = get_plugin_role()
-    _remote_targets_text = "\n".join(config.get('remote_targets') or [])
     return render_template_string(html, config=config, secret_sentinel=SECRET_SENTINEL,
                                   effective_role=_eff_role,
-                                  fpp_mode_default_reason=('remote' if _eff_role == 'remote' else 'player'),
-                                  remote_targets_text=_remote_targets_text)
+                                  fpp_mode_default_reason=('remote' if _eff_role == 'remote' else 'player'))
 
 @app.route('/api/config', methods=['POST'])
 def update_config():
@@ -8013,19 +8114,10 @@ def update_config():
         if 'plugin_role' in new_config:
             _r = str(new_config.get('plugin_role') or '').strip().lower()
             config['plugin_role'] = _r if _r in ('master', 'remote') else ''
-            global _resolved_role
+            global _resolved_role, _remotes_cache_time, _tml_peer_cache_time
             _resolved_role = None   # re-resolve the FPP-mode default next time if unset
-        if 'auto_discover_remotes' in new_config:
-            config['auto_discover_remotes'] = bool(new_config.get('auto_discover_remotes'))
-        if 'remote_targets' in new_config:
-            raw_rt = new_config.get('remote_targets')
-            if not isinstance(raw_rt, list):
-                raw_rt = []
-            config['remote_targets'] = [str(t).strip() for t in raw_rt if str(t).strip()][:32]
-        # A role/discovery change invalidates the cached remote list + trusted-peer set.
-        global _remotes_cache_time, _tml_peer_cache_time
-        _remotes_cache_time = 0
-        _tml_peer_cache_time = 0
+            _remotes_cache_time = 0
+            _tml_peer_cache_time = 0
 
         # Normalize phone number to E.164 (strip spaces, dashes, parens — keep + and digits)
         if config.get('twilio_phone_number'):
@@ -8974,6 +9066,23 @@ def api_plugin_role():
     """Current effective role (master/remote), so the config page can reflect the live value
     even if the FPP-mode watcher updated it after the page was rendered."""
     return jsonify({"role": get_plugin_role()})
+
+
+@app.route('/api/plugin/master-layout')
+def api_master_layout():
+    """Remote (browser-facing): fetch the master's text layout for a content id so the Display
+    tab's 'Sync Position to Master' can copy it. Normal token auth; proxies to the master."""
+    if not is_remote():
+        return jsonify({"found": False, "error": "This instance is not a remote."}), 409
+    content = request.args.get('content', '')
+    master = _find_master_base()
+    if not master:
+        return jsonify({"found": False, "error": "Master not found on the network."}), 404
+    try:
+        r = requests.get(f"{master}/api/tml/layout", params={"content": content}, timeout=3)
+        return jsonify(r.json())
+    except Exception as e:
+        return jsonify({"found": False, "error": f"Could not reach master: {e}"}), 502
 
 
 @app.route('/api/queue/status')
@@ -10165,6 +10274,31 @@ def api_tml_ping():
     return jsonify({"plugin": "textmylights", "role": get_plugin_role()})
 
 
+@app.route('/api/tml/content-list', methods=['GET'])
+def api_tml_content_list():
+    """Master: the content ids in its Name Display list, so a remote can mirror them into its
+    own Display-tab dropdown (and give each its own overlay layout). Content ids only — no
+    layouts, no sequence data."""
+    names = [it.get('content', '') for it in (config.get('names_content_list', []) or []) if it.get('content')]
+    return jsonify({"names": names})
+
+
+@app.route('/api/tml/layout', methods=['GET'])
+def api_tml_layout():
+    """Master: the saved text layout for a content id + this master's overlay model size, so a
+    remote can copy the positioning ('Sync Position to Master'), scaled to its own model."""
+    content = request.args.get('content', '')
+    item = next((it for it in (config.get('names_content_list', []) or [])
+                 if it.get('content') == content), None)
+    mw, mh = _overlay_model_dims()
+    if not item:
+        return jsonify({"found": False, "model_w": mw, "model_h": mh})
+    return jsonify({"found": True, "model_w": mw, "model_h": mh, "layout": {
+        k: item.get(k) for k in ('message_lines', 'line_boxes', 'line_colors', 'line_movements',
+                                 'line_speeds', 'line_fonts', 'line_orientations', 'display_duration')
+    }})
+
+
 def _apply_remote_waiting(content):
     """Remote: switch the base waiting/background layer to the master-pushed content — unless
     it's already showing that content (no-op, so the master's heartbeat re-push doesn't cause
@@ -10319,6 +10453,10 @@ if __name__ == '__main__':
 
     # Follow FPP's own mode: switch the plugin role to match when FPP changes player↔remote.
     threading.Thread(target=fpp_mode_watcher, daemon=True).start()
+
+    # Remote: mirror the master's Name-content list into this box's Display dropdown so each
+    # content can be given this remote's own overlay layout.
+    threading.Thread(target=remote_content_sync, daemon=True).start()
 
     # Polling thread starts if the selected source is configured — runs in
     # standby (show_not_live replies) when disabled, and processes names normally

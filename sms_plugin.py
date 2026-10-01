@@ -486,12 +486,13 @@ def fpp_mode_watcher():
     while True:
         try:
             role = _fpp_mode_role()   # None while FPP is unreachable → leave role as-is
-            if role is not None:
-                if role != _last_fpp_mode:
-                    logging.info(f"🔀 FPP mode detected: '{role}'")
-                    _last_fpp_mode = role
-                # Authoritative: the plugin role ALWAYS matches FPP's mode — correct any drift
-                # (stale config, a stray save) each pass, not only on a transition.
+            # Adopt FPP's mode on the first successful read (startup) and whenever FPP CHANGES
+            # mode. Between changes a manual override from the toggle persists — we don't fight
+            # it every pass — so the user is never stuck if detection is wrong.
+            if role is not None and role != _last_fpp_mode:
+                first = _last_fpp_mode is None
+                _last_fpp_mode = role
+                logging.info(f"🔀 FPP mode {'at startup' if first else 'changed to'}: '{role}'")
                 if (config.get('plugin_role') or '') != role:
                     logging.info(f"🔀 Setting plugin role → '{role}' to match FPP")
                     config['plugin_role'] = role
@@ -4423,12 +4424,12 @@ def index():
                     <div class="section">
                         <h2>🖥️ Projector Role (Master / Remote)</h2>
                         <p class="help-text">Running the plugin on more than one FPP? The <strong>Master</strong> receives the texts, sends replies, and counts limits; each <strong>Remote</strong> only displays the names the Master pushes to it. One text = one name — no duplicate replies, no double counting.</p>
-                        <label>This instance is: <span class="help-text" style="font-weight:normal;">— set automatically from this FPP's mode (Player → Master, Remote → Remote). Change the FPP mode in the top-right FPP menu.</span></label>
-                        <select id="plugin_role" disabled style="opacity:0.85; cursor:not-allowed;">
+                        <label>This instance is: <span class="help-text" style="font-weight:normal;">— defaults to this FPP's mode (Player → Master, Remote → Remote), but you can override it here.</span></label>
+                        <select id="plugin_role" onchange="onRoleChange()">
                             <option value="master" {{ 'selected' if effective_role != 'remote' else '' }}>Master — handles texts &amp; pushes names</option>
                             <option value="remote" {{ 'selected' if effective_role == 'remote' else '' }}>Remote — only displays pushed names</option>
                         </select>
-                        <p class="help-text" id="role_default_hint" style="margin-top:4px;">Following this FPP's mode (<strong>{{ fpp_mode_default_reason }}</strong>).</p>
+                        <p class="help-text" id="role_default_hint" style="margin-top:4px;">This FPP is in <strong>{{ fpp_mode_default_reason }}</strong> mode.</p>
                         <div id="master_discovery_box">
                             <p class="help-text" style="margin-top:8px;">🔎 Remotes are found automatically over FPP MultiSync — just set each other FPP instance to <strong>Remote</strong> mode. Nothing to enter here.</p>
                         </div>
@@ -4909,9 +4910,8 @@ def index():
                 function onRoleChange() {
                     var sel = document.getElementById('plugin_role');
                     var remote = sel && sel.value === 'remote';
+                    window._roleManualUntil = Date.now() + 4000;  // let the save land before reconcileRole re-reads
                     applyRoleVisibility(remote);
-                    var hint = document.getElementById('role_default_hint');
-                    if (hint) hint.style.display = 'none';  // user made an explicit choice
                     if (typeof saveConfig === 'function') saveConfig();
                 }
                 window.onRoleChange = onRoleChange;
@@ -7445,13 +7445,15 @@ def index():
             // Keep the role toggle + remote view in sync with the LIVE role while the page is
             // open, so switching FPP player↔remote flips the UI without a manual refresh.
             function reconcileRole() {
+                // Don't stomp a just-made manual selection while its save is in flight.
+                if (window._roleManualUntil && Date.now() < window._roleManualUntil) return;
                 fetch('/api/plugin_role').then(function(r){return r.json();}).then(function(d){
                     if (!d || !d.role) return;
+                    if (window._roleManualUntil && Date.now() < window._roleManualUntil) return;
                     var sel = document.getElementById('plugin_role');
                     if (sel && sel.value !== d.role) {
                         sel.value = d.role;
                         if (typeof window.applyRoleVisibility === 'function') window.applyRoleVisibility(d.role === 'remote');
-                        var hint = document.getElementById('role_default_hint'); if (hint) hint.style.display = 'none';
                     }
                 }).catch(function(){});
             }
@@ -7659,6 +7661,7 @@ var _saveTimer = null;
                 if (typeof window.flushEditorToSelected === 'function') window.flushEditorToSelected();
 
                 const data = {
+                    plugin_role: (document.getElementById('plugin_role')||{}).value || '',
                     message_source: document.getElementById('message_source').value,
                     twilio_account_sid: document.getElementById('account_sid').value,
                     twilio_auth_token: document.getElementById('auth_token').value,
@@ -8125,10 +8128,14 @@ def update_config():
         if 'plugin_role' in new_config:
             _r = str(new_config.get('plugin_role') or '').strip().lower()
             config['plugin_role'] = _r if _r in ('master', 'remote') else ''
-            global _resolved_role, _remotes_cache_time, _tml_peer_cache_time
+            global _resolved_role, _remotes_cache_time, _tml_peer_cache_time, polling_generation
             _resolved_role = None   # re-resolve the FPP-mode default next time if unset
             _remotes_cache_time = 0
             _tml_peer_cache_time = 0
+            # Switched to remote: retire any running poller (a remote never polls/responds).
+            # Switched to master: a poller will be (re)started by start_polling_if_needed below.
+            if is_remote():
+                polling_generation += 1
 
         # Normalize phone number to E.164 (strip spaces, dashes, parens — keep + and digits)
         if config.get('twilio_phone_number'):

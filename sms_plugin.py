@@ -73,6 +73,9 @@ CONFIG_FILE     = os.path.join(PLUGIN_DATA_DIR, "plugin.json")
 SECRETS_DIR     = os.path.join(PLUGIN_DATA_DIR, "secrets")
 SECRETS_FILE    = os.path.join(SECRETS_DIR, "credentials.json")
 SECRET_KEYS     = ("twilio_auth_token", "gv_app_password")
+# Box-specific Master/Remote identity — kept on THIS Pi across a config import unless the
+# user ticks "import mode" (so restoring settings never silently flips a master to a remote).
+MODE_KEYS       = ("plugin_role", "selected_master", "instance_name")
 # Placeholder shown in a saved secret field. Submitting it unchanged means
 # "keep the stored secret"; clearing the field to empty means "remove it";
 # any other value updates it. Must be something a real secret never equals.
@@ -5144,6 +5147,11 @@ def index():
                     <button type="button" class="test-btn" onclick="document.getElementById('import_file').click()">⬆️ Import Config</button>
                     <span id="import_status" style="font-size:13px;"></span>
                 </div>
+                <label style="display:flex; align-items:center; gap:8px; margin-top:10px; font-size:13px;">
+                    <input type="checkbox" id="import_mode_cb">
+                    Also import the <strong>Master/Remote mode</strong> from the bundle
+                    <span class="help-text" style="font-weight:normal;">— off by default, so importing keeps THIS Pi's role (and which master a remote follows). Tick only if you want the bundle's role to replace it.</span>
+                </label>
             </div>
 
             <!-- Local export modal — only used when the page is opened directly
@@ -5274,6 +5282,8 @@ def index():
                 function _tmlDoImport(file) {
                     var fd = new FormData();
                     fd.append('file', file);
+                    var modeCb = document.getElementById('import_mode_cb');
+                    fd.append('import_mode', (modeCb && modeCb.checked) ? '1' : '0');
                     return fetch('/api/config/import', { method: 'POST', body: fd })
                         .then(function(r) { return r.json(); });
                 }
@@ -8705,6 +8715,10 @@ def import_config():
         if upload is None:
             return jsonify({"success": False, "error": "No file uploaded"}), 400
 
+        # Whether to also adopt the bundle's Master/Remote mode. Default OFF: an import keeps
+        # THIS Pi's role so restoring settings never silently flips a master into a remote.
+        import_mode = str(request.form.get('import_mode', '')).strip().lower() in ('1', 'true', 'yes', 'on')
+
         data = upload.read()
         try:
             zf = zipfile.ZipFile(io.BytesIO(data))
@@ -8788,6 +8802,13 @@ def import_config():
                         continue
                     for sk in SECRET_KEYS:
                         imported.pop(sk, None)
+                    # Mode/identity keys (this box's Master/Remote role, which master a remote
+                    # follows, its advertised name) are box-specific. Keep THIS Pi's values
+                    # unless the user explicitly opted to import them (import_mode checkbox).
+                    if not import_mode:
+                        for mk in MODE_KEYS:
+                            imported.pop(mk, None)
+                        logging.info("Import: kept this Pi's Master/Remote mode (import_mode off)")
                     config.update(imported)
                     save_config()
                     summary["settings"] = True

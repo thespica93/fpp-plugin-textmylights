@@ -4581,15 +4581,13 @@ def index():
                     <div class="section">
                         <h2>🖥️ Projector Role (Master / Remote)</h2>
                         <p class="help-text">The <strong>Master</strong> is where the configuration lives and text messages are received. Each <strong>Remote</strong> only displays the names the Master pushes to it.</p>
-                        <p class="help-text" style="margin-top:4px;"><em>"Master"/"Remote" here is this <strong>plugin's</strong> role - separate from FPP's own Player/Remote (MultiSync) mode. The plugin master need not be the FPP MultiSync master.</em></p>
+                        <p class="help-text" style="margin-top:4px;"><em>Master/Remote here is this <strong>plugin's</strong> role - separate from FPP's own Player/Remote mode. The plugin master does not need to be the FPP master.</em></p>
                         <label>This instance is:</label>
                         <select id="plugin_role" onchange="onRoleChange()">
                             <option value="master" {{ 'selected' if effective_role != 'remote' else '' }}>Master - handles texts &amp; pushes names</option>
                             <option value="remote" {{ 'selected' if effective_role == 'remote' else '' }}>Remote - only displays pushed names</option>
                         </select>
-                        <div id="master_discovery_box">
-                            <p class="help-text" style="margin-top:8px;">🔎 Remotes are found automatically over FPP MultiSync - just set each other FPP instance to <strong>Remote</strong> mode. Nothing to enter here.</p>
-                        </div>
+
                         <div id="remote_mode_note" style="display:none; background:#e3f2fd; border:1px solid #90caf9; color:#0d47a1; border-radius:5px; padding:8px 12px; margin-top:10px; font-size:13px;">
                             ℹ️ <strong>Remote mode:</strong> the Master's content must also exist on this remote - recommend using <strong>Config → Export/Import</strong>.
                         </div>
@@ -5163,7 +5161,7 @@ def index():
             <!-- Backup & Restore -->
             <div class="section">
                 <h2>💾 Backup &amp; Restore</h2>
-                <p class="help-text" style="margin-bottom:12px;">Export all plugin settings, the content it uses (playlists, sequences, images), and the overlay model into one file - then import it on another Pi to reproduce this setup exactly. <strong>Credentials are not included</strong> (Twilio auth token / Google Voice app password); re-enter them after importing. <a id="backup_help_link" href="#" target="_top">Learn more</a></p>
+                <p class="help-text" style="margin-bottom:12px;">Export all plugin settings, the content it uses (playlists, sequences, images), and the overlay model into one file - then import it on another Pi to reproduce this setup exactly. <strong>Credentials are not included</strong>; re-enter them after importing. <a id="backup_help_link" href="#" target="_top">Learn more</a></p>
                 <div id="backup_actions" style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
                     <button type="button" class="test-btn" onclick="openExportModal()"
                        style="background:#4CAF50;">⬇️ Export Config</button>

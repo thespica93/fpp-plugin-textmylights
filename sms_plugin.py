@@ -4639,7 +4639,7 @@ def index():
                                 ⚠️ No Waiting content selected - required before you can Start the show.
                             </div>
                               </div>
-                              <div style="flex:1; min-width:280px;">
+                              <div style="flex:1; min-width:280px;" id="names_config_col">
                             <label>Name Display Content: <span class="help-text" style="font-weight:normal;margin-left:6px;">🎬 Background(s) shown when a name appears. Add one or more - each gets its own text layout on the Display tab.</span></label>
                             <div id="names_content_remote_note" style="display:none; background:#e3f2fd; border:1px solid #90caf9; color:#0d47a1; border-radius:5px; padding:8px 12px; margin-bottom:6px; font-size:13px;">
                                 ℹ️ This list is <strong>synced from the Master</strong> (only content that also exists on this Pi appears). Pick a content below to set <em>this</em> projector's text layout for it on the Display tab - your overlay model, sizing, and positioning are independent of the Master.
@@ -5010,13 +5010,11 @@ def index():
                     showIf('message_settings_section', !remote);
                     showIf('master_discovery_box', !remote);
                     showIf('filters_section', !remote);
-                    // Waiting content + the Names add/arrange are master-driven; the remote's
-                    // Names list is synced from the master. Keep the Overlay Model selector
-                    // (this projector's own model) and per-content layout editing.
+                    // Waiting + Name Display content are master-driven (the remote's names
+                    // list syncs from the master), so hide BOTH content columns on a remote.
+                    // Only the Overlay Model selector stays - it is this projector's own model.
                     showIf('waiting_config_col', !remote);
-                    showIf('btn_manage_names', !remote);
-                    showIf('names_mode_row', !remote);
-                    showIf('names_content_remote_note', remote);
+                    showIf('names_config_col', !remote);
                     showIf('btn_sync_pos_master', remote);   // remote-only: copy master's layout
                     showIf('tabbtn-sms', !remote);
                     showIf('tabbtn-testing', !remote);

@@ -4611,7 +4611,7 @@ def index():
                         <h2 style="margin-top: 0;">FPP Display Settings</h2>
 
                         <div id="fpp_content_live_warning" style="display:none; background:#b71c1c; color:#fff; border-radius:5px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
-                            🔴 <strong>Plugin is Live</strong> - run Text My Lights Stop to edit
+                            🔴 <strong>Plugin is Live</strong>; run Text My Lights Stop or press Stop to edit
                         </div>
                         <div id="fpp_content_inputs">
                             <div style="display:flex; gap:20px; flex-wrap:wrap; align-items:flex-start;">
@@ -4718,7 +4718,7 @@ def index():
                                 </div>
                             </div>
 
-                            <label>Overlay Model Name: <button type="button" onclick="refreshFPPLists(this)" style="font-size:11px;padding:2px 7px;margin-left:8px;cursor:pointer;">↻ Refresh Lists</button> <span class="help-text" style="font-weight:normal;margin-left:6px;">📝 The pixel overlay model for text (e.g., "Texting Matrix")</span></label>
+                            <label>Overlay Model Name: <button type="button" onclick="refreshFPPLists(this)" style="font-size:11px;padding:2px 7px;margin-left:8px;cursor:pointer;">↻ Refresh Lists</button> <span class="help-text" style="font-weight:normal;margin-left:6px;">📝 The pixel overlay model for text (e.g., "Texting Matrix"). On a remote this is local to this projector.</span></label>
                             <select id="overlay_model_name">
                                 <option value="">-- None --</option>
                             </select>

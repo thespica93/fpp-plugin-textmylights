@@ -445,20 +445,29 @@ _remote_stop_requested = False   # remote side: True once the master broadcasts 
                                  # keeps returning to its waiting content between names and
                                  # only tears the show down when the master says to.
 _last_fpp_mode = None            # last-seen FPP mode role, for the auto-follow watcher
+_fpp_mode_detail = ''            # raw values _fpp_mode_role() last read, for on-device diagnosis
 
 
 def _fpp_mode_role():
-    """The plugin role implied by FPP's CURRENT mode — 'remote' when FPP is in remote mode,
-    else 'master' — or None when FPP can't be reached (so callers don't act on a transient
-    failure). Primary source is the fppMode setting (string 'remote'/'player'); falls back to
-    /api/fppd/status (mode_name / mode==8=REMOTE_MODE)."""
+    """The plugin role implied by FPP's CURRENT mode — 'remote' ONLY when FPP is unambiguously
+    in remote mode, else 'master' — or None when FPP can't be reached (so callers don't act on a
+    transient failure). Primary source is the fppMode setting (string 'remote'/'player'/'master'
+    or legacy int); falls back to /api/fppd/status (mode==8=REMOTE / mode_name). Records what it
+    read in _fpp_mode_detail for on-device diagnosis. 'master' is the safe/full-function default
+    for anything that is NOT clearly remote."""
+    global _fpp_mode_detail
     # Primary: the fppMode setting value itself (most direct).
     try:
         r = requests.get(f"{FPP_HOST}/api/settings/fppMode", timeout=3)
         if r.status_code == 200:
-            txt = (r.text or '').strip().strip('"').lower()   # may be "remote" or remote
+            txt = (r.text or '').strip().strip('"').lower()   # "remote" / "player" / "master" / legacy int
             if txt:
-                return 'remote' if 'remote' in txt else 'master'
+                # Remote ONLY when it's exactly 'remote' or the legacy remote int (8) — never a
+                # loose substring match (which could trip on unexpected payloads). Everything
+                # else (player, master, bridge, numbers) is treated as master.
+                role = 'remote' if (txt == 'remote' or txt == '8') else 'master'
+                _fpp_mode_detail = f"settings/fppMode={txt!r} → {role}"
+                return role
     except Exception as e:
         logging.debug(f"_fpp_mode_role: settings/fppMode unavailable ({e})")
     # Fallback: fppd status.
@@ -466,13 +475,17 @@ def _fpp_mode_role():
         r = requests.get(f"{FPP_HOST}/api/fppd/status", timeout=3)
         if r.status_code == 200:
             data = r.json()
-            mode_name = str(data.get('mode_name', '')).lower()
-            if 'remote' in mode_name or data.get('mode') == 8:
+            mode_name = str(data.get('mode_name', '')).strip().lower()
+            mode_int = data.get('mode')
+            if mode_name == 'remote' or mode_int == 8:
+                _fpp_mode_detail = f"fppd/status mode_name={mode_name!r} mode={mode_int} → remote"
                 return 'remote'
-            if mode_name or data.get('mode') is not None:
+            if mode_name or mode_int is not None:
+                _fpp_mode_detail = f"fppd/status mode_name={mode_name!r} mode={mode_int} → master"
                 return 'master'
     except Exception as e:
         logging.debug(f"_fpp_mode_role: fppd status unavailable ({e})")
+    _fpp_mode_detail = 'FPP unreachable'
     return None
 
 
@@ -483,29 +496,29 @@ def _default_plugin_role():
 
 
 def fpp_mode_watcher():
-    """Keep the plugin role in lockstep with the FPP instance's own mode: when FPP switches to
-    remote the plugin becomes a remote; when FPP switches to player the plugin becomes master.
-    Acts only on an actual FPP mode CHANGE, so a manual toggle persists until FPP changes next."""
+    """Track the FPP instance's own player/remote mode for diagnostics and as the AUTO default.
+
+    IMPORTANT: this NEVER overwrites an explicit plugin_role. A manually chosen 'master'/'remote'
+    is authoritative and persists across restarts/updates. FPP mode only supplies the default
+    when plugin_role is unset (''): on an FPP mode change in that auto case we just invalidate
+    the cached resolution so get_plugin_role() re-reads FPP's mode. (Earlier this clobbered the
+    saved role on every startup — the first read looked like a 'change' — which flipped a manual
+    master back to remote on each plugin update.)"""
     global _last_fpp_mode, _resolved_role
-    logging.info("🔀 FPP mode watcher started (plugin role follows FPP player↔remote)")
+    logging.info("🔀 FPP mode watcher started (diagnostic + auto-default only; manual role wins)")
     while True:
         try:
-            role = _fpp_mode_role()   # None while FPP is unreachable → leave role as-is
-            # Adopt FPP's mode on the first successful read (startup) and whenever FPP CHANGES
-            # mode. Between changes a manual override from the toggle persists — we don't fight
-            # it every pass — so the user is never stuck if detection is wrong.
+            role = _fpp_mode_role()   # None while FPP is unreachable → leave _last_fpp_mode as-is
             if role is not None and role != _last_fpp_mode:
                 first = _last_fpp_mode is None
                 _last_fpp_mode = role
-                logging.info(f"🔀 FPP mode {'at startup' if first else 'changed to'}: '{role}'")
-                if (config.get('plugin_role') or '') != role:
-                    logging.info(f"🔀 Setting plugin role → '{role}' to match FPP")
-                    config['plugin_role'] = role
+                logging.info(f"🔀 FPP mode {'at startup' if first else 'changed to'}: '{role}' "
+                             f"[{_fpp_mode_detail}] | explicit plugin_role="
+                             f"{(config.get('plugin_role') or '')!r} (explicit always wins)")
+                # Only auto mode (no explicit choice) follows FPP; re-resolve lazily. An explicit
+                # plugin_role is left completely untouched.
+                if not (config.get('plugin_role') or '').strip():
                     _resolved_role = None
-                    try:
-                        save_config()
-                    except Exception:
-                        pass
         except Exception as e:
             logging.debug(f"fpp_mode_watcher: {e}")
         time.sleep(10)
@@ -7498,10 +7511,11 @@ def index():
                     if (!d || !d.role) return;
                     if (window._roleManualUntil && Date.now() < window._roleManualUntil) return;
                     var sel = document.getElementById('plugin_role');
-                    if (sel && sel.value !== d.role) {
-                        sel.value = d.role;
-                        if (typeof window.applyRoleVisibility === 'function') window.applyRoleVisibility(d.role === 'remote');
-                    }
+                    if (sel) sel.value = d.role;
+                    // Always enforce visibility to match the LIVE role — not only when the select
+                    // value changed — so the shown tabs can never drift out of sync with the role
+                    // (e.g. a remote that somehow still shows the SMS/Testing tabs).
+                    if (typeof window.applyRoleVisibility === 'function') window.applyRoleVisibility(d.role === 'remote');
                 }).catch(function(){});
             }
             reconcileRole();
@@ -9128,10 +9142,13 @@ def get_messages_by_date(date_str):
 
 @app.route('/api/plugin_role')
 def api_plugin_role():
-    """Current effective role (master/remote), so the config page can reflect the live value
-    even if the FPP-mode watcher updated it after the page was rendered. `fpp_mode` is the
-    last mode the watcher read from FPP (diagnostic)."""
-    return jsonify({"role": get_plugin_role(), "fpp_mode": _last_fpp_mode})
+    """Current effective role (master/remote), so the config page can reflect the live value.
+    `plugin_role` is the user's EXPLICIT choice ('' = auto, follow FPP mode); `fpp_mode` + detail
+    show what FPP reports (diagnostic — explicit choice always wins over it)."""
+    return jsonify({"role": get_plugin_role(),
+                    "plugin_role": (config.get('plugin_role') or ''),
+                    "fpp_mode": _last_fpp_mode,
+                    "fpp_mode_detail": _fpp_mode_detail})
 
 
 @app.route('/api/plugin/master-layout')

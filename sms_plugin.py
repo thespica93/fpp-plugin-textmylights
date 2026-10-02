@@ -149,17 +149,22 @@ try:
 except OSError:
     pass
 
-# Setup logging - ensure the log directory exists, then write to file + stderr
+# Setup logging - ensure the log directory exists, then write to file + stderr.
+# The file handler is size-bounded (rotating) so the log can never fill the SD card:
+# ~4 MB hard ceiling total (1 MB x 3 backups + the active file), oldest lines discarded.
+import logging.handlers
 _log_handlers = [logging.StreamHandler()]  # stderr always available via nohup
 try:
-    _log_handlers.append(logging.FileHandler(LOG_FILE))
+    _log_handlers.append(logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=1_000_000, backupCount=3))
 except Exception:
     pass  # directory may not exist on some FPP installs; stderr is the fallback
 logging.basicConfig(
-    level=logging.ERROR,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=_log_handlers
 )
+# Keep Flask/werkzeug at ERROR so its per-request access logging stays off (that WOULD be chatty).
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
 import flask.cli
@@ -2857,7 +2862,7 @@ def cleanup_old_logs():
                 file_date = datetime.strptime(date_str, "%Y-%m-%d").date()
                 if file_date < cutoff:
                     os.remove(os.path.join(MESSAGES_DIR, filename))
-                    logging.error(f"Deleted old log: {filename}")
+                    logging.info(f"Deleted old log: {filename}")
             except ValueError:
                 pass
     except Exception as e:
@@ -2883,7 +2888,7 @@ def load_queue_from_file():
                 message_queue.append(item)
                 restored += 1
         if restored:
-            logging.error(f"Queue restore: {restored} item(s) loaded from disk")
+            logging.info(f"Queue restore: {restored} item(s) loaded from disk")
         return restored
     except FileNotFoundError:
         return 0
@@ -2982,7 +2987,6 @@ def log_message(phone, message, name, status, counts=True):
         logs.append(entry)
         with open(log_path, 'w') as f:
             json.dump(logs, f, indent=2)
-        logging.info(f"✅ Message logged: {phone[-4:]} | {name} | {status}")
     except Exception as e:
         logging.error(f"Error logging message: {e}")
 
@@ -3005,7 +3009,6 @@ def update_message_status(phone, name, new_status):
             try:
                 with open(path, 'w') as f:
                     json.dump(logs, f, indent=2)
-                logging.info(f"Updated status: {phone[-4:]} | {name} | {new_status}")
             except Exception as e:
                 logging.error(f"Error writing status update: {e}")
         return found
@@ -3181,13 +3184,8 @@ def send_to_fpp(name, override=None):
         # FPP API fallback: join lines with newline
         display_message = '\n'.join(item[0] for item in rendered_lines) if rendered_lines else name
 
-        logging.info(f"🎄 ========== STARTING DISPLAY FOR: {name} ==========")
-        logging.info(f"📺 FPP Host: {fpp_host}")
-        logging.info(f"🎬 Name Display Playlist: {name_playlist}")
-        logging.info(f"📝 Overlay Model: {overlay_model}")
-        logging.info(f"📝 Message Lines: {message_lines}")
-        logging.info(f"📝 Display Message: {display_message}")
-        
+        logging.info(f"🎄 Displaying '{name}' (content={name_playlist or 'none'}, model={overlay_model or 'none'})")
+
         # Step 1: Start the name display playlist/sequence/video/image (background)
         if name_playlist:
             try:
@@ -3197,25 +3195,22 @@ def send_to_fpp(name, override=None):
                 # that plays ON TOP of it (overlay text renders above both). Nothing
                 # foreground is touched. return_to_default_playlist() later stops just
                 # the names effect, leaving the waiting effect running underneath.
-                logging.info(f"▶️  STEP 2: Starting name display content OVER waiting: {name_playlist}")
                 if name_playlist.startswith('seq:'):
                     # FSEQ Effect (loop=true, background=true): plays as background so
                     # overlay model renders on top with correct text colors.
                     seq_name = name_playlist[4:].removesuffix('.fseq')
                     effect_url = f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Start')}/{urllib.parse.quote(seq_name)}/true/true"
-                    start_response = requests.get(effect_url, timeout=3)
-                    logging.info(f"   FSEQ Effect Start (names): {start_response.status_code} - {start_response.text}")
+                    requests.get(effect_url, timeout=3)
 
                 elif name_playlist.startswith('img:'):
                     # Image background - will be composited with text in Step 2 below
-                    logging.info(f"   Image background: will render in overlay step")
+                    pass
 
                 else:
                     command = "Start Playlist"
                     encoded_playlist = urllib.parse.quote(name_playlist)
                     command_url = f"{fpp_host}/api/command/{urllib.parse.quote(command)}/{encoded_playlist}/true/false"
-                    start_response = requests.get(command_url, timeout=3)
-                    logging.info(f"   Start playlist response: {start_response.status_code}")
+                    requests.get(command_url, timeout=3)
 
                 time.sleep(0.3)
 
@@ -3229,8 +3224,6 @@ def send_to_fpp(name, override=None):
         # Step 2: Display text ON TOP of the sequence
         if overlay_model:
             try:
-                logging.info(f"📝 STEP 3: Displaying text on model: {overlay_model}")
-
                 text_position = config.get('text_position', 'Center')  # used only by the non-PIL fallback below
                 text_color = global_text_color
                 text_font = config.get('text_font', 'FreeSans')
@@ -3257,8 +3250,6 @@ def send_to_fpp(name, override=None):
                 text_url  = f"{fpp_host}/api/overlays/model/{encoded_model}/text"
 
                 mw, mh = _overlay_model_dims()
-                logging.info(f"📐 Overlay: model={overlay_model} overlay_size={mw}x{mh} "
-                             f"lines={len(all_items)} moving={any_moving} PIL={PIL_AVAILABLE}")
 
                 shm_rendered = False
                 scroll_started = False
@@ -3310,8 +3301,6 @@ def send_to_fpp(name, override=None):
                         bg_content = (name_playlist if (name_playlist and name_playlist.startswith('seq:'))
                                       else (_active_waiting_content or config.get('default_playlist', '')))
                         anim_fps = _fseq_fps_for_content(bg_content)
-                        logging.info(f"🎞️  Overlay animation fps={anim_fps} (bg={bg_content or 'none'}, "
-                                     f"img={'yes' if img_bg_path else 'no'})")
                         # Scrolling text now composites over the image background too
                         # (img_bg_path is None → black background, unchanged behavior).
                         scroll_started = animate_lines_via_shm(
@@ -3338,25 +3327,20 @@ def send_to_fpp(name, override=None):
                         "AntiAlias": True,
                         "AutoEnable": False
                     }
-                    response = requests.put(text_url, json=text_payload, timeout=10)
-                    logging.info(f"📡 FPP text API fallback: {response.status_code}")
-                else:
-                    logging.info(f"✅ PIL {'scroll' if scroll_started else 'static'} render active")
+                    requests.put(text_url, json=text_payload, timeout=10)
 
                 # State 2 (Opaque) for image background so it covers the display fully -
                 # for both the static composite (shm_rendered) and the scroll composite
                 # (scroll_started) paths. State 3 (Transparent RGB) for normal/FSEQ
                 # background (black = transparent).
                 overlay_state = 2 if (img_bg_path and (shm_rendered or scroll_started)) else 3
-                state_resp = requests.put(state_url, json={"State": overlay_state}, timeout=3)
-                logging.info(f"   Overlay state={overlay_state}: {state_resp.status_code}")
+                requests.put(state_url, json={"State": overlay_state}, timeout=3)
 
             except Exception as e:
                 logging.error(f"💥 ERROR sending text command: {e}")
                 import traceback
                 logging.error(traceback.format_exc())
-        
-        logging.info(f"✅ ========== DISPLAY COMMANDS COMPLETED ==========")
+
         return True
         
     except Exception as e:
@@ -3386,6 +3370,7 @@ def start_default_playlist(content=None):
 
     # This content becomes the base waiting layer (what names composite over / return to).
     _active_waiting_content = default_playlist
+    logging.info(f"▶️  Starting waiting content: {default_playlist}")
 
     try:
         if default_playlist.startswith('seq:'):
@@ -3396,13 +3381,9 @@ def start_default_playlist(content=None):
             # loop=true, background=true: loops natively, auto-suppressed by foreground
             # sequences, auto-resumes when foreground stops
             effect_url = f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Start')}/{urllib.parse.quote(seq_name)}/true/true"
-            logging.info(f"▶️  Starting FSEQ Effect Start (loop+background): {seq_name}")
-            logging.info(f"   URL: {effect_url}")
             response = requests.get(effect_url, timeout=3)
-            logging.info(f"   Response: {response.status_code} - {response.text}")
 
             if response.status_code == 200:
-                logging.info(f"✅ FSEQ Effect Start - looping in background")
                 return True
 
             logging.error(f"❌ FSEQ Effect Start failed: {response.status_code} - {response.text}")
@@ -3420,7 +3401,6 @@ def start_default_playlist(content=None):
                     encoded = urllib.parse.quote(overlay_model)
                     state_url = f"{fpp_host}/api/overlays/model/{encoded}/state"
                     requests.put(state_url, json={"State": 2}, timeout=3)  # Opaque
-                    logging.info(f"✅ Image background set: {img_name}")
                     return True
             logging.warning(f"⚠️  Image background failed: PIL={PIL_AVAILABLE} model={overlay_model} "
                             f"dims={mw}x{mh} exists={os.path.exists(img_path) if img_path else False}")
@@ -3429,13 +3409,9 @@ def start_default_playlist(content=None):
         else:
             command = "Start Playlist"
             command_url = f"{fpp_host}/api/command/{urllib.parse.quote(command)}/{urllib.parse.quote(default_playlist)}/true/true"
-            logging.info(f"▶️  Starting playlist: {default_playlist}")
-            logging.info(f"   URL: {command_url}")
             response = requests.get(command_url, timeout=3)
-            logging.info(f"   Response: {response.status_code} - {response.text}")
 
             if response.status_code == 200:
-                logging.info(f"✅ Playlist started")
                 return True
             else:
                 logging.error(f"❌ Failed to start playlist: {response.status_code}")
@@ -3634,7 +3610,6 @@ def return_to_default_playlist():
             try:
                 enc = urllib.parse.quote(overlay_model)
                 requests.put(f"{fpp_host}/api/overlays/model/{enc}/state", json={"State": 0}, timeout=3)
-                logging.info("🧹 Overlay cleared (State 0)")
             except Exception as e:
                 logging.warning(f"Could not clear overlay: {e}")
 
@@ -3643,10 +3618,8 @@ def return_to_default_playlist():
             # waiting was never stopped); just restore the overlay for the waiting content.
             if returning_to_image:
                 start_default_playlist(default_content)   # image + State 2, overwrites overlay, no blank
-                logging.info("ℹ️  No names playlist - restored img waiting (no blank)")
             else:
                 _clear_overlay()
-                logging.info("ℹ️  No names playlist - overlay cleared, waiting content shows")
             return
 
         # 1) Stop the NAME content by type. Never a blanket Stop Now - the main
@@ -3666,16 +3639,14 @@ def return_to_default_playlist():
                              f"running, only clearing the overlay")
             else:
                 # Stop the names FSEQ Effect - waiting FSEQ (if any) keeps running underneath
-                r = requests.get(f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(seq_name)}", timeout=3)
-                logging.info(f"⏹️  FSEQ Effect Stop (names): {r.status_code} - {r.text}")
+                requests.get(f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(seq_name)}", timeout=3)
         elif name_playlist.startswith('img:'):
             # Image name used the overlay only - nothing on the output to stop.
             pass
         else:
             # Names content is a foreground playlist - stop just that playlist
             # (not a blanket Stop Now), so any coexisting foreground isn't killed.
-            r = requests.get(f"{fpp_host}/api/playlists/stop", timeout=3)
-            logging.info(f"⏹️  Stopped names playlist ({r.status_code})")
+            requests.get(f"{fpp_host}/api/playlists/stop", timeout=3)
 
         # 2) Restore WAITING content on the overlay.
         # - img: waiting → re-render it and set State 2 Opaque. The name display
@@ -3687,7 +3658,6 @@ def return_to_default_playlist():
         #      background was there the whole time).
         if returning_to_image:
             start_default_playlist(default_content)
-            logging.info("🖼️  Restored img waiting content (no blank)")
         else:
             _clear_overlay()
 
@@ -3788,25 +3758,20 @@ def display_worker():
             phone = currently_displaying['phone']
             
             logging.info(f"🎬 NOW DISPLAYING: {name} (from {phone[-4:]})")
-            
+
             try:
-                logging.info(f"📝 Updating status to 'displaying'...")
                 update_message_status(phone, name, "displaying")
-                logging.info(f"✅ Status updated to 'displaying'")
             except Exception as e:
                 logging.error(f"💥 Error updating status to displaying: {e}")
-            
+
             try:
-                logging.info(f"📺 Sending to FPP display...")
                 # On a remote, the item carries the master's pushed {content, duration}.
                 send_to_fpp(name, override=currently_displaying.get('override'))
-                logging.info(f"✅ Sent to FPP display")
             except Exception as e:
                 logging.error(f"💥 Error sending to FPP: {e}")
-            
+
             # Per-content duration chosen by send_to_fpp for the item actually shown.
             display_duration = int(_active_display_duration or config.get('display_duration', 30))
-            logging.info(f"⏱️  Displaying for {display_duration} seconds...")
 
             try:
                 name_playlist_chk = _active_name_content or ''
@@ -3828,7 +3793,6 @@ def display_worker():
                             time.sleep(min(2.0, _rem))
                 else:
                     time.sleep(display_duration)
-                logging.info(f"⏱️  Display duration completed")
             except Exception as e:
                 logging.error(f"💥 Error during display: {e}")
             
@@ -3848,7 +3812,6 @@ def display_worker():
                     logging.info("🛑 Graceful stop: last name shown - stopping waiting content")
                     stop_show_playback()
                 else:
-                    logging.info(f"🔄 Returning to default playlist...")
                     return_to_default_playlist()
             except Exception as e:
                 logging.error(f"💥 Error returning to default / stopping: {e}")
@@ -3857,7 +3820,6 @@ def display_worker():
             
             try:
                 update_message_status(phone, name, "displayed")
-                logging.info(f"✅ Status updated to 'displayed'")
             except Exception as e:
                 logging.error(f"💥 Error updating status to displayed: {e}")
             
@@ -4069,7 +4031,7 @@ def poll_twilio():
                 _current_day = today
                 try:
                     cleanup_old_logs()
-                    logging.error(f"🌙 Midnight: old daily logs cleaned up for {today}")
+                    logging.info(f"🌙 Midnight: old daily logs cleaned up for {today}")
                 except Exception as e:
                     logging.error(f"Error during midnight cleanup: {e}")
 
@@ -4377,7 +4339,7 @@ def poll_google_voice():
                 _current_day = today
                 try:
                     cleanup_old_logs()
-                    logging.error(f"🌙 Midnight: old daily logs cleaned up for {today}")
+                    logging.info(f"🌙 Midnight: old daily logs cleaned up for {today}")
                 except Exception as e:
                     logging.error(f"Error during midnight cleanup: {e}")
 
@@ -4595,7 +4557,6 @@ def index():
                             <label style="display:flex; align-items:center; gap:8px;">🔗 Sync to Plugin Master
                                 <button type="button" class="test-btn" id="btn_refresh_masters" onclick="refreshMasters(this)" style="padding:2px 10px; font-size:12px;">🔄 Refresh</button>
                             </label>
-                            <p class="help-text" style="margin-top:4px;">Pick which <strong>plugin master</strong> this remote follows - that's an FPP running this plugin in <strong>Master</strong> role (not necessarily the FPP MultiSync master). If just one master is found it's selected automatically; with two or more, pick one.</p>
                             <div id="masters_list" style="margin-top:6px;">
                                 <p class="help-text" id="masters_empty">Looking for plugin masters on the network…</p>
                             </div>
@@ -10782,7 +10743,7 @@ if __name__ == '__main__':
             try:
                 import shutil
                 shutil.copy2(_old, _new)
-                logging.error(f"Migrated {_old} → {_new}")
+                logging.info(f"Migrated {_old} → {_new}")
             except Exception as _e:
                 logging.error(f"Migration failed {_old}: {_e}")
 

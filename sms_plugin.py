@@ -8297,7 +8297,19 @@ def update_config():
             raw_list = new_config.get('names_content_list')
             if not isinstance(raw_list, list):
                 raw_list = []
-            config['names_content_list'] = [_sanitize_names_item(it) for it in raw_list]
+            sanitized = [_sanitize_names_item(it) for it in raw_list]
+            if is_remote():
+                # On a REMOTE the master sync owns list MEMBERSHIP; the browser may only edit
+                # per-content LAYOUTS. Merge the posted layouts into the existing items by
+                # content id - never add or drop items here. This stops a remote's autosave
+                # (which may run with a stale/empty list) from wiping the master-synced list.
+                posted = {it.get('content'): it for it in sanitized if it.get('content')}
+                config['names_content_list'] = [
+                    posted.get(it.get('content'), it)
+                    for it in (config.get('names_content_list') or [])
+                ]
+            else:
+                config['names_content_list'] = sanitized
         if config.get('names_content_mode') not in ('roundrobin', 'random'):
             config['names_content_mode'] = 'roundrobin'
         # Keep the round-robin cursor valid if the list changed/shrank.

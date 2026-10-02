@@ -4606,8 +4606,11 @@ def index():
 
                         <label>Poll Interval (seconds):</label>
                         <input type="number" id="poll_interval" value="{{ config.poll_interval }}" min="1" max="60">
+                    </div>
 
-                        <hr style="border: none; border-top: 1px solid #ddd; margin: 15px 0;">
+                    <!-- FPP Display Settings: shown on BOTH master and remote (the overlay
+                         model + names content are per-projector; a remote needs them). -->
+                    <div class="section">
                         <h2 style="margin-top: 0;">FPP Display Settings</h2>
 
                         <div id="fpp_content_live_warning" style="display:none; background:#b71c1c; color:#fff; border-radius:5px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
@@ -4723,8 +4726,9 @@ def index():
                                 <option value="">-- None --</option>
                             </select>
                         </div>
+                    </div>
 
-                        <hr style="border: none; border-top: 1px solid #ddd; margin: 15px 0;">
+                    <div class="section" id="message_settings_section">
                         <h2 style="margin-top: 0;">Message Settings</h2>
 
                         <!-- Display Duration moved to the Display tab (it is now per Names
@@ -5003,6 +5007,7 @@ def index():
                 function applyRoleVisibility(remote) {
                     var showIf = function(id, show){ var el=document.getElementById(id); if(el) el.style.display = show ? '' : 'none'; };
                     showIf('message_source_section', !remote);
+                    showIf('message_settings_section', !remote);
                     showIf('master_discovery_box', !remote);
                     showIf('filters_section', !remote);
                     // Waiting content + the Names add/arrange are master-driven; the remote's

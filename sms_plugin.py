@@ -5062,12 +5062,13 @@ def index():
                     var html = '';
                     masters.forEach(function(m) {
                         var label = m.name || m.address;
-                        var meta = [m.address]; if (m.phone) meta.push(m.phone);
                         var checked = m.selected ? ' checked' : '';
-                        html += '<label style="display:flex; align-items:center; gap:8px; padding:4px 0;">'
-                             +  '<input type="checkbox" class="master_pick" data-addr="' + _esc(m.address) + '"' + checked + ' onchange="selectMaster(this)">'
-                             +  '<span><strong>' + _esc(label) + '</strong>'
-                             +  '<span class="help-text" style="margin-left:6px;">' + _esc(meta.join(' . ')) + '</span></span>'
+                        html += '<label style="display:flex; align-items:center; gap:10px; padding:6px 0; margin:0; font-weight:normal; cursor:pointer;">'
+                             +  '<input type="checkbox" class="master_pick" data-addr="' + _esc(m.address) + '"' + checked + ' onchange="selectMaster(this)" style="width:auto; margin:0; flex-shrink:0;">'
+                             +  '<span style="line-height:1.3;"><strong>' + _esc(label) + '</strong>'
+                             +  '<span class="help-text" style="margin-left:8px;">' + _esc(m.address) + '</span>'
+                             +  (m.phone ? '<br><span class="help-text">' + _esc(m.phone) + '</span>' : '')
+                             +  '</span>'
                              +  '</label>';
                     });
                     if (d.selected && d.selected_reachable === false) {

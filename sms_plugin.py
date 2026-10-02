@@ -75,7 +75,7 @@ SECRETS_FILE    = os.path.join(SECRETS_DIR, "credentials.json")
 SECRET_KEYS     = ("twilio_auth_token", "gv_app_password")
 # Box-specific Master/Remote identity — kept on THIS Pi across a config import unless the
 # user ticks "import mode" (so restoring settings never silently flips a master to a remote).
-MODE_KEYS       = ("plugin_role", "selected_master", "instance_name")
+MODE_KEYS       = ("plugin_role", "selected_master")
 # Placeholder shown in a saved secret field. Submitting it unchanged means
 # "keep the stored secret"; clearing the field to empty means "remove it";
 # any other value updates it. Must be something a real secret never equals.
@@ -309,10 +309,6 @@ DEFAULT_CONFIG = {
     #   "remote" — never polls/responds/counts; only renders name + content pushed by the
     #              master, using this instance's OWN overlay model / fonts / layout.
     "plugin_role": "",
-    # Optional friendly name a MASTER advertises to remotes, so when several masters
-    # exist (different phone numbers/shows) a remote can tell them apart. Falls back to
-    # the FPP hostname when blank.
-    "instance_name": "",
     # Remote-side: the address of the ONE master this remote syncs to (chosen in the UI).
     # Empty = auto (follow the first master found, accept pushes from any trusted peer).
     "selected_master": "",
@@ -553,10 +549,7 @@ def is_remote():
 
 
 def _instance_label():
-    """Friendly name this instance advertises: the user-set instance_name, else the hostname."""
-    name = (config.get('instance_name') or '').strip()
-    if name:
-        return name
+    """Friendly name this instance advertises to remotes: the FPP hostname."""
     try:
         import socket
         return socket.gethostname()
@@ -4563,8 +4556,6 @@ def index():
                         <p class="help-text" id="role_default_hint" style="margin-top:4px;">This FPP is in <strong>{{ fpp_mode_default_reason }}</strong> mode.</p>
                         <div id="master_discovery_box">
                             <p class="help-text" style="margin-top:8px;">🔎 Remotes are found automatically over FPP MultiSync — just set each other FPP instance to <strong>Remote</strong> mode. Nothing to enter here.</p>
-                            <label style="margin-top:8px;">Instance name <span class="help-text" style="font-weight:normal;">— optional; shown to remotes so they can tell multiple masters apart (e.g. "Front Yard" or the phone number). Defaults to this Pi's hostname.</span></label>
-                            <input type="text" id="instance_name" value="{{ config.get('instance_name','') }}" placeholder="(hostname)" oninput="saveConfig()">
                         </div>
                         <div id="remote_mode_note" style="display:none; background:#e3f2fd; border:1px solid #90caf9; color:#0d47a1; border-radius:5px; padding:8px 12px; margin-top:10px; font-size:13px;">
                             ℹ️ <strong>Remote mode:</strong> texts, replies, and per-phone limits are configured on the <strong>Master</strong> — they're ignored here. This instance only displays the names the Master pushes, using <em>this projector's</em> own overlay model, fonts, and content. Make sure the same sequences/images exist on this Pi (use <strong>Config → Export/Import</strong>); if a pushed sequence is missing, this instance simply keeps showing its current content.
@@ -7880,7 +7871,6 @@ var _saveTimer = null;
 
                 const data = {
                     plugin_role: (document.getElementById('plugin_role')||{}).value || '',
-                    instance_name: (document.getElementById('instance_name')||{}).value || '',
                     message_source: document.getElementById('message_source').value,
                     twilio_account_sid: document.getElementById('account_sid').value,
                     twilio_auth_token: document.getElementById('auth_token').value,
@@ -8355,10 +8345,6 @@ def update_config():
             # Switched to master: a poller will be (re)started by start_polling_if_needed below.
             if is_remote():
                 polling_generation += 1
-
-        # Friendly instance name a master advertises to remotes — trim + cap length.
-        if 'instance_name' in new_config:
-            config['instance_name'] = str(new_config.get('instance_name') or '').strip()[:60]
 
         # Normalize phone number to E.164 (strip spaces, dashes, parens — keep + and digits)
         if config.get('twilio_phone_number'):

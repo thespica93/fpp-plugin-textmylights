@@ -5609,7 +5609,7 @@ def index():
                             <canvas id="matrix_canvas" style="width:100%; display:block; background:#000; border:2px solid #555; border-radius:4px; cursor:default;"></canvas>
                             <div style="display:flex; gap:8px; margin-top:6px; align-items:center;">
                                 <button type="button" onclick="resetAllLines()" style="background:#555; padding:6px 12px; font-size:12px;">Reset All to Center</button>
-                                <button type="button" id="btn_sync_pos_master" onclick="syncPositionFromMaster(this)" style="display:none; background:#1976d2; color:#fff; padding:6px 12px; font-size:12px;" title="Copy the Master's text layout for this content, scaled to this projector's model">🔗 Sync Position to Master</button>
+                                <button type="button" id="btn_sync_pos_master" onclick="syncPositionFromMaster(this)" style="display:none; background:#1976d2; color:#fff; padding:6px 12px; font-size:12px;" title="Copy the Master's text layout for this content, scaled to this projector's model">🔗 Sync Position from Master</button>
                                 <span id="pos_display" style="font-size:12px; color:#888;"></span>
                                 <span id="sync_pos_status" style="font-size:12px; color:#888;"></span>
                             </div>
@@ -9363,7 +9363,7 @@ def api_plugin_select_master():
 @app.route('/api/plugin/master-layout')
 def api_master_layout():
     """Remote (browser-facing): fetch the master's text layout for a content id so the Display
-    tab's 'Sync Position to Master' can copy it. Normal token auth; proxies to the master."""
+    tab's 'Sync Position from Master' can copy it. Normal token auth; proxies to the master."""
     if not is_remote():
         return jsonify({"found": False, "error": "This instance is not a remote."}), 409
     content = request.args.get('content', '')
@@ -10580,7 +10580,7 @@ def api_tml_content_list():
 @app.route('/api/tml/layout', methods=['GET'])
 def api_tml_layout():
     """Master: the saved text layout for a content id + this master's overlay model size, so a
-    remote can copy the positioning ('Sync Position to Master'), scaled to its own model."""
+    remote can copy the positioning ('Sync Position from Master'), scaled to its own model."""
     content = request.args.get('content', '')
     item = next((it for it in (config.get('names_content_list', []) or [])
                  if it.get('content') == content), None)

@@ -694,22 +694,21 @@ def discover_masters(force=False):
 
 
 def _selected_master_addr():
-    """Remote: the address of the master this remote is pinned to ('' = auto / any)."""
+    """Remote: the address of the master this remote is pinned to ('' = none selected)."""
     return (config.get('selected_master') or '').strip()
 
 
 def _find_master_base():
-    """Remote: base URL of the master to sync FROM. Honors the user's selected_master when set
-    (so a remote follows exactly ONE of several masters); otherwise the first master found.
-    Returns None when the chosen/any master isn't currently reachable."""
-    masters = discover_masters()
+    """Remote: base URL of the selected master to sync FROM. A remote follows a master ONLY when
+    one is explicitly picked in the 'Sync to Master' list — no master selected means follow
+    nobody (returns None). Also None when the chosen master isn't currently reachable."""
     sel = _selected_master_addr()
-    if sel:
-        for m in masters:
-            if m['address'] == sel:
-                return m['base']
-        return None  # pinned master not currently reachable — don't silently follow another
-    return masters[0]['base'] if masters else None
+    if not sel:
+        return None  # nothing picked → the remote follows no master
+    for m in discover_masters():
+        if m['address'] == sel:
+            return m['base']
+    return None  # pinned master not currently reachable — don't silently follow another
 
 
 def sync_names_content_from_master():
@@ -719,9 +718,19 @@ def sync_names_content_from_master():
     positioning). Returns True if the list changed."""
     if not is_remote():
         return False
+    # No master picked → this remote mirrors nothing. Clear any list a previous selection
+    # left behind so the Display dropdown (and the display logic) show nothing.
+    if not _selected_master_addr():
+        if config.get('names_content_list'):
+            config['names_content_list'] = []
+            config['names_content_rr_index'] = -1
+            save_config()
+            logging.info("🔁 Remote: no master selected — cleared synced name content list")
+            return True
+        return False
     master = _find_master_base()
     if not master:
-        return False
+        return False   # selected master unreachable → keep current (don't wipe saved layouts)
     try:
         r = requests.get(f"{master}/api/tml/content-list", timeout=3)
         if r.status_code != 200:
@@ -10599,12 +10608,12 @@ def _apply_remote_waiting(content):
 
 
 def _push_from_selected_master():
-    """Remote: True if the current request comes from the master this remote is pinned to.
-    When no master is selected (auto), accept from any trusted peer (the before_request gate
-    already limited callers to FPP MultiSync peers)."""
+    """Remote: True only if the current request comes from the master this remote is pinned to.
+    With no master selected the remote follows nobody, so ALL pushes are ignored — nothing is
+    displayed until a master is explicitly picked in the 'Sync to Master' list."""
     sel = _selected_master_addr()
     if not sel:
-        return True
+        return False
     return request.remote_addr == sel
 
 

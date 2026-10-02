@@ -306,6 +306,13 @@ DEFAULT_CONFIG = {
     #   "remote" — never polls/responds/counts; only renders name + content pushed by the
     #              master, using this instance's OWN overlay model / fonts / layout.
     "plugin_role": "",
+    # Optional friendly name a MASTER advertises to remotes, so when several masters
+    # exist (different phone numbers/shows) a remote can tell them apart. Falls back to
+    # the FPP hostname when blank.
+    "instance_name": "",
+    # Remote-side: the address of the ONE master this remote syncs to (chosen in the UI).
+    # Empty = auto (follow the first master found, accept pushes from any trusted peer).
+    "selected_master": "",
     # Which inbound message source feeds the pipeline: "twilio" | "google_voice"
     "message_source": "twilio",
     "twilio_account_sid": "",
@@ -434,6 +441,8 @@ _fseq_dur_cache = {}              # {seq_name: duration_seconds} — parsed FSEQ
 _resolved_role = None            # cached effective role ("master"/"remote")
 _remotes_cache = []              # cached list of remote base URLs the master pushes to
 _remotes_cache_time = 0.0
+_masters_cache = []              # remote side: cached detailed master list [{address,base,name,phone}]
+_masters_cache_time = 0.0
 _REMOTES_CACHE_TTL = 30          # seconds between MultiSync discovery refreshes
 _tml_peer_cache = set()          # cached IPs allowed to call /api/tml/* (FPP peers)
 _tml_peer_cache_time = 0.0
@@ -540,6 +549,26 @@ def is_remote():
     return get_plugin_role() == 'remote'
 
 
+def _instance_label():
+    """Friendly name this instance advertises: the user-set instance_name, else the hostname."""
+    name = (config.get('instance_name') or '').strip()
+    if name:
+        return name
+    try:
+        import socket
+        return socket.gethostname()
+    except Exception:
+        return 'FPP'
+
+
+def _instance_phone_label():
+    """The source number/account this instance texts from, shown to remotes so they can tell
+    multiple masters apart. Twilio → the phone number; Google Voice → the Gmail address."""
+    if config.get('message_source', 'twilio') == 'google_voice':
+        return (config.get('gv_email') or '').strip()
+    return (config.get('twilio_phone_number') or '').strip()
+
+
 def _local_ips():
     """Best-effort set of this host's own addresses, to exclude self from discovery."""
     import socket
@@ -642,10 +671,49 @@ def discover_remotes(force=False):
     return remotes
 
 
+def discover_masters(force=False):
+    """Remote side: detailed list of reachable plugin MASTERS on the FPP MultiSync network,
+    each `{address, base, name, phone}`, so the UI can present them for selection. Cached
+    briefly (same TTL as the other discovery caches)."""
+    global _masters_cache, _masters_cache_time
+    now = time.time()
+    if not force and _masters_cache and (now - _masters_cache_time) < _REMOTES_CACHE_TTL:
+        return _masters_cache
+    found = []
+    for host in _multisync_addresses():
+        h = f"[{host}]" if (':' in host and not host.startswith('[')) else host  # bracket IPv6
+        base = f"http://{h}:5000"
+        try:
+            pr = requests.get(f"{base}/api/tml/ping", timeout=2)
+            if pr.status_code == 200:
+                j = pr.json()
+                if j.get('plugin') == 'textmylights' and j.get('role') == 'master':
+                    found.append({"address": host, "base": base,
+                                  "name": j.get('name') or host, "phone": j.get('phone') or ''})
+        except Exception:
+            pass  # unreachable / not the plugin — skip silently
+    found.sort(key=lambda m: (m.get('name') or '').lower())
+    _masters_cache, _masters_cache_time = found, now
+    return found
+
+
+def _selected_master_addr():
+    """Remote: the address of the master this remote is pinned to ('' = auto / any)."""
+    return (config.get('selected_master') or '').strip()
+
+
 def _find_master_base():
-    """Remote: base URL of the FPP peer running this plugin in MASTER mode, or None."""
-    masters = _probe_plugin_peers()['master']
-    return masters[0] if masters else None
+    """Remote: base URL of the master to sync FROM. Honors the user's selected_master when set
+    (so a remote follows exactly ONE of several masters); otherwise the first master found.
+    Returns None when the chosen/any master isn't currently reachable."""
+    masters = discover_masters()
+    sel = _selected_master_addr()
+    if sel:
+        for m in masters:
+            if m['address'] == sel:
+                return m['base']
+        return None  # pinned master not currently reachable — don't silently follow another
+    return masters[0]['base'] if masters else None
 
 
 def sync_names_content_from_master():
@@ -4492,9 +4560,20 @@ def index():
                         <p class="help-text" id="role_default_hint" style="margin-top:4px;">This FPP is in <strong>{{ fpp_mode_default_reason }}</strong> mode.</p>
                         <div id="master_discovery_box">
                             <p class="help-text" style="margin-top:8px;">🔎 Remotes are found automatically over FPP MultiSync — just set each other FPP instance to <strong>Remote</strong> mode. Nothing to enter here.</p>
+                            <label style="margin-top:8px;">Instance name <span class="help-text" style="font-weight:normal;">— optional; shown to remotes so they can tell multiple masters apart (e.g. "Front Yard" or the phone number). Defaults to this Pi's hostname.</span></label>
+                            <input type="text" id="instance_name" value="{{ config.get('instance_name','') }}" placeholder="(hostname)" oninput="saveConfig()">
                         </div>
                         <div id="remote_mode_note" style="display:none; background:#e3f2fd; border:1px solid #90caf9; color:#0d47a1; border-radius:5px; padding:8px 12px; margin-top:10px; font-size:13px;">
                             ℹ️ <strong>Remote mode:</strong> texts, replies, and per-phone limits are configured on the <strong>Master</strong> — they're ignored here. This instance only displays the names the Master pushes, using <em>this projector's</em> own overlay model, fonts, and content. Make sure the same sequences/images exist on this Pi (use <strong>Config → Export/Import</strong>); if a pushed sequence is missing, this instance simply keeps showing its current content.
+                        </div>
+                        <div id="master_sync_box" style="display:none; margin-top:12px;">
+                            <label style="display:flex; align-items:center; gap:8px;">🔗 Sync to Master
+                                <button type="button" class="test-btn" id="btn_refresh_masters" onclick="refreshMasters(this)" style="padding:2px 10px; font-size:12px;">🔄 Refresh</button>
+                            </label>
+                            <p class="help-text" style="margin-top:4px;">Pick which Master this remote follows. Only one at a time — this remote will only display the names that Master pushes. The list refreshes automatically.</p>
+                            <div id="masters_list" style="margin-top:6px;">
+                                <p class="help-text" id="masters_empty">Looking for masters on the network…</p>
+                            </div>
                         </div>
                     </div>
                     <div class="section" id="message_source_section">
@@ -4957,6 +5036,9 @@ def index():
                     var nb=document.getElementById('plugin_not_live_banner'); if(nb && remote) nb.style.display='none';
                     var note = document.getElementById('remote_mode_note');
                     if (note) note.style.display = remote ? 'block' : 'none';
+                    showIf('master_sync_box', remote);   // remote-only: pick which master to follow
+                    // Kick the masters auto-refresh on when switching into remote view.
+                    if (remote && typeof window.startMastersAutoRefresh === 'function') window.startMastersAutoRefresh();
                     // If a now-hidden tab is active, fall back to Settings.
                     if (remote) {
                         var active = document.querySelector('.tab-content.active');
@@ -4967,6 +5049,71 @@ def index():
                     }
                 }
                 window.applyRoleVisibility = applyRoleVisibility;
+
+                // --- "Sync to Master" picker (remote only) --------------------------------
+                var _mastersTimer = null;
+                function _esc(s) {
+                    return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){
+                        return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c];
+                    });
+                }
+                function renderMasters(d) {
+                    var box = document.getElementById('masters_list');
+                    if (!box) return;
+                    var masters = (d && d.masters) || [];
+                    if (!masters.length) {
+                        box.innerHTML = '<p class="help-text">No masters found yet. Make sure another FPP is running this plugin as <strong>Master</strong> on the same MultiSync network, then press Refresh.</p>';
+                        return;
+                    }
+                    var html = '';
+                    masters.forEach(function(m) {
+                        var label = m.name || m.address;
+                        var meta = [m.address]; if (m.phone) meta.push(m.phone);
+                        var checked = m.selected ? ' checked' : '';
+                        html += '<label style="display:flex; align-items:center; gap:8px; padding:4px 0;">'
+                             +  '<input type="checkbox" class="master_pick" data-addr="' + _esc(m.address) + '"' + checked + ' onchange="selectMaster(this)">'
+                             +  '<span><strong>' + _esc(label) + '</strong>'
+                             +  '<span class="help-text" style="margin-left:6px;">' + _esc(meta.join(' . ')) + '</span></span>'
+                             +  '</label>';
+                    });
+                    if (d.selected && d.selected_reachable === false) {
+                        html += '<p class="help-text" style="color:#c62828;">warning: the selected master is not reachable right now.</p>';
+                    }
+                    box.innerHTML = html;
+                }
+                function loadMasters(force) {
+                    fetch('/api/plugin/masters' + (force ? '?refresh=1' : ''))
+                        .then(function(r){ return r.json(); })
+                        .then(function(d){ if (d && d.is_remote) renderMasters(d); })
+                        .catch(function(){});
+                }
+                window.loadMasters = loadMasters;
+                function selectMaster(cb) {
+                    // Single-select: unchecking the current one clears the pin (auto / any master).
+                    var picks = document.querySelectorAll('.master_pick');
+                    picks.forEach(function(p){ if (p !== cb) p.checked = false; });
+                    var address = cb.checked ? (cb.getAttribute('data-addr') || '') : '';
+                    fetch('/api/plugin/select-master', {
+                        method: 'POST', headers: {'Content-Type':'application/json'},
+                        body: JSON.stringify({address: address})
+                    }).then(function(){ loadMasters(false); }).catch(function(){});
+                }
+                window.selectMaster = selectMaster;
+                function refreshMasters(btn) {
+                    if (btn) {
+                        btn.disabled = true; var t = btn.textContent; btn.textContent = '...';
+                        setTimeout(function(){ btn.disabled = false; btn.textContent = t; }, 1200);
+                    }
+                    loadMasters(true);
+                }
+                window.refreshMasters = refreshMasters;
+                function startMastersAutoRefresh() {
+                    if (_mastersTimer) return;
+                    loadMasters(false);
+                    _mastersTimer = setInterval(function(){ loadMasters(false); }, 10000);
+                }
+                window.startMastersAutoRefresh = startMastersAutoRefresh;
+
                 function onRoleChange() {
                     var sel = document.getElementById('plugin_role');
                     var remote = sel && sel.value === 'remote';
@@ -7723,6 +7870,7 @@ var _saveTimer = null;
 
                 const data = {
                     plugin_role: (document.getElementById('plugin_role')||{}).value || '',
+                    instance_name: (document.getElementById('instance_name')||{}).value || '',
                     message_source: document.getElementById('message_source').value,
                     twilio_account_sid: document.getElementById('account_sid').value,
                     twilio_auth_token: document.getElementById('auth_token').value,
@@ -8197,6 +8345,10 @@ def update_config():
             # Switched to master: a poller will be (re)started by start_polling_if_needed below.
             if is_remote():
                 polling_generation += 1
+
+        # Friendly instance name a master advertises to remotes — trim + cap length.
+        if 'instance_name' in new_config:
+            config['instance_name'] = str(new_config.get('instance_name') or '').strip()[:60]
 
         # Normalize phone number to E.164 (strip spaces, dashes, parens — keep + and digits)
         if config.get('twilio_phone_number'):
@@ -9149,6 +9301,46 @@ def api_plugin_role():
                     "plugin_role": (config.get('plugin_role') or ''),
                     "fpp_mode": _last_fpp_mode,
                     "fpp_mode_detail": _fpp_mode_detail})
+
+
+@app.route('/api/plugin/masters')
+def api_plugin_masters():
+    """Remote (browser-facing): the plugin masters discovered on the FPP network, each with a
+    friendly name + source number, and which one this remote is currently pinned to. Drives the
+    'Sync to Master' picker + its auto-refresh. Normal token auth."""
+    if not is_remote():
+        return jsonify({"masters": [], "selected": "", "is_remote": False})
+    force = request.args.get('refresh') in ('1', 'true', 'yes')
+    sel = _selected_master_addr()
+    masters = discover_masters(force=force)
+    return jsonify({
+        "is_remote": True,
+        "selected": sel,
+        "selected_reachable": any(m['address'] == sel for m in masters) if sel else True,
+        "masters": [{"address": m["address"], "name": m["name"], "phone": m["phone"],
+                     "selected": (m["address"] == sel)} for m in masters],
+    })
+
+
+@app.route('/api/plugin/select-master', methods=['POST'])
+def api_plugin_select_master():
+    """Remote (browser-facing): pin this remote to ONE master (by address), or clear the pin
+    (empty address = auto/any). Only one master at a time."""
+    if not is_remote():
+        return jsonify({"success": False, "error": "This instance is not a remote."}), 409
+    data = request.json or {}
+    addr = str(data.get('address', '') or '').strip()
+    global _masters_cache_time
+    config['selected_master'] = addr
+    save_config()
+    _masters_cache_time = 0   # force a fresh probe on the next read
+    logging.info(f"🔗 Remote pinned to master: {addr or '(auto / any)'}")
+    # Immediately re-mirror the newly selected master's name-content list.
+    try:
+        sync_names_content_from_master()
+    except Exception as e:
+        logging.debug(f"select-master resync failed: {e}")
+    return jsonify({"success": True, "selected": addr})
 
 
 @app.route('/api/plugin/master-layout')
@@ -10352,9 +10544,11 @@ def view_messages():
 
 @app.route('/api/tml/ping', methods=['GET'])
 def api_tml_ping():
-    """Identify this instance to a discovering master: plugin name + effective role. A master
+    """Identify this instance to a discovering peer: plugin name + effective role, plus a
+    friendly name and source number so a remote can tell multiple masters apart. A master
     pushes only to peers that answer here with role == 'remote'."""
-    return jsonify({"plugin": "textmylights", "role": get_plugin_role()})
+    return jsonify({"plugin": "textmylights", "role": get_plugin_role(),
+                    "name": _instance_label(), "phone": _instance_phone_label()})
 
 
 @app.route('/api/tml/content-list', methods=['GET'])
@@ -10396,13 +10590,26 @@ def _apply_remote_waiting(content):
         _switch_waiting_content(content, _active_waiting_content)
 
 
+def _push_from_selected_master():
+    """Remote: True if the current request comes from the master this remote is pinned to.
+    When no master is selected (auto), accept from any trusted peer (the before_request gate
+    already limited callers to FPP MultiSync peers)."""
+    sel = _selected_master_addr()
+    if not sel:
+        return True
+    return request.remote_addr == sel
+
+
 @app.route('/api/tml/state', methods=['POST'])
 def api_tml_state():
     """Remote: apply the master's chosen display state. A name event ({name, content,
     duration}) shows that name over the content using THIS instance's own layout; a waiting
-    event ({content}) switches the background. Only remotes act on it."""
+    event ({content}) switches the background. Only remotes act on it, and only when the push
+    comes from the master this remote is pinned to (so several masters can coexist)."""
     if not is_remote():
         return jsonify({"success": False, "error": "not in remote mode"}), 409
+    if not _push_from_selected_master():
+        return jsonify({"success": True, "ignored": "not the selected master"})
     data = request.json or {}
     content = str(data.get('content', '') or '')
     name = str(data.get('name', '') or '').strip()
@@ -10430,9 +10637,12 @@ def api_tml_state():
 def api_tml_stop():
     """Remote: the master was Stopped, so stop here too. Same graceful behavior as the local
     Stop — any names the master already pushed drain first, then the waiting content stops.
-    Only remotes act on it (the peer-IP allowlist in before_request gates who may call it)."""
+    Only remotes act on it (the peer-IP allowlist in before_request gates who may call it), and
+    only from the master this remote is pinned to."""
     if not is_remote():
         return jsonify({"success": False, "error": "not in remote mode"}), 409
+    if not _push_from_selected_master():
+        return jsonify({"success": True, "ignored": "not the selected master"})
     global _remote_stop_requested
     _remote_stop_requested = True   # the display worker tears down once its queue drains
     try:

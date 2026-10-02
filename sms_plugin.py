@@ -7436,6 +7436,22 @@ def index():
                     if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
                 }
 
+                // Seconds to cap the preview scrubber at: the SELECTED names content's own
+                // display_duration (from the data model, which is correct from page load),
+                // falling back to the DOM duration fields. Reading the data model avoids a
+                // timing bug where loadBgPreview ran before content_duration was populated and
+                // fell back to the global 30s.
+                function _previewCapSeconds() {
+                    var lst = window._namesContentList || [];
+                    var idx = window._namesSelectedIndex;
+                    if (lst.length > 0 && idx != null && idx >= 0 && idx < lst.length) {
+                        var d = parseInt(lst[idx].display_duration);
+                        if (d > 0) return d;
+                    }
+                    var el = document.getElementById('content_duration') || document.getElementById('display_duration');
+                    return (el && parseInt(el.value)) || 30;
+                }
+
                 function loadBgPreview() {
                     var ct = getConfiguredContent();
                     if (!ct) return;
@@ -7473,8 +7489,7 @@ def index():
                                 // send_to_fpp/display loop) -- anything past that point in the
                                 // FSEQ is never actually seen behind a message, so cap the
                                 // scrubber there instead of the file's full length.
-                                var _durEl = document.getElementById('content_duration') || document.getElementById('display_duration');
-                                var displayDur = (_durEl && parseInt(_durEl.value)) || 30;
+                                var displayDur = _previewCapSeconds();
                                 var totalSec = Math.min(displayDur, Math.max(1, Math.floor(data.duration_ms / 1000)));
                                 var scrubber = document.getElementById('fseq_scrubber');
                                 scrubber.max = totalSec;
@@ -7498,8 +7513,7 @@ def index():
                         // Capped to display_duration, not the video's own length -- playback
                         // always restarts from 0 and is cut off after display_duration seconds
                         // each time a message shows, so nothing past that point is ever seen.
-                        var _vDurEl = document.getElementById('content_duration') || document.getElementById('display_duration');
-                        scrubber.max = (_vDurEl && parseInt(_vDurEl.value)) || 30;
+                        scrubber.max = Math.max(1, _previewCapSeconds());
                         scrubber.value = 0;
                         window._scrubSeconds = 0;
                         document.getElementById('fseq_scrubber_row').style.display = '';

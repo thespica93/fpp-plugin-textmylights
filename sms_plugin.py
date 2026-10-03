@@ -4598,7 +4598,7 @@ def index():
 
         <!-- SMS cost disclaimer - shown on every role (master and remote) -->
         <div style="background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:6px; padding:10px 14px; margin:14px 0 0 0; font-size:13px; line-height:1.5;">
-            <strong>DISCLAIMER:</strong> The author and supporters of this plugin are NOT responsible for SMS charges that may be incurred by using this plugin.
+            <strong>DISCLAIMER:</strong> The author of this plugin is NOT responsible for SMS charges that may be incurred by using this plugin.
         </div>
 
         <!-- Tab navigation -->
@@ -5799,6 +5799,8 @@ def index():
                     .resp-row textarea { opacity: 0.4; pointer-events: none; transition: opacity .2s; }
                     .resp-row.locked textarea { opacity: 0.4; }
                     .resp-row.enabled textarea { opacity: 1; pointer-events: auto; }
+                    .reset-default-btn { margin-top: 4px; background: #eee; color: #333; border: 1px solid #ccc; border-radius: 4px; padding: 3px 10px; font-size: 12px; cursor: pointer; opacity: 0.4; pointer-events: none; transition: opacity .2s; }
+                    .resp-row.enabled .reset-default-btn { opacity: 1; pointer-events: auto; }
                     .resp-locked-note { font-size: 13px; color: #856404; background: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; padding: 7px 10px; margin: 4px 0 6px; }
                 </style>
 
@@ -5809,7 +5811,34 @@ def index():
                     if (!row || !cb) return;   // never let a missing row abort init
                     row.classList.toggle('enabled', cb.checked);
                 }
+                // The authoritative default response text, straight from the server's
+                // DEFAULT_CONFIG, so "Reset to default" always restores the true default
+                // (and automatically tracks any default we change in a future update).
+                window._respDefaults = {{ response_defaults | tojson }};
+                function resetResp(id) {
+                    var ta = document.getElementById('response_' + id);
+                    if (!ta) return;
+                    var def = (window._respDefaults || {})['response_' + id];
+                    if (def === undefined) return;
+                    ta.value = def;
+                    if (window.saveConfig) saveConfig();
+                }
+                // Inject a "Reset to default" button after each response textarea once.
+                function addResetButtons() {
+                    ['show_not_live','blocked','profanity','duplicate','invalid_format','too_long','rate_limited','not_whitelisted','success'].forEach(function(id) {
+                        var ta = document.getElementById('response_' + id);
+                        if (!ta || ta._hasReset) return;
+                        var btn = document.createElement('button');
+                        btn.type = 'button';
+                        btn.className = 'reset-default-btn';
+                        btn.textContent = '↩️ Reset to default';
+                        btn.onclick = function() { resetResp(id); };
+                        ta.insertAdjacentElement('afterend', btn);
+                        ta._hasReset = true;
+                    });
+                }
                 function initRespRows() {
+                    addResetButtons();
                     ['show_not_live','blocked','profanity','duplicate','invalid_format','too_long','rate_limited','not_whitelisted','success'].forEach(function(id) {
                         toggleResp(id);
                     });
@@ -8424,8 +8453,11 @@ var _saveTimer = null;
     """
 
     _eff_role = get_plugin_role()
+    # The true default response text, so the per-field "Reset to default" buttons
+    # restore exactly what a fresh install ships (and track future default changes).
+    _resp_defaults = {k: v for k, v in DEFAULT_CONFIG.items() if k.startswith('response_')}
     return render_template_string(html, config=config, secret_sentinel=SECRET_SENTINEL,
-                                  effective_role=_eff_role)
+                                  effective_role=_eff_role, response_defaults=_resp_defaults)
 
 @app.route('/api/config', methods=['POST'])
 def update_config():

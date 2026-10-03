@@ -154,10 +154,10 @@ else
     log_and_show "[7/7] zstandard skipped — optional (zstd FSEQ preview only); plugin works without it"
 fi
 
-# Create config files if they don't exist
-if [ ! -f "/home/fpp/media/config/blocked_phones.json" ]; then
-    echo "[]" > /home/fpp/media/config/blocked_phones.json
-fi
+# NOTE: the blocklist (blocked_phones.json) and all other runtime data live in
+# PLUGIN_DATA_DIR below, NOT in FPP's config/ dir (which is reserved for plugin.<name>
+# settings files and is bundled into crash reports). The plugin creates the blocklist on
+# demand and treats a missing file as empty, so nothing to seed here.
 
 # Create the plugin data dir and an OWNER-ONLY secrets folder for credentials
 # (Twilio auth token, Gmail app password). Kept out of plugin.json/logs/backups;

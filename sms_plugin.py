@@ -96,6 +96,11 @@ PROFANITY_STRIKES_FILE = os.path.join(PLUGIN_DATA_DIR, "profanity_strikes.json")
 # outstanding name requests awaiting an admin Y/N. See _maybe_handle_admin_message().
 ADMIN_CTX_FILE          = os.path.join(PLUGIN_DATA_DIR, "admin_reply_ctx.json")
 PENDING_APPROVALS_FILE  = os.path.join(PLUGIN_DATA_DIR, "pending_approvals.json")
+# Requests that timed out before the admin answered are moved here so a LATE "Y" can
+# still add the name to the whitelist (for next time) without showing it now. Bounded.
+EXPIRED_APPROVALS_FILE  = os.path.join(PLUGIN_DATA_DIR, "expired_approvals.json")
+EXPIRED_APPROVALS_TTL_H = 24    # drop expired records older than this many hours
+EXPIRED_APPROVALS_MAX   = 200   # hard cap on retained expired records
 # The word the operator texts from the admin phone to connect/seed the reply context.
 # It is reserved: it is never shown on the display (see process_incoming_message).
 ADMIN_CONNECT_KEYWORD   = "admin"
@@ -431,9 +436,10 @@ DEFAULT_CONFIG = {
     # to the standard not-whitelisted reply. See _maybe_handle_admin_message() and
     # ADMIN_CTX_FILE / PENDING_APPROVALS_FILE.
     "admin_phone": "",
-    "response_whitelist_pending": "Your name isn't on our whitelist, please wait a few moments while I get permission to display.",
-    "response_admin_denied": "Sorry, this name has not been added to our whitelist.",
-    "admin_approval_prompt": "New name request: '{name}'. Reply Y to add and show it, or N to deny.",
+    "response_whitelist_pending": "Your name isn't on our whitelist, please wait a few moments while I get approval to display.",
+    # A denied request (or a timed-out one) just sends response_not_whitelisted -
+    # there is no separate "denied" message.
+    "admin_approval_prompt": "New name request: '{name}'. Reply Y to add to whitelist, or N to deny.",
     # Minutes a pending request waits for an admin Y/N before it expires (0 = never).
     # On expiry the texter gets the standard not-whitelisted reply so they aren't left waiting.
     "admin_approval_timeout_mins": 10,
@@ -2720,6 +2726,41 @@ def save_pending_approvals(items):
     except Exception as e:
         logging.error(f"Error saving pending approvals: {e}")
 
+def load_expired_approvals():
+    """Load the recently-expired requests (TTL/size pruned on read)."""
+    try:
+        if os.path.exists(EXPIRED_APPROVALS_FILE):
+            with open(EXPIRED_APPROVALS_FILE, 'r') as f:
+                data = json.load(f)
+                if not isinstance(data, list):
+                    return []
+                cutoff = time.time() - EXPIRED_APPROVALS_TTL_H * 3600
+                data = [it for it in data if float(it.get('expired_ts', 0) or 0) >= cutoff]
+                return data[-EXPIRED_APPROVALS_MAX:]
+    except Exception as e:
+        logging.error(f"Error loading expired approvals: {e}")
+    return []
+
+def save_expired_approvals(items):
+    try:
+        with open(EXPIRED_APPROVALS_FILE, 'w') as f:
+            json.dump(items[-EXPIRED_APPROVALS_MAX:], f, indent=2)
+    except Exception as e:
+        logging.error(f"Error saving expired approvals: {e}")
+
+def record_expired_approvals(expired):
+    """Append timed-out requests to the expired store so a late 'Y' can still
+    whitelist the name (without showing it)."""
+    if not expired:
+        return
+    store = load_expired_approvals()
+    now = time.time()
+    for it in expired:
+        rec = dict(it)
+        rec['expired_ts'] = now
+        store.append(rec)
+    save_expired_approvals(store)
+
 def prune_pending_approvals(items=None):
     """Drop pendings older than admin_approval_timeout_mins. On expiry, reply to the
     texter with the standard not-whitelisted message so they are not left waiting
@@ -2745,6 +2786,8 @@ def prune_pending_approvals(items=None):
         log_message(it.get('texter_phone', ''), it.get('body', ''),
                     it.get('name', ''), "admin_timeout")
     if expired:
+        # Keep them briefly so a late admin 'Y' can still whitelist the name.
+        record_expired_approvals(expired)
         save_pending_approvals(survivors)
     return survivors
 
@@ -2839,39 +2882,64 @@ def _maybe_handle_admin_message(from_number, body):
     if decision is None:
         return False  # admin texted a real name - let normal processing handle it
 
-    pending = prune_pending_approvals()
-    if not pending:
-        logging.info("Admin Y/N received but no pending approvals; ignoring")
-        return True  # consume it so a bare 'Y'/'N' is never shown as a name
-
-    # A name-targeted reply resolves that request; otherwise FIFO (oldest first).
-    idx = 0
-    if target:
-        for i, it in enumerate(pending):
-            if it.get('name', '').lower() == target.lower():
-                idx = i
-                break
-    record = pending.pop(idx)
-    save_pending_approvals(pending)
-
-    name = record.get('name', '')
-    texter_ctx = record.get('texter_ctx')
-    texter_phone = record.get('texter_phone', '')
     admin_ctx = load_admin_ctx()
 
-    if decision == 'approve':
-        add_name_to_whitelist(name)
-        add_to_queue(name, texter_phone, record.get('body', name))
-        log_message(texter_phone, record.get('body', ''), name, "admin_approved")
-        _send_feature_reply(texter_ctx, config.get('response_success', ''), 'success')
-        _send_feature_reply(admin_ctx, f"Added and showing '{name}'.", 'admin_ack')
-        logging.info(f"✅ Admin approved '{name}' - added to whitelist and queued")
-    else:  # deny
-        log_message(texter_phone, record.get('body', ''), name, "admin_denied")
-        _send_feature_reply(texter_ctx, config.get('response_admin_denied', ''), 'admin_denied')
-        _send_feature_reply(admin_ctx, f"Denied '{name}'.", 'admin_ack')
-        logging.info(f"🚫 Admin denied '{name}'")
-    return True
+    # A name-targeted reply ('Y Grandma') resolves that request; otherwise FIFO
+    # (oldest first). Shared by the active and the expired lists.
+    def _pick(items):
+        if not items:
+            return None
+        if target:
+            for i, it in enumerate(items):
+                if it.get('name', '').lower() == target.lower():
+                    return items.pop(i)
+        return items.pop(0)
+
+    pending = prune_pending_approvals()
+    record = _pick(pending)
+
+    if record is not None:
+        # Normal, in-window resolution.
+        save_pending_approvals(pending)
+        name = record.get('name', '')
+        texter_ctx = record.get('texter_ctx')
+        texter_phone = record.get('texter_phone', '')
+        if decision == 'approve':
+            add_name_to_whitelist(name)
+            add_to_queue(name, texter_phone, record.get('body', name))
+            log_message(texter_phone, record.get('body', ''), name, "admin_approved")
+            _send_feature_reply(texter_ctx, config.get('response_success', ''), 'success')
+            _send_feature_reply(admin_ctx, f"Added and showing '{name}'.", 'admin_ack')
+            logging.info(f"✅ Admin approved '{name}' - added to whitelist and queued")
+        else:  # deny
+            log_message(texter_phone, record.get('body', ''), name, "admin_denied")
+            # A denial just sends the standard Not-on-Whitelist response - no separate
+            # "denied" message. Same outcome (and same reply) as a timed-out request.
+            _send_feature_reply(texter_ctx, config.get('response_not_whitelisted', ''), 'not_whitelisted')
+            _send_feature_reply(admin_ctx, f"Denied '{name}'.", 'admin_ack')
+            logging.info(f"🚫 Admin denied '{name}'")
+        return True
+
+    # Nothing active matched - a LATE reply to an already-expired request. A late 'Y'
+    # still adds the name to the whitelist (for next time) but does NOT show it now;
+    # a late 'N' needs no action (the texter was already told on expiry).
+    expired = load_expired_approvals()
+    exp_rec = _pick(expired)
+    if exp_rec is not None:
+        save_expired_approvals(expired)
+        name = exp_rec.get('name', '')
+        if decision == 'approve':
+            add_name_to_whitelist(name)
+            log_message(exp_rec.get('texter_phone', ''), exp_rec.get('body', ''), name, "admin_approved_late")
+            _send_feature_reply(admin_ctx, f"Too late to show '{name}', but added it to the whitelist for next time.", 'admin_ack')
+            logging.info(f"✅ Admin approved '{name}' after timeout - whitelisted only, not shown")
+        else:  # late deny
+            _send_feature_reply(admin_ctx, f"'{name}' already expired - no action taken.", 'admin_ack')
+            logging.info(f"🚫 Admin denied '{name}' after timeout - no action")
+        return True
+
+    logging.info("Admin Y/N received but no pending (or recently expired) approvals; ignoring")
+    return True  # consume it so a bare 'Y'/'N' is never shown as a name
 
 def _maybe_request_admin_approval(name, from_number, body):
     """When admin approval is active, create a pending request, text the admin the
@@ -5173,7 +5241,7 @@ def index():
                         <!-- Live Name Approval - Google Voice only; shown/hidden by updateSourceUI() -->
                         <div id="gv_approval" style="display:none;">
                             <hr style="border:none; border-top:1px solid #444; margin:16px 0;">
-                            <h3 style="margin:14px 0 6px;">🙋 Live Name Approval (optional)</h3>
+                            <h3 style="margin:14px 0 6px;">🙋 Live Name Approval (optional) <span id="live_approval_wl_state" style="font-size:13px; font-weight:normal; margin-left:6px; padding:2px 8px; border-radius:10px;"></span></h3>
                             <p class="help-text" style="margin:4px 0 8px;">When the whitelist is on and the show is live, a texter who sends a name that is not on the list can be approved by you over text - reply <strong>Y</strong> to add and show it, or <strong>N</strong> to deny. Leave the number blank to turn this off. The messages are configured on the <strong>SMS Responses</strong> tab.</p>
 
                             <div id="admin_bootstrap_banner" style="{{ '' if (config.get('admin_phone','') and not admin_ctx_seeded) else 'display:none;' }} background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:6px; padding:10px 14px; margin-bottom:10px; font-size:13px;">
@@ -5183,7 +5251,7 @@ def index():
                                 ✅ Admin phone connected - live approvals are active.
                             </div>
                             <div id="admin_thread_warning" style="{{ '' if config.get('admin_phone','') else 'display:none;' }} background:#fdecea; border:1px solid #f44336; color:#b71c1c; border-radius:6px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
-                                🔴 <strong>Keep the thread:</strong> the Google Voice conversation with the admin number must stay in your Gmail inbox for approvals to work. If you delete or archive it, this reverts to "Action needed" and you will need to text <strong>admin</strong> again to reconnect.
+                                🔴 <strong>Keep the "admin" email:</strong> Google Voice does not have the ability to send outbound messages without an exisiting email thread. The "admin" email must remain in your Gmail inbox for approvals to work.
                             </div>
 
                             <label>Admin Phone Number:</label>
@@ -5363,7 +5431,7 @@ def index():
 
                         <hr style="border:none; border-top:1px solid #444; margin:15px 0;">
 
-                        <label class="toggle-switch"><input type="checkbox" id="use_whitelist" {{ 'checked' if config.get('use_whitelist', False) else '' }} onchange="updateFormatRules(); checkFiltersState(); checkWhitelistResponseState(); saveConfig();"><span class="toggle-slider"></span></label>
+                        <label class="toggle-switch"><input type="checkbox" id="use_whitelist" {{ 'checked' if config.get('use_whitelist', False) else '' }} onchange="updateFormatRules(); checkFiltersState(); checkWhitelistResponseState(); updateLiveApprovalWlState(); saveConfig();"><span class="toggle-slider"></span></label>
                         <label class="checkbox-label">Enable Name Whitelist - only allow approved names</label><br>
                         <button class="view-btn" onclick="location.href='/whitelist'" style="margin-top:6px;">📋 Manage Whitelist</button>
                     </div>
@@ -6433,26 +6501,23 @@ def index():
 
                 <!-- Live Name Approval messages - only shown when an Admin Phone Number is
                      set (configured on the Message Source tab) and Google Voice is the source. -->
-                <div id="admin_approval_responses" class="resp-row enabled" style="{{ '' if (config.get('message_source','twilio')=='google_voice' and config.get('admin_phone','')) else 'display:none;' }}">
+                <div id="admin_approval_responses" class="resp-row enabled" style="{{ '' if (config.get('message_source','twilio')=='google_voice' and config.get('admin_phone','')) else 'display:none;' }} margin-left:22px; border-left:3px solid #90caf9;">
                     <div class="resp-toggle" style="font-weight:bold;">🙋 Live Name Approval (Google Voice)</div>
-                    <p class="help-text" style="margin:2px 0 12px;">Used when a texter sends a name that is not on the whitelist and you have an <strong>Admin Phone Number</strong> set (Message Source tab). You get the Y/N prompt; the texter gets the waiting message, then the Success response (Y) or the denied message (N).</p>
+                    <p class="help-text" style="margin:2px 0 12px;">An extension of the <strong>Not on Whitelist</strong> response above: when a texter sends a name that is not on the whitelist and you have an <strong>Admin Phone Number</strong> set (Message Source tab), you get the Y/N prompt; the texter gets the waiting message, then the Success response (Y). A denial (N) or a timeout sends the <strong>Not on Whitelist</strong> response above.</p>
 
                     <label>Approval Timeout (minutes):</label>
                     <input type="number" id="admin_approval_timeout_mins" min="0" max="1440" value="{{ config.get('admin_approval_timeout_mins', 10) }}" style="width:90px;">
                     <p class="help-text" style="margin:3px 0 14px;">How long a request waits for your Y/N before it expires (the texter then gets the Not-on-Whitelist reply). 0 = never expire.</p>
 
                     <label>Text to Admin (approval prompt):</label>
-                    <textarea id="admin_approval_prompt" rows="2">{{ config.get('admin_approval_prompt', "New name request: '{name}'. Reply Y to add and show it, or N to deny.") }}</textarea>
+                    <textarea id="admin_approval_prompt" rows="2">{{ config.get('admin_approval_prompt', "New name request: '{name}'. Reply Y to add to whitelist, or N to deny.") }}</textarea>
                     <p class="help-text" style="margin:3px 0 2px;">Use <code>{name}</code> where the requested name should appear.</p>
                     <button type="button" class="reset-default-btn" style="opacity:1; pointer-events:auto;" onclick="resetAdminField('admin_approval_prompt')">↩️ Reset to default</button>
 
                     <label style="margin-top:14px; display:block;">Reply to Texter (while waiting):</label>
-                    <textarea id="response_whitelist_pending" rows="2">{{ config.get('response_whitelist_pending', "Your name isn't on our whitelist, please wait a few moments while I get permission to display.") }}</textarea>
+                    <textarea id="response_whitelist_pending" rows="2">{{ config.get('response_whitelist_pending', "Your name isn't on our whitelist, please wait a few moments while I get approval to display.") }}</textarea>
                     <button type="button" class="reset-default-btn" style="opacity:1; pointer-events:auto;" onclick="resetAdminField('response_whitelist_pending')">↩️ Reset to default</button>
-
-                    <label style="margin-top:14px; display:block;">Reply to Texter (if denied):</label>
-                    <textarea id="response_admin_denied" rows="2">{{ config.get('response_admin_denied', 'Sorry, this name has not been added to our whitelist.') }}</textarea>
-                    <button type="button" class="reset-default-btn" style="opacity:1; pointer-events:auto;" onclick="resetAdminField('response_admin_denied')">↩️ Reset to default</button>
+                    <p class="help-text" style="margin:10px 0 2px;">If you deny the request (or it times out), the texter is sent the <strong>Not on Whitelist</strong> response above - there is no separate "denied" message.</p>
                 </div>
 
                 <script>
@@ -6460,9 +6525,8 @@ def index():
                     // Source tab; these message fields live here. Wire everything after the
                     // DOM is parsed so elements in both tabs exist.
                     window._adminDefaults = {
-                        admin_approval_prompt: "New name request: '{name}'. Reply Y to add and show it, or N to deny.",
-                        response_whitelist_pending: "Your name isn't on our whitelist, please wait a few moments while I get permission to display.",
-                        response_admin_denied: "Sorry, this name has not been added to our whitelist."
+                        admin_approval_prompt: "New name request: '{name}'. Reply Y to add to whitelist, or N to deny.",
+                        response_whitelist_pending: "Your name isn't on our whitelist, please wait a few moments while I get approval to display."
                     };
                     function resetAdminField(id) {
                         var el = document.getElementById(id);
@@ -6471,24 +6535,50 @@ def index():
                         if (window.saveConfig) saveConfig();
                     }
                     // Show the approval messages only when Google Voice is the source AND an
-                    // admin phone is set; keep the banner's shown number in sync live.
+                    // admin phone is set. The banner's shown number and the warning/connected
+                    // state are NOT updated from this live-typed value - they are driven by the
+                    // SAVED number the server reports in pollAdminStatus(), so nothing flips
+                    // while you are still typing.
                     function updateAdminApprovalUI() {
                         var isGV = ((document.getElementById('message_source')||{}).value) === 'google_voice';
                         var phone = (((document.getElementById('admin_phone')||{}).value) || '').trim();
                         var sec = document.getElementById('admin_approval_responses');
                         if (sec) sec.style.display = (isGV && phone) ? '' : 'none';
-                        var num = document.getElementById('admin_banner_num');
-                        if (num) num.textContent = phone;
                     }
                     window.updateAdminApprovalUI = updateAdminApprovalUI;
+                    // Reflect the live whitelist on/off state next to the Live Name Approval
+                    // heading (approvals only matter while the whitelist is on).
+                    function updateLiveApprovalWlState() {
+                        var el = document.getElementById('live_approval_wl_state');
+                        var wl = document.getElementById('use_whitelist');
+                        if (!el || !wl) return;
+                        if (wl.checked) {
+                            el.textContent = 'Whitelist is On';
+                            el.style.background = '#e8f5e9'; el.style.color = '#2e7d32';
+                        } else {
+                            el.textContent = 'Whitelist is Off';
+                            el.style.background = '#fdecea'; el.style.color = '#b71c1c';
+                        }
+                    }
+                    window.updateLiveApprovalWlState = updateLiveApprovalWlState;
                     document.addEventListener('DOMContentLoaded', function() {
                         var ap = document.getElementById('admin_phone');
                         if (ap) {
-                            ap.addEventListener('input', updateAdminApprovalUI);
-                            ap.addEventListener('change', function(){ updateAdminApprovalUI(); if (window.saveConfig) saveConfig(); });
-                            ap.addEventListener('blur', function(){ if (window.saveConfig) saveConfig(); });
+                            // No 'input' handler on purpose: the banner/connected state must not
+                            // react to each keystroke. Only when the number is committed (change
+                            // or blur) do we save it and, once the save lands, re-check - the
+                            // server then runs its mailbox scan against the new number.
+                            function onAdminPhoneCommitted() {
+                                updateAdminApprovalUI();
+                                if (window.saveConfig) saveConfig();
+                                // saveConfig is debounced ~300ms then POSTs; give it time to land
+                                // so the status poll scans the just-saved number.
+                                setTimeout(pollAdminStatus, 1200);
+                            }
+                            ap.addEventListener('change', onAdminPhoneCommitted);
+                            ap.addEventListener('blur', onAdminPhoneCommitted);
                         }
-                        ['admin_approval_timeout_mins','admin_approval_prompt','response_whitelist_pending','response_admin_denied'].forEach(function(id) {
+                        ['admin_approval_timeout_mins','admin_approval_prompt','response_whitelist_pending'].forEach(function(id) {
                             var el = document.getElementById(id);
                             if (!el) return;
                             el.addEventListener('change', function(){ if (window.saveConfig) saveConfig(); });
@@ -6502,17 +6592,28 @@ def index():
                             var threadWarn = document.getElementById('admin_thread_warning');
                             if (!banner || !connected) return;
                             var isGV = ((document.getElementById('message_source')||{}).value) === 'google_voice';
-                            var phone = (((document.getElementById('admin_phone')||{}).value) || '').trim();
-                            if (!isGV || !phone) {
+                            if (!isGV) {
                                 banner.style.display = 'none'; connected.style.display = 'none';
                                 if (threadWarn) threadWarn.style.display = 'none';
                                 return;
                             }
-                            // The "keep the thread" reminder stands whenever an admin phone is set.
-                            if (threadWarn) threadWarn.style.display = 'block';
                             fetch('/api/plugin/admin-approval-status')
                                 .then(function(r){ return r.json(); })
                                 .then(function(d){
+                                    // Drive the shown number and the warning/connected state from
+                                    // the SAVED number the server reports - never the live input -
+                                    // so nothing flips while the operator is still typing, and the
+                                    // server has already run its mailbox scan for this number.
+                                    var savedPhone = ((d && d.admin_phone) || '').toString().trim();
+                                    var num = document.getElementById('admin_banner_num');
+                                    if (num) num.textContent = savedPhone;
+                                    if (!savedPhone) {
+                                        banner.style.display = 'none'; connected.style.display = 'none';
+                                        if (threadWarn) threadWarn.style.display = 'none';
+                                        return;
+                                    }
+                                    // The "keep the thread" reminder stands once a number is saved.
+                                    if (threadWarn) threadWarn.style.display = 'block';
                                     if (d && d.seeded) { banner.style.display = 'none'; connected.style.display = 'block'; }
                                     else { banner.style.display = 'block'; connected.style.display = 'none'; }
                                 })
@@ -6521,6 +6622,7 @@ def index():
                         setInterval(pollAdminStatus, 5000);
                         pollAdminStatus();
                         updateAdminApprovalUI();
+                        updateLiveApprovalWlState();
                     });
                 </script>
 
@@ -8697,7 +8799,6 @@ var _saveTimer = null;
                     data.admin_approval_timeout_mins = parseInt((document.getElementById('admin_approval_timeout_mins')||{}).value) || 0;
                     data.admin_approval_prompt = (document.getElementById('admin_approval_prompt')||{}).value || '';
                     data.response_whitelist_pending = (document.getElementById('response_whitelist_pending')||{}).value || '';
-                    data.response_admin_denied = (document.getElementById('response_admin_denied')||{}).value || '';
                 }
 
                 // Only persist the per-line fonts once loadFonts() has actually
@@ -9153,6 +9254,11 @@ def update_config():
             _ctx = load_admin_ctx()
             if _ctx and _normalize_phone(_ctx.get('phone', '')) != config['admin_phone']:
                 clear_admin_ctx()
+            # The number was just entered/changed - let the very next status poll run a
+            # fresh mailbox scan instead of waiting out the seed/verify throttle windows.
+            global _last_admin_seed_scan, _last_admin_verify_scan
+            _last_admin_seed_scan = 0.0
+            _last_admin_verify_scan = 0.0
         if 'admin_approval_timeout_mins' in new_config:
             try:
                 _to = int(new_config.get('admin_approval_timeout_mins', 10) or 0)

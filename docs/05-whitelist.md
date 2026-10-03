@@ -59,7 +59,8 @@ When a visitor texts a name that is **not** on the whitelist, the plugin texts *
 | Your reply | What happens |
 |------------|--------------|
 | **Y** | The name is added to the whitelist and shown; the visitor gets the success reply. |
-| **N** | The name is denied; the visitor gets the "denied" reply. |
+| **N** | The name is denied; the visitor gets the standard **Not on Whitelist** reply. There is no separate "denied" message. |
+| *(no reply in time)* | The request expires after the **Approval Timeout** and the visitor gets the Not on Whitelist reply. Reply **Y** later and the name is still added to the whitelist for next time, but it is **not** shown now. |
 
 It runs **only while the show is live**. Leave the Admin Phone Number blank to turn it off.
 
@@ -81,7 +82,7 @@ Approvals work **only while the Google Voice conversation with your admin number
 - The banner reverts to "Action needed."
 - Approvals pause until you text **admin** again to re-establish the thread.
 
-The visitor-facing "please wait" / "denied" messages and the prompt you receive are all editable on the **SMS Responses** tab.
+The approval prompt and the visitor-facing "please wait" message are editable on the **SMS Responses** tab, grouped under the **Not on Whitelist** response (which is also what a denial or a timeout sends).
 
 ---
 

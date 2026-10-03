@@ -212,9 +212,10 @@ function tml_shot($file, $alt) {
     <div class="ref"><table>
         <tr><th>You receive</th><th>You reply</th><th>What happens</th></tr>
         <tr><td>"Approve ‘Name’? Y/N"</td><td><strong>Y</strong></td><td>Name is added to the whitelist and shown; the visitor gets the success reply.</td></tr>
-        <tr><td>(same)</td><td><strong>N</strong></td><td>Name is denied; the visitor gets the "denied" reply.</td></tr>
+        <tr><td>(same)</td><td><strong>N</strong></td><td>Name is denied; the visitor gets the standard <strong>Not on Whitelist</strong> reply. There is no separate "denied" message.</td></tr>
+        <tr><td>(no reply in time)</td><td>—</td><td>The request expires after the <strong>Approval Timeout</strong> and the visitor gets the Not on Whitelist reply. If you reply <strong>Y</strong> later, the name is still added to the whitelist for next time, but it is <strong>not</strong> shown now.</td></tr>
     </table></div>
-    <p>The exact prompt and the visitor-facing "please wait" / "denied" messages are editable on the <em>SMS Responses</em> tab.</p>
+    <p>The approval prompt and the visitor-facing "please wait" message are editable on the <em>SMS Responses</em> tab, under the <strong>Not on Whitelist</strong> response (which is also what a denial sends).</p>
     </section>
 
     <!-- ================= BACKUP & RESTORE ================= -->

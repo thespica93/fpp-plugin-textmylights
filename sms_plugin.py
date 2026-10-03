@@ -7682,6 +7682,38 @@ def index():
             }
             reconcileRole();
             setInterval(reconcileRole, 5000);
+            // Remote: live-refresh the names content list when the master adds/removes content,
+            // so the Display dropdown/list updates without a manual reload. Only acts on
+            // MEMBERSHIP changes (ids added/removed/reordered) so it never stomps layout edits
+            // to a surviving selected item.
+            function refreshRemoteNamesContent() {
+                var _rs = document.getElementById('plugin_role');
+                if (!_rs || _rs.value !== 'remote') return;
+                fetch('/api/plugin/names-content').then(function(r){return r.json();}).then(function(d){
+                    if (!d || !d.is_remote || !Array.isArray(d.names_content_list)) return;
+                    var serverIds = d.names_content_list.map(function(it){ return it.content || ''; });
+                    var cur = window._namesContentList || [];
+                    var localIds = cur.map(function(it){ return it.content || ''; });
+                    if (JSON.stringify(serverIds) === JSON.stringify(localIds)) return;  // no membership change
+                    var prevSelId = (cur[window._namesSelectedIndex] || {}).content || null;
+                    var byId = {}; cur.forEach(function(it){ if (it.content) byId[it.content] = it; });
+                    // Rebuild in server order, keeping the local item (with any in-progress
+                    // layout edits) for surviving ids; use the server item for new ids.
+                    window._namesContentList = d.names_content_list.map(function(it){ return byId[it.content] || it; });
+                    var lst = window._namesContentList;
+                    var newIdx = -1;
+                    if (prevSelId) { for (var i = 0; i < lst.length; i++) { if (lst[i].content === prevSelId) { newIdx = i; break; } } }
+                    if (newIdx < 0) newIdx = (lst.length > 0) ? 0 : -1;
+                    var selectionChanged = (newIdx < 0) || !prevSelId || (lst[newIdx] && lst[newIdx].content !== prevSelId);
+                    window._namesSelectedIndex = newIdx;
+                    if (typeof window.renderNamesList === 'function') window.renderNamesList();
+                    // Only reset the editor if the selected content actually changed (so edits
+                    // to a surviving selected item are not stomped).
+                    if (selectionChanged && newIdx >= 0 && typeof applyLayoutToEditor === 'function') applyLayoutToEditor(lst[newIdx]);
+                    if (typeof window.toggleFseqPreview === 'function') window.toggleFseqPreview();
+                }).catch(function(){});
+            }
+            setInterval(refreshRemoteNamesContent, 10000);
             _init('liveStatus', updateLiveStatus);
             setInterval(updateLiveStatus, 5000);
             for (var _li = 0; _li < 4; _li++) { updateLineSpeedRowVisibility(_li); updateLineOrientationRowVisibility(_li); }
@@ -9355,6 +9387,17 @@ def api_plugin_masters():
         "masters": [{"address": m["address"], "name": m["name"], "phone": m["phone"],
                      "selected": (m["address"] == sel)} for m in masters],
     })
+
+
+@app.route('/api/plugin/names-content')
+def api_plugin_names_content():
+    """Remote (browser-facing): the current master-synced names content list, so the open
+    Display page can live-refresh its dropdown/list when the master adds/removes content
+    without a manual reload. Normal token auth."""
+    if not is_remote():
+        return jsonify({"is_remote": False, "names_content_list": []})
+    return jsonify({"is_remote": True,
+                    "names_content_list": config.get('names_content_list', []) or []})
 
 
 @app.route('/api/plugin/select-master', methods=['POST'])

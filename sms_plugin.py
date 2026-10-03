@@ -96,6 +96,9 @@ PROFANITY_STRIKES_FILE = os.path.join(PLUGIN_DATA_DIR, "profanity_strikes.json")
 # outstanding name requests awaiting an admin Y/N. See _maybe_handle_admin_message().
 ADMIN_CTX_FILE          = os.path.join(PLUGIN_DATA_DIR, "admin_reply_ctx.json")
 PENDING_APPROVALS_FILE  = os.path.join(PLUGIN_DATA_DIR, "pending_approvals.json")
+# The word the operator texts from the admin phone to connect/seed the reply context.
+# It is reserved: it is never shown on the display (see process_incoming_message).
+ADMIN_CONNECT_KEYWORD   = "admin"
 
 FSEQ_SEQUENCE_PATH = '/home/fpp/media/sequences'
 FPP_VIDEOS_PATH    = '/home/fpp/media/videos'
@@ -2564,6 +2567,7 @@ def admin_ctx_is_seeded():
     return _normalize_phone(ctx.get('phone', '')) == _normalize_phone(admin_phone)
 
 _last_admin_seed_scan = 0.0
+_last_admin_verify_scan = 0.0
 
 def seed_admin_ctx_from_inbox(force=False):
     """Seed the admin reply context from the most recent Google Voice email ALREADY in
@@ -2631,6 +2635,67 @@ def seed_admin_ctx_from_inbox(force=False):
     except Exception as e:
         logging.error(f"Admin ctx inbox scan failed: {e}")
         return False
+    finally:
+        if imap is not None:
+            try:
+                imap.logout()
+            except Exception:
+                pass
+
+def verify_admin_ctx(force=False):
+    """Confirm the stored admin reply context still points at a live email thread.
+
+    The reply context only works while the Google Voice conversation email is still
+    in the inbox - if the operator deletes (or archives out) that thread, Google
+    Voice can no longer route our reply and approvals silently break. We re-check
+    cheaply by searching the inbox DIRECTLY for the stored Message-ID (no full
+    mailbox scan). If it is gone, we clear the context so the setup banner reverts
+    and the operator knows to text the number again.
+
+    Returns True if the context is still valid (or could not be checked this call),
+    False only when we positively confirmed the thread no longer exists and cleared
+    it. Transient failures (no network, Gmail hiccup) NEVER clear a good context."""
+    global _last_admin_verify_scan
+    if config.get('message_source') != 'google_voice':
+        return False
+    if not admin_ctx_is_seeded():
+        return False
+    now = time.time()
+    if not force and (now - _last_admin_verify_scan) < 60:
+        return True  # recently verified; assume still good
+    _last_admin_verify_scan = now
+
+    ctx = load_admin_ctx()
+    msgid = (ctx or {}).get('message_id', '').strip()
+    if not msgid:
+        # No Message-ID to target (older/partial context). Can't verify directly;
+        # leave it in place rather than risk clearing a working context.
+        return True
+
+    email_addr = config.get('gv_email', '').strip()
+    app_pw = config.get('gv_app_password', '').strip()
+    if not email_addr or not app_pw:
+        return True  # can't check without credentials; don't clear
+
+    imap = None
+    try:
+        imap = imaplib.IMAP4_SSL(config.get('gv_imap_host', 'imap.gmail.com'), timeout=20)
+        imap.login(email_addr, app_pw)
+        imap.select(config.get('gv_imap_folder', 'INBOX'))
+        # Targeted header search for exactly the stored thread message.
+        typ, data = imap.uid('search', None, 'HEADER', 'Message-ID', msgid)
+        found = (typ == 'OK' and data and data[0] and len(data[0].split()) > 0)
+        if found:
+            return True
+        # Positively absent from the inbox: the thread was deleted/archived.
+        clear_admin_ctx()
+        logging.warning("Admin reply thread no longer in inbox - cleared context; "
+                        "live approvals paused until the admin texts the number again")
+        return False
+    except Exception as e:
+        # Network/Gmail error - do NOT clear a context we simply couldn't reach.
+        logging.error(f"Admin ctx verify failed (leaving context in place): {e}")
+        return True
     finally:
         if imap is not None:
             try:
@@ -2762,6 +2827,13 @@ def _maybe_handle_admin_message(from_number, body):
         ctx['phone'] = _normalize_phone(admin_phone)
         save_admin_ctx(ctx)
         logging.info("🔑 Admin reply context refreshed from inbound admin message")
+
+    # The dedicated connect keyword: texting "admin" is the suggested way to seed the
+    # reply context on first setup. It is consumed here (never shown as a name) - the
+    # save above already captured the context we needed from it.
+    if body.strip().lower() == ADMIN_CONNECT_KEYWORD:
+        logging.info("🔗 Admin connect keyword received - reply context established")
+        return True
 
     decision, target = _parse_admin_decision(body)
     if decision is None:
@@ -4370,6 +4442,14 @@ def process_incoming_message(from_number, body):
     if _maybe_handle_admin_message(from_number, body):
         return
 
+    # "admin" is the reserved connect keyword (how the admin phone seeds its reply
+    # context). It must never reach the display as a name - drop it silently for any
+    # sender. The admin's own "admin" text is already consumed above; this covers a
+    # non-admin (or not-yet-configured) sender texting the same word.
+    if body.strip().lower() == ADMIN_CONNECT_KEYWORD:
+        logging.info(f"🙈 Ignored reserved 'admin' keyword from {from_number[-4:]}")
+        return
+
     # Phone 'tapback' reactions and emoji-only replies to the display
     # notification are courtesy responses, not name submissions - silently
     # drop them so we never fire an invalid_format (or any) auto-response.
@@ -5085,25 +5165,31 @@ def index():
 
                             <button class="test-btn" onclick="testGoogleVoice()">🔌 Test Google Voice Connection</button>
                             <div id="gv_test_result" style="margin-top: 8px; font-size: 14px;"></div>
+                        </div>
 
+                        <label>Poll Interval (seconds):</label>
+                        <input type="number" id="poll_interval" value="{{ config.poll_interval }}" min="1" max="60">
+
+                        <!-- Live Name Approval - Google Voice only; shown/hidden by updateSourceUI() -->
+                        <div id="gv_approval" style="display:none;">
                             <hr style="border:none; border-top:1px solid #444; margin:16px 0;">
                             <h3 style="margin:14px 0 6px;">🙋 Live Name Approval (optional)</h3>
                             <p class="help-text" style="margin:4px 0 8px;">When the whitelist is on and the show is live, a texter who sends a name that is not on the list can be approved by you over text - reply <strong>Y</strong> to add and show it, or <strong>N</strong> to deny. Leave the number blank to turn this off. The messages are configured on the <strong>SMS Responses</strong> tab.</p>
 
                             <div id="admin_bootstrap_banner" style="{{ '' if (config.get('admin_phone','') and not admin_ctx_seeded) else 'display:none;' }} background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:6px; padding:10px 14px; margin-bottom:10px; font-size:13px;">
-                                ⚠️ <strong>Action needed:</strong> text your Google Voice number once from the admin phone (<span id="admin_banner_num">{{ config.get('admin_phone','') }}</span>) to turn on live approvals. You will not receive approval requests until you do. This clears automatically once a text from your number is found (we also check your existing Google Voice history in Gmail).
+                                ⚠️ <strong>Action needed:</strong> from the admin phone (<span id="admin_banner_num">{{ config.get('admin_phone','') }}</span>), text the word <strong>admin</strong> to your Google Voice number to connect. You will not receive approval requests until you do. The word "admin" is never shown on the display. This clears automatically once your text is found (we also check your existing Google Voice history in Gmail).
                             </div>
                             <div id="admin_connected_note" style="{{ '' if (config.get('admin_phone','') and admin_ctx_seeded) else 'display:none;' }} background:#e8f5e9; border:1px solid #66bb6a; color:#2e7d32; border-radius:6px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
                                 ✅ Admin phone connected - live approvals are active.
                             </div>
+                            <div id="admin_thread_warning" style="{{ '' if config.get('admin_phone','') else 'display:none;' }} background:#fdecea; border:1px solid #f44336; color:#b71c1c; border-radius:6px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
+                                🔴 <strong>Keep the thread:</strong> the Google Voice conversation with the admin number must stay in your Gmail inbox for approvals to work. If you delete or archive it, this reverts to "Action needed" and you will need to text <strong>admin</strong> again to reconnect.
+                            </div>
 
                             <label>Admin Phone Number:</label>
                             <input type="text" id="admin_phone" value="{{ config.get('admin_phone','') }}" placeholder="e.g. 5551234567" style="width:100%; max-width:260px;">
-                            <p class="help-text" style="margin:3px 0 0;">The phone that approves names. It must have texted your Google Voice number at least once (any message) so replies can reach it.</p>
+                            <p class="help-text" style="margin:3px 0 0;">The phone that approves names. From it, text the word <strong>admin</strong> to your Google Voice number once so replies can reach it.</p>
                         </div>
-
-                        <label>Poll Interval (seconds):</label>
-                        <input type="number" id="poll_interval" value="{{ config.poll_interval }}" min="1" max="60">
                     </div>
 
                     <!-- FPP Display Settings: shown on BOTH master and remote (the overlay
@@ -6413,10 +6499,17 @@ def index():
                         function pollAdminStatus() {
                             var banner = document.getElementById('admin_bootstrap_banner');
                             var connected = document.getElementById('admin_connected_note');
+                            var threadWarn = document.getElementById('admin_thread_warning');
                             if (!banner || !connected) return;
                             var isGV = ((document.getElementById('message_source')||{}).value) === 'google_voice';
                             var phone = (((document.getElementById('admin_phone')||{}).value) || '').trim();
-                            if (!isGV || !phone) { banner.style.display = 'none'; connected.style.display = 'none'; return; }
+                            if (!isGV || !phone) {
+                                banner.style.display = 'none'; connected.style.display = 'none';
+                                if (threadWarn) threadWarn.style.display = 'none';
+                                return;
+                            }
+                            // The "keep the thread" reminder stands whenever an admin phone is set.
+                            if (threadWarn) threadWarn.style.display = 'block';
                             fetch('/api/plugin/admin-approval-status')
                                 .then(function(r){ return r.json(); })
                                 .then(function(d){
@@ -8750,8 +8843,10 @@ var _saveTimer = null;
                 var isGV = srcEl.value === 'google_voice';
                 var tw = document.getElementById('twilio_creds');
                 var gv = document.getElementById('gv_creds');
+                var appr = document.getElementById('gv_approval');
                 if (tw) tw.style.display = isGV ? 'none' : '';
                 if (gv) gv.style.display = isGV ? '' : 'none';
+                if (appr) appr.style.display = isGV ? '' : 'none';
 
                 // Point the help link at the selected provider's config section.
                 // This page runs inside the plugin's own service (port 5000), so a
@@ -9089,8 +9184,14 @@ def api_admin_approval_status():
     phone has texted the Google Voice number yet (so there is a reply context to
     text them). Polled only while the banner is showing."""
     seeded = admin_ctx_is_seeded()
-    # Self-heal from existing texting history: if not seeded yet, scan the Gmail inbox
-    # for a prior Google Voice message from the admin number (throttled internally).
+    # If currently seeded, re-validate that the admin's email thread still exists.
+    # verify_admin_ctx() searches directly for the stored Message-ID (throttled) and
+    # clears the context if the thread was deleted, so the banner reverts on its own.
+    if seeded:
+        seeded = verify_admin_ctx()
+    # Self-heal from existing texting history: if not seeded (never was, or the thread
+    # was just cleared), scan the Gmail inbox for another Google Voice message from the
+    # admin number (throttled internally).
     if not seeded and config.get('admin_phone', '').strip():
         seeded = seed_admin_ctx_from_inbox()
     return jsonify({

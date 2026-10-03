@@ -21,6 +21,7 @@ function tml_shot($file, $alt) {
     .sms-help { max-width: 1100px; margin: 0 auto; font-family: Arial, sans-serif; line-height: 1.5; }
     .sms-help h2 { color: #4CAF50; border-bottom: 2px solid #4CAF50; padding-bottom: 6px; margin-top: 0; }
     .sms-help h3 { color: #333; margin-top: 18px; }
+    .sms-help h4 { color: #333; margin-top: 14px; margin-bottom: 4px; font-size: 15px; }
     .sms-help ol { margin: 10px 0 10px 4px; padding-left: 20px; }
     .sms-help ol li { margin-bottom: 7px; }
     .sms-help code { background: #f0f0f0; padding: 1px 5px; border-radius: 3px; font-size: 13px; }
@@ -192,6 +193,28 @@ function tml_shot($file, $alt) {
         <tr><td>On whitelist <span style="color:#888;">(if on)</span></td><td>Reply: not on list</td></tr>
         <tr><td>✅ Added to display queue</td><td>Reply: success</td></tr>
     </table></div>
+
+    <h3 id="live-approval">🙋 Live Name Approval over text <span style="color:#888;font-weight:normal;">(Google Voice only)</span></h3>
+    <p>With the whitelist <strong>on</strong>, a name that is not on the list is normally rejected. Live Name Approval lets you say "yes" from your phone instead: when a visitor texts a name you have not pre-approved, the plugin texts <strong>you</strong> the name and you reply <strong>Y</strong> to add it and show it, or <strong>N</strong> to deny it. It runs only while the show is live, and only for Google Voice. Leave the Admin Phone Number blank to turn it off.</p>
+
+    <h4>Connecting your admin phone</h4>
+    <p>Google Voice can only <em>send</em> a text by replying inside an existing email conversation. So before it can text you, your admin phone has to start one:</p>
+    <ol>
+        <li>In <em>Settings → Message Source → Google Voice</em>, enter your <strong>Admin Phone Number</strong>.</li>
+        <li>From that phone, text the word <strong>admin</strong> to your Google Voice number.</li>
+        <li>The yellow "Action needed" banner turns green ("Admin phone connected") within a few seconds.</li>
+    </ol>
+    <div class="note">The word <strong>admin</strong> is reserved — it is used only to connect and is <strong>never shown on the display</strong>. The plugin also scans your existing Google Voice history in Gmail, so if you have already texted the number from your admin phone it may connect on its own. If you change the admin number, text <strong>admin</strong> again from the new phone.</div>
+
+    <div class="warn"><strong>🔴 Keep the conversation thread.</strong> Approvals work only while that Google Voice conversation with your admin number is still in your Gmail <strong>inbox</strong>. If you delete it or archive it out of the inbox, the plugin notices (it re-checks that exact message periodically), the banner reverts to "Action needed," and approvals pause until you text <strong>admin</strong> again.</div>
+
+    <h4>Approving names during the show</h4>
+    <div class="ref"><table>
+        <tr><th>You receive</th><th>You reply</th><th>What happens</th></tr>
+        <tr><td>"Approve ‘Name’? Y/N"</td><td><strong>Y</strong></td><td>Name is added to the whitelist and shown; the visitor gets the success reply.</td></tr>
+        <tr><td>(same)</td><td><strong>N</strong></td><td>Name is denied; the visitor gets the "denied" reply.</td></tr>
+    </table></div>
+    <p>The exact prompt and the visitor-facing "please wait" / "denied" messages are editable on the <em>SMS Responses</em> tab.</p>
     </section>
 
     <!-- ================= BACKUP & RESTORE ================= -->

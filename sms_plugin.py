@@ -29,14 +29,14 @@ import email
 import email.utils
 from email.header import decode_header, make_header
 
-# PIL/Pillow for pixel-accurate text rendering (optional — falls back to FPP text API if unavailable)
+# PIL/Pillow for pixel-accurate text rendering (optional - falls back to FPP text API if unavailable)
 try:
     from PIL import Image, ImageDraw, ImageFont
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
 
-# zstandard for FSEQ zstd decompression (optional — install via fpp_install.sh)
+# zstandard for FSEQ zstd decompression (optional - install via fpp_install.sh)
 try:
     import zstandard as _zstd_mod
     ZSTD_AVAILABLE = True
@@ -66,13 +66,16 @@ PLUGIN_DIR      = os.path.dirname(os.path.abspath(__file__))
 # All runtime data lives under one plugin folder
 PLUGIN_DATA_DIR = "/home/fpp/media/plugin.fpp-textmylights"
 CONFIG_FILE     = os.path.join(PLUGIN_DATA_DIR, "plugin.json")
-# Credentials live in their own owner-only directory — NOT in plugin.json, logs,
+# Credentials live in their own owner-only directory - NOT in plugin.json, logs,
 # or backups. (True at-rest secrecy isn't possible on this hardware: an
 # unattended service must be able to read them on boot, so any key would sit on
 # the same card. This keeps them out of the shared config and off casual view.)
 SECRETS_DIR     = os.path.join(PLUGIN_DATA_DIR, "secrets")
 SECRETS_FILE    = os.path.join(SECRETS_DIR, "credentials.json")
 SECRET_KEYS     = ("twilio_auth_token", "gv_app_password")
+# Box-specific Master/Remote identity - kept on THIS Pi across a config import unless the
+# user ticks "import mode" (so restoring settings never silently flips a master to a remote).
+MODE_KEYS       = ("plugin_role", "selected_master")
 # Placeholder shown in a saved secret field. Submitting it unchanged means
 # "keep the stored secret"; clearing the field to empty means "remove it";
 # any other value updates it. Must be something a real secret never equals.
@@ -89,13 +92,13 @@ FPP_VIDEOS_PATH    = '/home/fpp/media/videos'
 FPP_IMAGES_PATH    = '/home/fpp/media/images'
 # Root helper (installed by fpp_install.sh) that makes a single
 # /dev/shm/FPP-Model-Data-<model> file writable by the fpp user. The plugin may only
-# invoke THIS via sudo — never `chmod` directly — so a model name can never be abused to
+# invoke THIS via sudo - never `chmod` directly - so a model name can never be abused to
 # change permissions on files outside /dev/shm. The helper re-validates its argument.
 SHM_PERMS_HELPER = '/usr/local/bin/tml-fix-shm-perms'
 FPP_PLAYLISTS_PATH = '/home/fpp/media/playlists'
 FPP_CONFIG_DIR     = '/home/fpp/media/config'
 # FPP keeps Pixel Overlay Models (the "matrix" the plugin draws text onto) as
-# "Other" channel outputs, stored in co-other.json — NOT a dedicated
+# "Other" channel outputs, stored in co-other.json - NOT a dedicated
 # model-overlays.json (which doesn't exist on standard installs). Confirmed via
 # the on-device overlay diagnostic. Export finds the file dynamically
 # (_find_overlay_config_file) so it adapts if a setup differs.
@@ -146,17 +149,22 @@ try:
 except OSError:
     pass
 
-# Setup logging — ensure the log directory exists, then write to file + stderr
+# Setup logging - ensure the log directory exists, then write to file + stderr.
+# The file handler is size-bounded (rotating) so the log can never fill the SD card:
+# ~4 MB hard ceiling total (1 MB x 3 backups + the active file), oldest lines discarded.
+import logging.handlers
 _log_handlers = [logging.StreamHandler()]  # stderr always available via nohup
 try:
-    _log_handlers.append(logging.FileHandler(LOG_FILE))
+    _log_handlers.append(logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=1_000_000, backupCount=3))
 except Exception:
     pass  # directory may not exist on some FPP installs; stderr is the fallback
 logging.basicConfig(
-    level=logging.ERROR,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=_log_handlers
 )
+# Keep Flask/werkzeug at ERROR so its per-request access logging stays off (that WOULD be chatty).
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
 import flask.cli
@@ -167,7 +175,7 @@ app = Flask(__name__)
 # (which may include .fseq content) are the only large uploads; 512 MB is generous
 # for those while still bounding the damage. Applies to every endpoint.
 app.config['MAX_CONTENT_LENGTH'] = 512 * 1024 * 1024
-# Independent guard on a config-import bundle's *decompressed* size — a small .zip can
+# Independent guard on a config-import bundle's *decompressed* size - a small .zip can
 # expand to gigabytes (a "zip bomb"). Reject bundles whose contents exceed this.
 MAX_IMPORT_UNCOMPRESSED = 1024 * 1024 * 1024  # 1 GB total across all entries
 
@@ -175,11 +183,11 @@ MAX_IMPORT_UNCOMPRESSED = 1024 * 1024 * 1024  # 1 GB total across all entries
 # NETWORK ACCESS CONTROL
 # ----------------------------------------------------------------------------
 # The service binds 0.0.0.0:5000 so the FPP web UI (running on a different
-# machine — the user's browser) can iframe it. To keep anonymous LAN clients
+# machine - the user's browser) can iframe it. To keep anonymous LAN clients
 # from reading credentials / controlling the show, every *network* request must
 # carry an access token. The token is minted here and read by the FPP-served
 # PHP pages (ui.php / messages.php), which are already behind FPP's own web
-# server — so only someone who can load the FPP UI ever receives it.
+# server - so only someone who can load the FPP UI ever receives it.
 #
 # Loopback (127.0.0.1) is always trusted: the scheduler's activate/deactivate
 # scripts and any on-box tooling reach us over localhost and need no token.
@@ -192,7 +200,7 @@ _AUTH_COOKIE = "tml_token"
 
 def _load_or_create_token():
     """Reuse a persisted token across restarts so already-open UIs keep working;
-    mint one on first run. The token file is world-readable on purpose — the FPP
+    mint one on first run. The token file is world-readable on purpose - the FPP
     web server (whatever user it runs as) must read it to embed in the UI, and
     local read access already implies full access to the plaintext config."""
     try:
@@ -222,16 +230,24 @@ def _require_access_token():
     if request.remote_addr in ('127.0.0.1', '::1'):
         return None
     if os.path.exists(AUTH_DISABLE_FILE):
-        # Debug escape hatch — the whole UI is wide open to anyone on the network.
+        # Debug escape hatch - the whole UI is wide open to anyone on the network.
         # Warn (throttled) so this is never silently left enabled in production.
         global _auth_disabled_warned_at
         _now = time.time()
         if _now - _auth_disabled_warned_at > 300:
             _auth_disabled_warned_at = _now
-            logging.warning("⚠️  AUTH DISABLED (.disable_auth present) — the plugin is "
+            logging.warning("⚠️  AUTH DISABLED (.disable_auth present) - the plugin is "
                             "reachable WITHOUT a token by anyone on the network. Remove "
                             f"{AUTH_DISABLE_FILE} to re-enable access control.")
         return None
+    # Inter-instance calls (a master pushing to a remote's /api/tml/* endpoints) come from
+    # another FPP on the LAN, so the per-instance access token won't match. Instead of a
+    # shared secret, trust the FPP MultiSync peers this box already recognizes (the same
+    # systems FPP itself syncs with), plus any manually-listed remote IPs.
+    if request.path.startswith('/api/tml/'):
+        if request.remote_addr in _trusted_tml_peers():
+            return None
+        return Response("Not a recognized FPP peer.", status=403, mimetype='text/plain')
     # First load carries the token as a query param (embedded by the FPP UI);
     # we then set a cookie so subsequent same-origin fetches are authorized.
     qtok = request.args.get('token', '')
@@ -285,12 +301,22 @@ _fpp_data_cache = None
 _fpp_data_cache_time = 0
 _FPP_DATA_CACHE_TTL = 60  # seconds
 
-# FPP runs locally — always use localhost
+# FPP runs locally - always use localhost
 FPP_HOST = 'http://127.0.0.1'
 
 # Default configuration
 DEFAULT_CONFIG = {
     "enabled": False,
+    # Multi-instance role (independent of FPP's own player/remote mode). "" = not yet
+    # chosen → resolved to a default from the FPP instance's mode on first load.
+    #   "master" - polls Twilio/GV, filters, responds, counts, AND pushes the chosen
+    #              name/content to remotes (the single selection authority).
+    #   "remote" - never polls/responds/counts; only renders name + content pushed by the
+    #              master, using this instance's OWN overlay model / fonts / layout.
+    "plugin_role": "",
+    # Remote-side: the address of the ONE master this remote syncs to (chosen in the UI).
+    # Empty = auto (follow the first master found, accept pushes from any trusted peer).
+    "selected_master": "",
     # Which inbound message source feeds the pipeline: "twilio" | "google_voice"
     "message_source": "twilio",
     "twilio_account_sid": "",
@@ -339,12 +365,12 @@ DEFAULT_CONFIG = {
     "text_color": "#FF0000",
     "text_font": "FreeSans",
     "text_position": "Center",
-    "message_template": "Merry Christmas {name}!",  # legacy — migrated to message_lines on load
+    "message_template": "Merry Christmas {name}!",  # legacy - migrated to message_lines on load
     "message_lines": ["Merry Christmas", "{name}!", "", ""],
     # Each box is the MAX area a line can render into; font size auto-fits to it
     # (largest size where the actual message text fits both w and h), then is
     # centered within the box. x/y < 0 means auto-position (horizontally centered /
-    # vertically stacked among the other auto-positioned lines) — w/h are always
+    # vertically stacked among the other auto-positioned lines) - w/h are always
     # concrete since there's no "auto size" for the fit target itself.
     "line_boxes": [{"x": -1, "y": -1, "w": 300, "h": 60} for _ in range(4)],
     "line_colors": ["", "", "", ""],
@@ -413,7 +439,440 @@ _active_waiting_content = ''
 rotator_thread = None
 stop_rotator = True               # pause flag: True = don't switch/idle. Cleared on start.
 rotator_lock = threading.Lock()   # serializes a rotator switch against stop_show_playback teardown
-_fseq_dur_cache = {}              # {seq_name: duration_seconds} — parsed FSEQ lengths
+_fseq_dur_cache = {}              # {seq_name: duration_seconds} - parsed FSEQ lengths
+
+# ── Multi-instance (master/remote) ──────────────────────────────────────────
+_resolved_role = None            # cached effective role ("master"/"remote")
+_remotes_cache = []              # cached list of remote base URLs the master pushes to
+_remotes_cache_time = 0.0
+_masters_cache = []              # remote side: cached detailed master list [{address,base,name,phone}]
+_masters_cache_time = 0.0
+_REMOTES_CACHE_TTL = 30          # seconds between MultiSync discovery refreshes
+_tml_peer_cache = set()          # cached IPs allowed to call /api/tml/* (FPP peers)
+_tml_peer_cache_time = 0.0
+_remote_last_state = None        # remote side: last state applied from a master push
+_remote_last_state_time = 0.0
+_remote_stop_requested = False   # remote side: True once the master broadcasts Stop. A remote
+                                 # never self-stops on its local `enabled` flag (it's usually
+                                 # never activated locally - only the master is Started); it
+                                 # keeps returning to its waiting content between names and
+                                 # only tears the show down when the master says to.
+_last_fpp_mode = None            # last-seen FPP mode role, for the auto-follow watcher
+_fpp_mode_detail = ''            # raw values _fpp_mode_role() last read, for on-device diagnosis
+
+
+def _fpp_mode_role():
+    """The plugin role implied by FPP's CURRENT mode - 'remote' ONLY when FPP is unambiguously
+    in remote mode, else 'master' - or None when FPP can't be reached (so callers don't act on a
+    transient failure). Primary source is the fppMode setting (string 'remote'/'player'/'master'
+    or legacy int); falls back to /api/fppd/status (mode==8=REMOTE / mode_name). Records what it
+    read in _fpp_mode_detail for on-device diagnosis. 'master' is the safe/full-function default
+    for anything that is NOT clearly remote."""
+    global _fpp_mode_detail
+    # Primary: the fppMode setting value itself (most direct).
+    try:
+        r = requests.get(f"{FPP_HOST}/api/settings/fppMode", timeout=3)
+        if r.status_code == 200:
+            txt = (r.text or '').strip().strip('"').lower()   # "remote" / "player" / "master" / legacy int
+            if txt:
+                # Remote ONLY when it's exactly 'remote' or the legacy remote int (8) - never a
+                # loose substring match (which could trip on unexpected payloads). Everything
+                # else (player, master, bridge, numbers) is treated as master.
+                role = 'remote' if (txt == 'remote' or txt == '8') else 'master'
+                _fpp_mode_detail = f"settings/fppMode={txt!r} → {role}"
+                return role
+    except Exception as e:
+        logging.debug(f"_fpp_mode_role: settings/fppMode unavailable ({e})")
+    # Fallback: fppd status.
+    try:
+        r = requests.get(f"{FPP_HOST}/api/fppd/status", timeout=3)
+        if r.status_code == 200:
+            data = r.json()
+            mode_name = str(data.get('mode_name', '')).strip().lower()
+            mode_int = data.get('mode')
+            if mode_name == 'remote' or mode_int == 8:
+                _fpp_mode_detail = f"fppd/status mode_name={mode_name!r} mode={mode_int} → remote"
+                return 'remote'
+            if mode_name or mode_int is not None:
+                _fpp_mode_detail = f"fppd/status mode_name={mode_name!r} mode={mode_int} → master"
+                return 'master'
+    except Exception as e:
+        logging.debug(f"_fpp_mode_role: fppd status unavailable ({e})")
+    _fpp_mode_detail = 'FPP unreachable'
+    return None
+
+
+def _default_plugin_role():
+    """Suggested default role from FPP's mode; 'master' (the full-function role, correct for a
+    lone box) when FPP can't be reached."""
+    return _fpp_mode_role() or 'master'
+
+
+def fpp_mode_watcher():
+    """Track the FPP instance's own player/remote mode for diagnostics and as the AUTO default.
+
+    IMPORTANT: this NEVER overwrites an explicit plugin_role. A manually chosen 'master'/'remote'
+    is authoritative and persists across restarts/updates. FPP mode only supplies the default
+    when plugin_role is unset (''): on an FPP mode change in that auto case we just invalidate
+    the cached resolution so get_plugin_role() re-reads FPP's mode. (Earlier this clobbered the
+    saved role on every startup - the first read looked like a 'change' - which flipped a manual
+    master back to remote on each plugin update.)"""
+    global _last_fpp_mode, _resolved_role
+    logging.info("🔀 FPP mode watcher started (diagnostic + auto-default only; manual role wins)")
+    while True:
+        try:
+            role = _fpp_mode_role()   # None while FPP is unreachable → leave _last_fpp_mode as-is
+            if role is not None and role != _last_fpp_mode:
+                first = _last_fpp_mode is None
+                _last_fpp_mode = role
+                logging.info(f"🔀 FPP mode {'at startup' if first else 'changed to'}: '{role}' "
+                             f"[{_fpp_mode_detail}] | explicit plugin_role="
+                             f"{(config.get('plugin_role') or '')!r} (explicit always wins)")
+                # Only auto mode (no explicit choice) follows FPP; re-resolve lazily. An explicit
+                # plugin_role is left completely untouched.
+                if not (config.get('plugin_role') or '').strip():
+                    _resolved_role = None
+        except Exception as e:
+            logging.debug(f"fpp_mode_watcher: {e}")
+        time.sleep(10)
+
+
+def get_plugin_role():
+    """Effective role. An explicit config choice ('master'/'remote') always wins; when unset,
+    fall back to the FPP-mode default (resolved once, then cached for the process)."""
+    global _resolved_role
+    role = (config.get('plugin_role') or '').strip().lower()
+    if role in ('master', 'remote'):
+        return role
+    if _resolved_role is None:
+        _resolved_role = _default_plugin_role()
+    return _resolved_role
+
+
+def is_remote():
+    return get_plugin_role() == 'remote'
+
+
+def _instance_label():
+    """Friendly name this instance advertises to remotes: the FPP hostname."""
+    try:
+        import socket
+        return socket.gethostname()
+    except Exception:
+        return 'FPP'
+
+
+def _instance_phone_label():
+    """The source number/account this instance texts from, shown to remotes so they can tell
+    multiple masters apart. Twilio → the phone number; Google Voice → the Gmail address."""
+    if config.get('message_source', 'twilio') == 'google_voice':
+        return (config.get('gv_email') or '').strip()
+    return (config.get('twilio_phone_number') or '').strip()
+
+
+def _local_ips():
+    """Best-effort set of this host's own addresses, to exclude self from discovery."""
+    import socket
+    ips = {'127.0.0.1', '::1', 'localhost'}
+    try:
+        hn = socket.gethostname()
+        ips.add(hn)
+        ips.add(socket.gethostbyname(hn))
+    except Exception:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ips.add(s.getsockname()[0])
+        s.close()
+    except Exception:
+        pass
+    return ips
+
+
+def _parse_host_port(target, default_port=5000):
+    """Split a manual 'host' or 'host:port' target into (host, port)."""
+    t = str(target).strip()
+    if not t:
+        return None
+    if ':' in t and not t.startswith('['):
+        host, _, p = t.rpartition(':')
+        try:
+            return host, int(p)
+        except ValueError:
+            return t, default_port
+    return t, default_port
+
+
+def _multisync_addresses():
+    """IP addresses of the FPP systems this box knows via MultiSync (excludes self)."""
+    addrs = set()
+    try:
+        r = requests.get(f"{FPP_HOST}/api/fppd/multiSyncSystems", timeout=3)
+        if r.status_code == 200:
+            data = r.json()
+            systems = data.get('systems') if isinstance(data, dict) else data
+            local = _local_ips()
+            for s in (systems or []):
+                if not isinstance(s, dict):
+                    continue
+                a = str(s.get('address') or s.get('ip') or '').strip()
+                if a and a not in local and not s.get('local'):
+                    addrs.add(a)
+    except Exception as e:
+        logging.debug(f"_multisync_addresses: failed ({e})")
+    return addrs
+
+
+def _trusted_tml_peers():
+    """IPs allowed to call this instance's /api/tml/* endpoints WITHOUT the access token: the
+    FPP MultiSync peers this box already recognizes. No shared secret - trust follows FPP's
+    own sync network. Cached briefly."""
+    global _tml_peer_cache, _tml_peer_cache_time
+    now = time.time()
+    if _tml_peer_cache and (now - _tml_peer_cache_time) < _REMOTES_CACHE_TTL:
+        return _tml_peer_cache
+    peers = set(_multisync_addresses())
+    _tml_peer_cache, _tml_peer_cache_time = peers, now
+    return peers
+
+
+def _probe_plugin_peers():
+    """Probe the FPP MultiSync systems and group the ones running this plugin by role:
+    {'master': [base URLs], 'remote': [base URLs]}. Discovery is automatic - peers come from
+    FPP's own MultiSync network, so the user only has to set each FPP's player/remote mode."""
+    out = {'master': [], 'remote': []}
+    seen = set()
+    for host in _multisync_addresses():
+        h = f"[{host}]" if (':' in host and not host.startswith('[')) else host  # bracket IPv6
+        base = f"http://{h}:5000"
+        if base in seen:
+            continue
+        seen.add(base)
+        try:
+            pr = requests.get(f"{base}/api/tml/ping", timeout=2)
+            if pr.status_code == 200:
+                j = pr.json()
+                if j.get('plugin') == 'textmylights' and j.get('role') in out:
+                    out[j['role']].append(base)
+        except Exception:
+            pass  # unreachable / not the plugin - skip silently
+    return out
+
+
+def discover_remotes(force=False):
+    """Base URLs of peer instances the master should push to - ONLY FPP systems running this
+    plugin in REMOTE mode. Cached briefly."""
+    global _remotes_cache, _remotes_cache_time
+    now = time.time()
+    if not force and _remotes_cache and (now - _remotes_cache_time) < _REMOTES_CACHE_TTL:
+        return _remotes_cache
+    remotes = _probe_plugin_peers()['remote']
+    _remotes_cache, _remotes_cache_time = remotes, now
+    return remotes
+
+
+def discover_masters(force=False):
+    """Remote side: detailed list of reachable plugin MASTERS on the FPP MultiSync network,
+    each `{address, base, name, phone}`, so the UI can present them for selection. Cached
+    briefly (same TTL as the other discovery caches)."""
+    global _masters_cache, _masters_cache_time
+    now = time.time()
+    if not force and _masters_cache and (now - _masters_cache_time) < _REMOTES_CACHE_TTL:
+        return _masters_cache
+    found = []
+    for host in _multisync_addresses():
+        h = f"[{host}]" if (':' in host and not host.startswith('[')) else host  # bracket IPv6
+        base = f"http://{h}:5000"
+        try:
+            pr = requests.get(f"{base}/api/tml/ping", timeout=2)
+            if pr.status_code == 200:
+                j = pr.json()
+                if j.get('plugin') == 'textmylights' and j.get('role') == 'master':
+                    found.append({"address": host, "base": base,
+                                  "name": j.get('name') or host, "phone": j.get('phone') or ''})
+        except Exception:
+            pass  # unreachable / not the plugin - skip silently
+    found.sort(key=lambda m: (m.get('name') or '').lower())
+    _masters_cache, _masters_cache_time = found, now
+    return found
+
+
+def _selected_master_addr():
+    """Remote: the address of the plugin master this remote is pinned to ('' = none).
+    The raw config value may be '' (never chosen - eligible for auto-select), 'none' (the user
+    explicitly cleared the pin), or an address; both '' and 'none' mean "follow nobody now"."""
+    raw = (config.get('selected_master') or '').strip()
+    return '' if raw.lower() == 'none' else raw
+
+
+def _maybe_auto_select_single_master():
+    """Remote convenience: when the user has never chosen a master (selected_master unset) and
+    exactly ONE plugin master is on the network, pin to it automatically. With 0 or 2+ masters,
+    or once the user has explicitly picked/cleared ('none'), leave the choice alone. Returns
+    True if it just auto-pinned."""
+    if not is_remote():
+        return False
+    raw = (config.get('selected_master') or '').strip()
+    if raw:   # already pinned to an address, or explicitly 'none' - don't auto-choose
+        return False
+    masters = discover_masters()
+    if len(masters) == 1:
+        config['selected_master'] = masters[0]['address']
+        save_config()
+        logging.info(f"🔗 Remote: auto-selected the only plugin master ({masters[0]['address']})")
+        return True
+    return False
+
+
+def _find_master_base():
+    """Remote: base URL of the selected master to sync FROM. A remote follows a master ONLY when
+    one is explicitly picked in the 'Sync to Master' list - no master selected means follow
+    nobody (returns None). Also None when the chosen master isn't currently reachable."""
+    sel = _selected_master_addr()
+    if not sel:
+        return None  # nothing picked → the remote follows no master
+    for m in discover_masters():
+        if m['address'] == sel:
+            return m['base']
+    return None  # pinned master not currently reachable - don't silently follow another
+
+
+def sync_names_content_from_master():
+    """Remote: mirror the MASTER's Name Display content ids into this instance's own list so
+    the Display-tab dropdown shows them - but only content that physically exists on this
+    remote, and KEEPING this remote's own per-content overlay layout (different model size /
+    positioning). Returns True if the list changed."""
+    if not is_remote():
+        return False
+    # If exactly one master exists and nothing's been chosen yet, pin to it automatically.
+    _maybe_auto_select_single_master()
+    # Still no master picked (0 or 2+ masters, or explicitly cleared) → mirror nothing. Clear
+    # any list a previous selection left behind so the Display dropdown shows nothing.
+    if not _selected_master_addr():
+        if config.get('names_content_list'):
+            config['names_content_list'] = []
+            config['names_content_rr_index'] = -1
+            save_config()
+            logging.info("🔁 Remote: no master selected - cleared synced name content list")
+            return True
+        return False
+    master = _find_master_base()
+    if not master:
+        return False   # selected master unreachable → keep current (don't wipe saved layouts)
+    try:
+        r = requests.get(f"{master}/api/tml/content-list", timeout=3)
+        if r.status_code != 200:
+            return False
+        master_ids = [c for c in (r.json().get('names') or []) if c]
+    except Exception as e:
+        logging.debug(f"sync_names_content_from_master: fetch failed ({e})")
+        return False
+
+    # Only content physically present on THIS remote, in the master's order.
+    target = [c for c in master_ids if _content_exists_locally(c)]
+    lst = config.get('names_content_list', []) or []
+    existing = {it.get('content'): it for it in lst if it.get('content')}
+    new_list = []
+    for cid in target:
+        if cid in existing:
+            new_list.append(existing[cid])          # keep this remote's own layout
+        else:
+            item = _names_item_defaults()
+            item['content'] = cid
+            item['message_lines'] = ['{name}', '', '', '']   # sensible starting layout
+            new_list.append(item)
+
+    if [it.get('content') for it in new_list] != [it.get('content') for it in lst]:
+        config['names_content_list'] = new_list
+        if int(config.get('names_content_rr_index', -1) or -1) >= len(new_list):
+            config['names_content_rr_index'] = -1
+        save_config()
+        logging.info(f"🔁 Remote: synced Name content list from master ({len(new_list)} item(s) "
+                     f"present locally)")
+        return True
+    return False
+
+
+def remote_content_sync():
+    """Remote daemon: keep the Name-content dropdown mirrored from the master (~every 15s)."""
+    while True:
+        try:
+            if is_remote():
+                sync_names_content_from_master()
+        except Exception as e:
+            logging.debug(f"remote_content_sync: {e}")
+        time.sleep(15)
+
+
+def push_state_to_remotes(payload):
+    """Master only: fire-and-forget the chosen display state (name + content id + timing -
+    never sequence bytes) to every confirmed remote. Runs in a background thread so it never
+    delays the master's own display or SMS reply. No-op unless this instance is the master."""
+    if get_plugin_role() != 'master':
+        return
+
+    def _worker():
+        try:
+            remotes = discover_remotes()
+            if not remotes:
+                return
+            for base in remotes:
+                try:
+                    requests.post(f"{base}/api/tml/state", json=payload, timeout=2)
+                except Exception as e:
+                    logging.debug(f"push to {base} failed: {e}")
+        except Exception as e:
+            logging.warning(f"push_state_to_remotes error: {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _push_waiting_state():
+    """Master: tell remotes which waiting/background content is now active (a 'waiting event'
+ - content id only, no name) so they mirror the master's rotation pick. The remote ignores
+    a push for content it's already showing, so re-sending is harmless."""
+    if get_plugin_role() != 'master':
+        return
+    push_state_to_remotes({'content': _active_waiting_content})
+
+
+def broadcast_stop_to_remotes():
+    """Master only: tell every confirmed remote to Stop too, so pressing Stop on the master
+    takes the whole show down. Fire-and-forget in a background thread; each remote drains its
+    own queue (any names the master already pushed finish first) before going dark."""
+    if get_plugin_role() != 'master':
+        return
+
+    def _worker():
+        try:
+            remotes = discover_remotes()
+            for base in remotes:
+                try:
+                    requests.post(f"{base}/api/tml/stop", timeout=2)
+                except Exception as e:
+                    logging.debug(f"stop broadcast to {base} failed: {e}")
+        except Exception as e:
+            logging.warning(f"broadcast_stop_to_remotes error: {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def master_sync_heartbeat():
+    """Master: re-assert the current WAITING content to remotes every few seconds so a remote
+    that joins late (rebooted, powered on after the master) converges to the same background.
+    Only fires while idle (no name showing); the remote no-ops if already on that content."""
+    while True:
+        try:
+            # Only re-assert while the master's own show is live and idle. A STOPPED or
+            # draining master must not keep pushing waiting content - that would re-arm a
+            # remote that was just told to stop (the waiting push clears its stop flag).
+            if (get_plugin_role() == 'master' and config.get('enabled', False)
+                    and currently_displaying is None):
+                push_state_to_remotes({'content': _active_waiting_content})
+        except Exception as e:
+            logging.debug(f"master_sync_heartbeat: {e}")
+        time.sleep(10)
 
 
 def _coerce_len(seq, n, fill):
@@ -676,7 +1135,7 @@ def load_config():
             logging.info("Migrated line_positions/line_font_sizes to line_boxes")
 
         # names_content_list (v2.7) starts EMPTY on upgrade. While empty, send_to_fpp
-        # falls back to the flat name_display_playlist + global text layout — identical to
+        # falls back to the flat name_display_playlist + global text layout - identical to
         # the pre-list behavior, and the existing UI keeps working. The list is seeded from
         # the flat config (via _names_item_from_flat_config) the first time the new
         # per-content UI loads with content configured, at which point it becomes
@@ -756,7 +1215,7 @@ def save_config():
 
 def _response_is_muted(message_type):
     """Return True when this auto-response must not send right now because a
-    companion setting has "greyed it out" — WITHOUT touching the stored toggle.
+    companion setting has "greyed it out" - WITHOUT touching the stored toggle.
 
     The config page disables (greys) a response row when another setting makes
     it moot, but deliberately never unchecks the toggle, so the user's on/off
@@ -764,10 +1223,10 @@ def _response_is_muted(message_type):
     path honors the mute at runtime, while plugin.json keeps the last state. The
     toggle only ever changes when the user changes it.
 
-      - Any response over Twilio — the plugin has no Twilio reply path, so the
+ - Any response over Twilio - the plugin has no Twilio reply path, so the
         SMS Responses tab is hidden and nothing may send.
-      - rate-limited when Max Messages Per Phone is 0 (nobody is ever limited).
-      - duplicate    when Allow Duplicate Names is on (never a duplicate).
+ - rate-limited when Max Messages Per Phone is 0 (nobody is ever limited).
+ - duplicate    when Allow Duplicate Names is on (never a duplicate).
 
     Invalid-Format / Too-Long / Not-Whitelisted are intentionally NOT muted
     here: the single-name path greys them under the whitelist, but the
@@ -787,12 +1246,12 @@ def _resolve_font_path(font_name):
     """Resolve a font name to its file path (fc-match, falling back to a manual
     directory search), cached per name for the process lifetime. Box-fit sizing
     calls this many times per line (once per binary-search step) at different
-    sizes, so the expensive part — locating the file — only happens once."""
+    sizes, so the expensive part - locating the file - only happens once."""
     if font_name in _font_path_cache:
         return _font_path_cache[font_name]
 
     path = None
-    # Use fontconfig (fc-match) — same resolution FPP uses for its font names
+    # Use fontconfig (fc-match) - same resolution FPP uses for its font names
     try:
         import subprocess
         result = subprocess.run(
@@ -972,7 +1431,7 @@ def _render_oriented_text_strip(text, font_name, box_w, box_h, color_rgb, orient
 def _sudo_fix_shm_perms(model_name):
     """Make /dev/shm/FPP-Model-Data-<model_name> writable by the fpp user via the root
     helper. The model name is validated here (no path separators) AND again inside the
-    helper, so it can never be used to chmod a file outside /dev/shm — this is the guard
+    helper, so it can never be used to chmod a file outside /dev/shm - this is the guard
     against the old broad `sudo chmod 666 /dev/shm/FPP-Model-Data-*` sudoers rule that a
     crafted model name could abuse for path traversal. Returns True on success."""
     if not model_name or '/' in model_name or '\x00' in model_name or '\n' in model_name:
@@ -998,7 +1457,7 @@ def render_to_shm(line_items, model_name, width, height):
     and orientation.
     line_items: list of (text, box_x, box_y, box_w, box_h, color_hex, font_name, orientation)
     tuples. orientation is 'horizontal' (default), 'vertical_rotated', or 'vertical_stacked'
-    — see _render_oriented_text_strip. Font size is auto-fit to (box_w, box_h), then the
+ - see _render_oriented_text_strip. Font size is auto-fit to (box_w, box_h), then the
     rendered text is centered within the box. box_x/box_y == -1 auto-centers the box itself
     on the canvas (vertical stacking among lines is resolved by the caller before this
     point, so box_y is normally already concrete). -1 is an exact sentinel, not just any
@@ -1037,7 +1496,7 @@ def render_to_shm(line_items, model_name, width, height):
         except PermissionError:
             # FPP creates shm files as root after postStart.sh runs.
             # Use the sudoers rule added by fpp_install.sh to fix permissions once.
-            logging.warning(f"render_to_shm: permission denied on {shm_path} — fixing via helper")
+            logging.warning(f"render_to_shm: permission denied on {shm_path} - fixing via helper")
             if _sudo_fix_shm_perms(model_name):
                 _write()
             else:
@@ -1122,7 +1581,7 @@ def render_image_to_shm(image_path, model_name, width, height, line_items=None):
 
 
 def _overlay_model_dims():
-    """Resolve the overlay model's pixel size (width, height) — the resolution every image
+    """Resolve the overlay model's pixel size (width, height) - the resolution every image
     and text frame is force-scaled to. Prefer the values stored in config (written when the
     model is picked in the UI); if either is missing/0 (stale or never-saved config), fetch
     the model's real dimensions live from FPP and cache them back so image waiting content
@@ -1186,7 +1645,7 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
         are always horizontal glyphs -- the point of that movement is horizontal travel.
         See _render_oriented_text_strip.
         movement 'L2R'/'R2L'/'T2B'/'B2T': text height is auto-fit to box_h (width
-            unconstrained — the text is expected to be wider than the box and travels
+            unconstrained - the text is expected to be wider than the box and travels
             across it). The box also acts as a clipping viewport: text is only visible
             while passing through it, appearing to enter and exit at the box's own edges
             rather than the full canvas edges.
@@ -1257,7 +1716,7 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
             entry = {'strip': strip, 'tw': tw, 'th': th, 'movement': movement,
                      'clip': (resolved_bx, resolved_by, box_w, box_h)}
             # Over an image background, paste only the glyph (mask out the strip's black
-            # box). Over a black background (no image) leave it None — pasting opaquely on
+            # box). Over a black background (no image) leave it None - pasting opaquely on
             # black is identical and cheaper.
             entry['mask'] = _text_coverage_mask(strip) if bg_image_path else None
             # speed == 0 is the "fit to display time" sentinel: instead of a fixed
@@ -1299,7 +1758,7 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
                 entry['loop_start'] = float(resolved_by + box_h) if movement == 'B2T' else float(resolved_by - th)
                 entry['loop_end']   = float(resolved_by - th) if movement == 'B2T' else float(resolved_by + box_h)
                 entry['step_px'] = _step_for(entry['loop_start'], entry['loop_end'])
-            else:  # Center — fixed, centered in box
+            else:  # Center - fixed, centered in box
                 entry['dx'] = resolved_bx + max(0, (box_w - tw) // 2)
                 entry['dy'] = resolved_by + max(0, (box_h - th) // 2)
             prepared.append(entry)
@@ -1329,7 +1788,7 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
 
         def _clip_paste(frame, strip, mask, src_x, src_y, dst_x, dst_y, vis_w, vis_h, clip):
             # Intersect the paste rect with the line's own box, so scrolling text is only
-            # visible while inside it — entering/exiting at the box edges instead of the
+            # visible while inside it - entering/exiting at the box edges instead of the
             # full canvas edges. `mask` (or None) is cropped the same way so text lands on
             # an image background without its black box.
             cx, cy, cw, ch = clip
@@ -1345,7 +1804,7 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
         def _pos_at(e, t):
             # Closed-form scroll position at elapsed time `t` (seconds). Motion is a pure
             # function of wall-clock time, NOT an accumulator advanced per frame, so a slow
-            # or dropped render frame never causes stutter or drift — the text is always
+            # or dropped render frame never causes stutter or drift - the text is always
             # exactly where it belongs for time t. Velocity (px/sec) = per-frame step * fps.
             loop_len = abs(e['loop_end'] - e['loop_start']) or 1.0
             dist = e['step_px'] * fps * t            # total distance travelled by time t
@@ -1468,7 +1927,7 @@ def parse_fseq_header(filepath):
     frame_count       = struct.unpack_from('<I', raw, 14)[0]
     step_time_ms      = raw[18]
     compression_type  = raw[19] & 0x0F   # 0=none, 1=zlib, 2=zstd (per xLights: 1=zstd)
-    # Offset 20 and 21 are separate uint8 fields — NOT a single uint16
+    # Offset 20 and 21 are separate uint8 fields - NOT a single uint16
     num_comp_blocks   = raw[20]           # uint8
     num_sparse_ranges = raw[21]           # uint8
 
@@ -1489,14 +1948,14 @@ def parse_fseq_header(filepath):
         effective_ctype = 2   # override: treat as zstd
         logging.info(
             "FSEQ: header says uncompressed (byte 19 = 0) but zstd magic detected "
-            "at chan_data_offset — treating as zstd (FSEQ v2.2 quirk)"
+            "at chan_data_offset - treating as zstd (FSEQ v2.2 quirk)"
         )
     elif (compression_type == 0 and len(_probe) >= 2 and _probe[0] == 0x78
           and ((_probe[0] << 8 | _probe[1]) % 31 == 0)):
         effective_ctype = 1   # override: treat as zlib
         logging.info(
             "FSEQ: header says uncompressed (byte 19 = 0) but zlib magic detected "
-            "at chan_data_offset — treating as zlib (FSEQ v2.2 quirk)"
+            "at chan_data_offset - treating as zlib (FSEQ v2.2 quirk)"
         )
 
     # ── Compression block table ───────────────────────────────────────────────
@@ -1523,7 +1982,7 @@ def parse_fseq_header(filepath):
     # offset 32 + num_comp_blocks*8, each entry 6 bytes (uint24 + uint24).
     # For auto-detected zstd (v2.2): the block table fills the entire header
     # space; sparse ranges are absent or in a variable-length metadata section
-    # we don't parse here — discard to ensure direct channel offset mapping.
+    # we don't parse here - discard to ensure direct channel offset mapping.
     sparse_ranges = []
     if effective_ctype == compression_type and num_sparse_ranges > 0:
         # Standard v2.0: sparse ranges at fixed position after comp block table
@@ -1562,7 +2021,7 @@ def _sparse_ch_to_frame_byte(sparse_ranges, logical_ch):
     table, packed together in range order.  Returns None if the channel falls in a gap.
     """
     if not sparse_ranges:
-        return logical_ch   # Dense FSEQ — direct 1:1 mapping
+        return logical_ch   # Dense FSEQ - direct 1:1 mapping
 
     byte_offset = 0
     for sr in sparse_ranges:
@@ -1598,7 +2057,7 @@ def read_fseq_frame(header, frame_idx, start_ch, ch_count):
         if ch_count <= total_ch:
             frame_byte = 0
             logging.warning(
-                f"FSEQ preview: start_ch {start_ch} not in sparse ranges — "
+                f"FSEQ preview: start_ch {start_ch} not in sparse ranges - "
                 f"falling back to frame byte 0 (model-specific FSEQ?)"
             )
         else:
@@ -1612,7 +2071,7 @@ def read_fseq_frame(header, frame_idx, start_ch, ch_count):
         # channel_count, but start_ch > 0).  Read from the top instead.
         logging.warning(
             f"FSEQ preview: model range {start_ch}..{start_ch + ch_count} exceeds "
-            f"file channel_count {total_ch} — treating as model-specific export "
+            f"file channel_count {total_ch} - treating as model-specific export "
             f"(frame byte 0)"
         )
         frame_byte = 0
@@ -1625,10 +2084,10 @@ def read_fseq_frame(header, frame_idx, start_ch, ch_count):
             return f.read(ch_count)
 
     elif ctype in (1, 2):
-        # zlib (1) or zstd (2) block compression — same block table layout
+        # zlib (1) or zstd (2) block compression - same block table layout
         if ctype == 2 and not ZSTD_AVAILABLE:
             raise ValueError(
-                "FSEQ uses zstd compression — run fpp_install.sh to install the "
+                "FSEQ uses zstd compression - run fpp_install.sh to install the "
                 "'zstandard' library, then restart the plugin."
             )
 
@@ -1661,7 +2120,7 @@ def read_fseq_frame(header, frame_idx, start_ch, ch_count):
             try:
                 decompressed = dctx.decompress(compressed)
             except Exception:
-                # Fallback with an explicit size cap — allow up to 64 frames per
+                # Fallback with an explicit size cap - allow up to 64 frames per
                 # block, which is far more than any real FSEQ uses (typically 1-4).
                 decompressed = dctx.decompress(
                     compressed, max_output_size=total_ch * 64
@@ -1722,7 +2181,7 @@ def get_fpp_sequences():
         return []
 
 def get_fpp_videos():
-    # Video/Play Media support disabled — only .fseq, images, and playlists accepted
+    # Video/Play Media support disabled - only .fseq, images, and playlists accepted
     return []
 
 
@@ -1798,13 +2257,13 @@ def _enumerate_fonts():
     (PixelOverlay.cpp findFonts()) checks for a dot in the entry name before
     checking whether it's a directory, so any font subdirectory without a dot
     in its name (e.g. fonts-freefont-ttf's freefont/) is skipped and the scan
-    never recurses into it — the endpoint then returns null. os.walk has no
+    never recurses into it - the endpoint then returns null. os.walk has no
     such bug.
 
     Returns a list of {'name', 'category', 'path'} dicts. Bundled fonts under
     this plugin's fonts/<category>/ (e.g. fonts/christmas/) are tagged with
     that category name; everything else found in the OS font directories is
-    tagged "System". Names are deduped — a bundled font also gets copied into
+    tagged "System". Names are deduped - a bundled font also gets copied into
     /usr/local/share/fonts by fpp_install.sh (so FPP's own scanner and
     fc-match can find it), so without dedup it would show up twice.
     """
@@ -1850,8 +2309,8 @@ def _enumerate_fonts():
 
 def get_fpp_fonts():
     """Font list for the config UI: name + category, grouped for <optgroup>
-    rendering. .ttf/.pfb names are derived the same way FPP does — filename
-    minus a fixed 4-char extension — so they match what FPP's native overlay
+    rendering. .ttf/.pfb names are derived the same way FPP does - filename
+    minus a fixed 4-char extension - so they match what FPP's native overlay
     text API expects. .otf is also included (needed for some bundled fonts,
     e.g. Christmas Garland) even though FPP's own scanner doesn't recognize it
     (isTTF() checks .ttf only): PIL renders .otf fine, and PIL is the plugin's
@@ -2069,7 +2528,7 @@ def send_sms_text(to_phone, text, message_type="message"):
 def _sanitize_header(value):
     """Strip CR/LF (and stray control chars) from values that come from an inbound
     email before they go into outbound reply headers, so a crafted message can't
-    inject extra headers (LOW-2 — email header injection)."""
+    inject extra headers (LOW-2 - email header injection)."""
     if value is None:
         return ''
     return re.sub(r'[\r\n\x00]+', ' ', str(value)).strip()
@@ -2079,7 +2538,7 @@ def send_gv_reply(text, message_type="", ctx=None):
 
     Replying to the notification email from the same Gmail account causes Google
     Voice to deliver the reply body as an SMS to the original sender. Uses the
-    reply context (target address + threading headers) — an explicit `ctx` when
+    reply context (target address + threading headers) - an explicit `ctx` when
     given (e.g. a manual reply from the queue page, resolved from the message
     log), otherwise the one captured by the poller for the message currently
     being processed."""
@@ -2132,7 +2591,7 @@ def extract_name(message):
     if message:
         message = message.title()
 
-    # No length truncation here — an over-length name is REJECTED by
+    # No length truncation here - an over-length name is REJECTED by
     # is_valid_name() (Too Long) rather than silently trimmed to fit, so the
     # sender is told to shorten it instead of a chopped name being displayed.
     return message if message else "Guest"
@@ -2145,8 +2604,8 @@ def is_non_name_message(body):
     submissions, so callers should silently ignore them instead of firing an
     invalid_format (or any) auto-response.
 
-    A message with zero ASCII letters can never yield a valid name anyway —
-    extract_name() strips to [a-zA-Z\\s-], so it would collapse to "Guest" —
+    A message with zero ASCII letters can never yield a valid name anyway -
+    extract_name() strips to [a-zA-Z\\s-], so it would collapse to "Guest" -
     which makes dropping it safe as well as correct."""
     text = (body or '').strip()
     if not text:
@@ -2168,8 +2627,8 @@ def is_non_name_message(body):
 def is_valid_name(text):
     """Validate a name. Returns (ok, reason) where reason is '' when ok, else a
     code the caller maps to a response:
-      - 'too_long'   : exceeds Max Message Length
-      - 'word_count' : violates the One Word / Two Words rule
+ - 'too_long'   : exceeds Max Message Length
+ - 'word_count' : violates the One Word / Two Words rule
 
     Length is checked FIRST, so an over-length name reports 'too_long' even when
     it also breaks the word rule. Length is enforced regardless of the word
@@ -2274,7 +2733,7 @@ def load_blacklist():
         if _blacklist_cache is None or _blacklist_mtime != current_mtime:
             words = load_blacklist_words()
             if words:
-                # Single combined pattern — one regex pass instead of N passes
+                # Single combined pattern - one regex pass instead of N passes
                 combined = '|'.join(r'\b' + re.escape(w) + r'\b' for w in words)
                 _blacklist_cache = re.compile(combined)
             else:
@@ -2319,7 +2778,7 @@ def get_day_log_path(date=None):
     return os.path.join(MESSAGES_DIR, f"messages_{date.isoformat()}.json")
 
 def mask_phone(p):
-    """Redact a phone number to its last 4 digits for display/API responses —
+    """Redact a phone number to its last 4 digits for display/API responses -
     full numbers are kept only in the on-disk logs and never sent to the browser.
     Passes through the 'Local Testing' sentinel and empty values unchanged."""
     if not p or p == 'Local Testing':
@@ -2367,7 +2826,7 @@ def _reply_ctx_from_log_ref(date_str, ts):
     """Resolve the stored Google Voice reply context of a logged message by
     (date, timestamp). Mirrors _phone_from_log_ref: the reply-to address and
     threading headers stay server-side, so the browser only ever holds the
-    (date, ts) reference — never the real address."""
+    (date, ts) reference - never the real address."""
     try:
         if date_str:
             path = get_day_log_path(datetime.strptime(date_str, "%Y-%m-%d").date())
@@ -2403,7 +2862,7 @@ def cleanup_old_logs():
                 file_date = datetime.strptime(date_str, "%Y-%m-%d").date()
                 if file_date < cutoff:
                     os.remove(os.path.join(MESSAGES_DIR, filename))
-                    logging.error(f"Deleted old log: {filename}")
+                    logging.info(f"Deleted old log: {filename}")
             except ValueError:
                 pass
     except Exception as e:
@@ -2429,7 +2888,7 @@ def load_queue_from_file():
                 message_queue.append(item)
                 restored += 1
         if restored:
-            logging.error(f"Queue restore: {restored} item(s) loaded from disk")
+            logging.info(f"Queue restore: {restored} item(s) loaded from disk")
         return restored
     except FileNotFoundError:
         return 0
@@ -2521,19 +2980,18 @@ def log_message(phone, message, name, status, counts=True):
         }
         # Under Google Voice, stash how to reply to this exact message (target
         # address + threading headers) so the queue page's Respond button can
-        # answer it later. Kept server-side only — redact_messages() strips it
+        # answer it later. Kept server-side only - redact_messages() strips it
         # before anything reaches the browser.
         if config.get('message_source') == 'google_voice' and _gv_reply_ctx and _gv_reply_ctx.get('to'):
             entry["reply_ctx"] = _gv_reply_ctx
         logs.append(entry)
         with open(log_path, 'w') as f:
             json.dump(logs, f, indent=2)
-        logging.info(f"✅ Message logged: {phone[-4:]} | {name} | {status}")
     except Exception as e:
         logging.error(f"Error logging message: {e}")
 
 def update_message_status(phone, name, new_status):
-    """Update the status of a message — searches today's file, then yesterday's if not found."""
+    """Update the status of a message - searches today's file, then yesterday's if not found."""
     def _update_in_file(path):
         try:
             with open(path, 'r') as f:
@@ -2551,7 +3009,6 @@ def update_message_status(phone, name, new_status):
             try:
                 with open(path, 'w') as f:
                     json.dump(logs, f, indent=2)
-                logging.info(f"Updated status: {phone[-4:]} | {name} | {new_status}")
             except Exception as e:
                 logging.error(f"Error writing status update: {e}")
         return found
@@ -2563,10 +3020,11 @@ def update_message_status(phone, name, new_status):
     except Exception as e:
         logging.error(f"Error updating message status: {e}")
 
-def add_to_queue(name, phone, message):
-    """Add a message to the display queue"""
+def add_to_queue(name, phone, message, override=None):
+    """Add a message to the display queue. `override` (remote path) carries the master's
+    pushed {content, duration} so the display uses that selection instead of choosing one."""
     global message_queue
-    
+
     try:
         queue_item = {
             "name": name,
@@ -2576,6 +3034,8 @@ def add_to_queue(name, phone, message):
             "timestamp": datetime.now().isoformat(),
             "status": "queued"
         }
+        if override is not None:
+            queue_item["override"] = override
         
         logging.info(f"📋 Created queue item: {queue_item}")
         
@@ -2593,8 +3053,28 @@ def add_to_queue(name, phone, message):
         logging.error(traceback.format_exc())
         return False
 
-def send_to_fpp(name):
-    """Send name to FPP - Start name sequence and display text overlay"""
+def _content_exists_locally(content):
+    """True if the plugin content id (seq:/img:) exists on THIS instance. Empty content (no
+    background) and non-seq/img values are treated as present. Used by the remote to decide
+    whether it can honor a master-pushed content or must keep its current background."""
+    if not content:
+        return True
+    if content.startswith('seq:'):
+        nm = os.path.basename(content[4:].removesuffix('.fseq'))
+        return os.path.exists(os.path.join(FSEQ_SEQUENCE_PATH, nm + '.fseq'))
+    if content.startswith('img:'):
+        nm = os.path.basename(content[4:])
+        return os.path.exists(os.path.join(FPP_IMAGES_PATH, nm))
+    return True
+
+
+def send_to_fpp(name, override=None):
+    """Send name to FPP - Start name sequence and display text overlay.
+
+    override (remote path): {'content': <id>, 'duration': <int>} - the master's chosen
+    content/timing. The remote renders it with ITS OWN layout (matched item, else flat) and
+    falls back to no background switch when it lacks the pushed content. When override is
+    None (master / standalone), content is selected locally exactly as before."""
     try:
         fpp_host = FPP_HOST
         # Pick which names content (with its OWN text layout + duration) to use for THIS
@@ -2602,7 +3082,20 @@ def send_to_fpp(name):
         # waiting content), exactly as before. The chosen content + duration are stashed in
         # module globals for display_worker() and the return/stop paths.
         global _active_name_content, _active_display_duration
-        _item = select_names_content_item()
+        _forced_content = None
+        if override is not None:
+            # Remote: content/timing pushed by the master. Keep the local look: match the
+            # pushed content to THIS instance's own names_content_list item for its layout.
+            _forced_content = override.get('content', '') or ''
+            if _forced_content and not _content_exists_locally(_forced_content):
+                logging.info(f"ℹ️  Remote: pushed content '{_forced_content}' not present here "
+                             f"- overlaying name on current background")
+                _forced_content = ''
+            _item = next((it for it in (config.get('names_content_list', []) or [])
+                          if it.get('content', '') == _forced_content), None)
+        else:
+            _item = select_names_content_item()
+
         if _item is not None:
             name_playlist         = _item.get('content', '')
             message_lines         = _item.get('message_lines', ['', '', '', ''])
@@ -2623,7 +3116,19 @@ def send_to_fpp(name):
             line_fonts_cfg        = config.get('line_fonts', [])
             line_orientations_cfg = config.get('line_orientations', [])
             _active_display_duration = int(config.get('display_duration', 30) or 30)
+        if override is not None:
+            # Background + timing are the master's selection; layout above stays local.
+            name_playlist = _forced_content
+            if override.get('duration'):
+                _active_display_duration = int(override['duration'])
         _active_name_content = name_playlist
+        # Master: mirror this exact name + chosen content + duration to the remotes so every
+        # projector shows the same selection (incl. random/round-robin picks). Skipped when
+        # override is set (this IS a remote applying a push) so remotes never re-push.
+        if override is None and get_plugin_role() == 'master':
+            push_state_to_remotes({'name': name,
+                                   'content': _active_name_content,
+                                   'duration': _active_display_duration})
         overlay_model = config.get('overlay_model_name', 'Texting Matrix')
 
         global_text_color = config.get('text_color', '#FF0000')
@@ -2635,7 +3140,7 @@ def send_to_fpp(name):
 
         # Collect non-empty rendered lines + their saved box/colors/movement/speed/font.
         # A line with no override for a given setting falls back to the matching global
-        # default. Font size is not stored — it's auto-fit to the line's box at render time.
+        # default. Font size is not stored - it's auto-fit to the line's box at render time.
         rendered_lines = []  # [(rendered_text, box_x, box_y, box_w, box_h, color_hex, movement, speed, font_name, orientation), ...]
         for i, tmpl_line in enumerate(message_lines):
             if not tmpl_line.strip():
@@ -2672,20 +3177,15 @@ def send_to_fpp(name):
             all_items.append((rendered, bx, resolved_y, bw, bh, lcolor, movement, speed, font_name, orientation))
             cumulative_y += line_heights[idx]
 
-        # True if at least one line scrolls — decides whether the fast one-shot static
+        # True if at least one line scrolls - decides whether the fast one-shot static
         # render is enough, or the animated per-line renderer is needed.
         any_moving = any(item[6] != 'Center' for item in all_items)
 
         # FPP API fallback: join lines with newline
         display_message = '\n'.join(item[0] for item in rendered_lines) if rendered_lines else name
 
-        logging.info(f"🎄 ========== STARTING DISPLAY FOR: {name} ==========")
-        logging.info(f"📺 FPP Host: {fpp_host}")
-        logging.info(f"🎬 Name Display Playlist: {name_playlist}")
-        logging.info(f"📝 Overlay Model: {overlay_model}")
-        logging.info(f"📝 Message Lines: {message_lines}")
-        logging.info(f"📝 Display Message: {display_message}")
-        
+        logging.info(f"🎄 Displaying '{name}' (content={name_playlist or 'none'}, model={overlay_model or 'none'})")
+
         # Step 1: Start the name display playlist/sequence/video/image (background)
         if name_playlist:
             try:
@@ -2695,44 +3195,39 @@ def send_to_fpp(name):
                 # that plays ON TOP of it (overlay text renders above both). Nothing
                 # foreground is touched. return_to_default_playlist() later stops just
                 # the names effect, leaving the waiting effect running underneath.
-                logging.info(f"▶️  STEP 2: Starting name display content OVER waiting: {name_playlist}")
                 if name_playlist.startswith('seq:'):
                     # FSEQ Effect (loop=true, background=true): plays as background so
                     # overlay model renders on top with correct text colors.
                     seq_name = name_playlist[4:].removesuffix('.fseq')
                     effect_url = f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Start')}/{urllib.parse.quote(seq_name)}/true/true"
-                    start_response = requests.get(effect_url, timeout=3)
-                    logging.info(f"   FSEQ Effect Start (names): {start_response.status_code} - {start_response.text}")
+                    requests.get(effect_url, timeout=3)
 
                 elif name_playlist.startswith('img:'):
-                    # Image background — will be composited with text in Step 2 below
-                    logging.info(f"   Image background: will render in overlay step")
+                    # Image background - will be composited with text in Step 2 below
+                    pass
 
                 else:
                     command = "Start Playlist"
                     encoded_playlist = urllib.parse.quote(name_playlist)
                     command_url = f"{fpp_host}/api/command/{urllib.parse.quote(command)}/{encoded_playlist}/true/false"
-                    start_response = requests.get(command_url, timeout=3)
-                    logging.info(f"   Start playlist response: {start_response.status_code}")
+                    requests.get(command_url, timeout=3)
 
                 time.sleep(0.3)
 
             except Exception as e:
                 logging.error(f"💥 ERROR starting name playlist: {e}")
         else:
-            # No names content configured — seq:/playlist waiting content composites
+            # No names content configured - seq:/playlist waiting content composites
             # correctly underneath the overlay and is left running.
             pass
 
         # Step 2: Display text ON TOP of the sequence
         if overlay_model:
             try:
-                logging.info(f"📝 STEP 3: Displaying text on model: {overlay_model}")
-
                 text_position = config.get('text_position', 'Center')  # used only by the non-PIL fallback below
                 text_color = global_text_color
                 text_font = config.get('text_font', 'FreeSans')
-                # The non-PIL fallback below has no concept of per-line boxes — approximate
+                # The non-PIL fallback below has no concept of per-line boxes - approximate
                 # a single FontSize from the first line's box height (box_h is index 4).
                 font_size = all_items[0][4] if all_items else 48
                 scroll_speed = config.get('scroll_speed', 20)
@@ -2755,8 +3250,6 @@ def send_to_fpp(name):
                 text_url  = f"{fpp_host}/api/overlays/model/{encoded_model}/text"
 
                 mw, mh = _overlay_model_dims()
-                logging.info(f"📐 Overlay: model={overlay_model} overlay_size={mw}x{mh} "
-                             f"lines={len(all_items)} moving={any_moving} PIL={PIL_AVAILABLE}")
 
                 shm_rendered = False
                 scroll_started = False
@@ -2776,13 +3269,13 @@ def send_to_fpp(name):
                         img_bg_path = None
 
                 # Blanking policy (avoids the transition flash):
-                #  - Incoming IMAGE (State 2, Opaque): do NOT blank. The current overlay
+                # - Incoming IMAGE (State 2, Opaque): do NOT blank. The current overlay
                 #    (e.g. the previous image) stays on screen while we load/resize the new
-                #    one — the slow part — and render_image_to_shm swaps it in with a single
+                #    one - the slow part - and render_image_to_shm swaps it in with a single
                 #    write(), so image→image changes have no blank frame at all.
-                #  - Incoming text/seq (State 3, Transparent): blank first, so the previous
+                # - Incoming text/seq (State 3, Transparent): blank first, so the previous
                 #    name can't linger while the new text frame is built. (Text path unchanged
-                #    — it already works cleanly.)
+                # - it already works cleanly.)
                 if not img_bg_path:
                     requests.put(state_url, json={"State": 0}, timeout=3)
 
@@ -2808,8 +3301,6 @@ def send_to_fpp(name):
                         bg_content = (name_playlist if (name_playlist and name_playlist.startswith('seq:'))
                                       else (_active_waiting_content or config.get('default_playlist', '')))
                         anim_fps = _fseq_fps_for_content(bg_content)
-                        logging.info(f"🎞️  Overlay animation fps={anim_fps} (bg={bg_content or 'none'}, "
-                                     f"img={'yes' if img_bg_path else 'no'})")
                         # Scrolling text now composites over the image background too
                         # (img_bg_path is None → black background, unchanged behavior).
                         scroll_started = animate_lines_via_shm(
@@ -2822,7 +3313,7 @@ def send_to_fpp(name):
                     logging.warning(f"⚠️ PIL skipped: overlay dimensions not saved ({mw}x{mh}). "
                                     f"Re-select the model in config to save dimensions.")
                 elif not PIL_AVAILABLE:
-                    logging.warning("⚠️ Pillow not installed — using FPP text API (no X/Y positioning). "
+                    logging.warning("⚠️ Pillow not installed - using FPP text API (no X/Y positioning). "
                                     "Run plugin install to add Pillow.")
 
                 if not shm_rendered and not scroll_started:
@@ -2836,25 +3327,20 @@ def send_to_fpp(name):
                         "AntiAlias": True,
                         "AutoEnable": False
                     }
-                    response = requests.put(text_url, json=text_payload, timeout=10)
-                    logging.info(f"📡 FPP text API fallback: {response.status_code}")
-                else:
-                    logging.info(f"✅ PIL {'scroll' if scroll_started else 'static'} render active")
+                    requests.put(text_url, json=text_payload, timeout=10)
 
-                # State 2 (Opaque) for image background so it covers the display fully —
+                # State 2 (Opaque) for image background so it covers the display fully -
                 # for both the static composite (shm_rendered) and the scroll composite
                 # (scroll_started) paths. State 3 (Transparent RGB) for normal/FSEQ
                 # background (black = transparent).
                 overlay_state = 2 if (img_bg_path and (shm_rendered or scroll_started)) else 3
-                state_resp = requests.put(state_url, json={"State": overlay_state}, timeout=3)
-                logging.info(f"   Overlay state={overlay_state}: {state_resp.status_code}")
+                requests.put(state_url, json={"State": overlay_state}, timeout=3)
 
             except Exception as e:
                 logging.error(f"💥 ERROR sending text command: {e}")
                 import traceback
                 logging.error(traceback.format_exc())
-        
-        logging.info(f"✅ ========== DISPLAY COMMANDS COMPLETED ==========")
+
         return True
         
     except Exception as e:
@@ -2879,11 +3365,12 @@ def start_default_playlist(content=None):
     default_playlist = content if content is not None else config.get('default_playlist', '')
 
     if not default_playlist:
-        logging.info("ℹ️  No default playlist configured — skipping auto-start")
+        logging.info("ℹ️  No default playlist configured - skipping auto-start")
         return False
 
     # This content becomes the base waiting layer (what names composite over / return to).
     _active_waiting_content = default_playlist
+    logging.info(f"▶️  Starting waiting content: {default_playlist}")
 
     try:
         if default_playlist.startswith('seq:'):
@@ -2894,20 +3381,16 @@ def start_default_playlist(content=None):
             # loop=true, background=true: loops natively, auto-suppressed by foreground
             # sequences, auto-resumes when foreground stops
             effect_url = f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Start')}/{urllib.parse.quote(seq_name)}/true/true"
-            logging.info(f"▶️  Starting FSEQ Effect Start (loop+background): {seq_name}")
-            logging.info(f"   URL: {effect_url}")
             response = requests.get(effect_url, timeout=3)
-            logging.info(f"   Response: {response.status_code} - {response.text}")
 
             if response.status_code == 200:
-                logging.info(f"✅ FSEQ Effect Start — looping in background")
                 return True
 
             logging.error(f"❌ FSEQ Effect Start failed: {response.status_code} - {response.text}")
             return False
 
         elif default_playlist.startswith('img:'):
-            # Static image — render to overlay model shared memory
+            # Static image - render to overlay model shared memory
             img_name = default_playlist[4:]
             img_path = os.path.join(FPP_IMAGES_PATH, img_name)
             overlay_model = config.get('overlay_model_name', '')
@@ -2918,7 +3401,6 @@ def start_default_playlist(content=None):
                     encoded = urllib.parse.quote(overlay_model)
                     state_url = f"{fpp_host}/api/overlays/model/{encoded}/state"
                     requests.put(state_url, json={"State": 2}, timeout=3)  # Opaque
-                    logging.info(f"✅ Image background set: {img_name}")
                     return True
             logging.warning(f"⚠️  Image background failed: PIL={PIL_AVAILABLE} model={overlay_model} "
                             f"dims={mw}x{mh} exists={os.path.exists(img_path) if img_path else False}")
@@ -2927,13 +3409,9 @@ def start_default_playlist(content=None):
         else:
             command = "Start Playlist"
             command_url = f"{fpp_host}/api/command/{urllib.parse.quote(command)}/{urllib.parse.quote(default_playlist)}/true/true"
-            logging.info(f"▶️  Starting playlist: {default_playlist}")
-            logging.info(f"   URL: {command_url}")
             response = requests.get(command_url, timeout=3)
-            logging.info(f"   Response: {response.status_code} - {response.text}")
 
             if response.status_code == 200:
-                logging.info(f"✅ Playlist started")
                 return True
             else:
                 logging.error(f"❌ Failed to start playlist: {response.status_code}")
@@ -2959,7 +3437,7 @@ def _switch_waiting_content(new_content, prev_content):
     ok = start_default_playlist(new_content)   # sets _active_waiting_content = new_content
 
     # 2) Tear down the PREVIOUS content now that the new one covers it. Never touch it when
-    #    it's the same file (a repeat) — that would stop what we just started.
+    #    it's the same file (a repeat) - that would stop what we just started.
     try:
         if prev_content and prev_content != new_content:
             if prev_content.startswith('seq:'):
@@ -2968,7 +3446,7 @@ def _switch_waiting_content(new_content, prev_content):
                 logging.info(f"⏹️  Rotator stopped previous waiting seq: {seq_name}")
             elif prev_content.startswith('img:') and not new_content.startswith('img:'):
                 # Previous was an opaque image overlay and the new content is a seq/playlist
-                # underneath — turn the overlay off so the new content shows through.
+                # underneath - turn the overlay off so the new content shows through.
                 overlay_model = config.get('overlay_model_name', '')
                 if overlay_model:
                     enc = urllib.parse.quote(overlay_model)
@@ -2977,19 +3455,23 @@ def _switch_waiting_content(new_content, prev_content):
             # img: → img: needs nothing (new render already overwrote the overlay buffer).
     except Exception as e:
         logging.warning(f"Rotator teardown of previous waiting content failed: {e}")
+    _push_waiting_state()   # master: mirror this waiting selection to the remotes
     return ok
 
 
 def _rotator_should_idle():
     """The rotator only rotates when NOT paused, the show is enabled, and 2+ waiting items
-    are configured. Otherwise it idles (single-content / disabled / stopped)."""
+    are configured. Otherwise it idles (single-content / disabled / stopped). Remotes never
+    self-rotate - their waiting content is chosen by the master and applied via a push."""
+    if is_remote():
+        return True
     if stop_rotator or not config.get('enabled', False):
         return True
     return len((config.get('default_content_list', []) or [])) < 2
 
 
 def _rotator_busy():
-    """True while a name owns the display — the rotator holds the current waiting content
+    """True while a name owns the display - the rotator holds the current waiting content
     (looping underneath) rather than switching, and resumes once the queue drains."""
     with queue_lock:
         return (currently_displaying is not None) or (len(message_queue) > 0)
@@ -3011,7 +3493,7 @@ def waiting_rotator():
     """Long-lived daemon that rotates the waiting-content list while the show is idle.
 
     Rotates only when 2+ items are configured and the show is enabled/not paused. Model:
-    HOLD the currently-active item for its full length, THEN advance to the next — so the
+    HOLD the currently-active item for its full length, THEN advance to the next - so the
     first item (brought up by start_waiting_content) plays fully before rotation begins.
     Rotation is suspended while a name owns the display; the current waiting content keeps
     looping underneath and the name composites on top."""
@@ -3037,14 +3519,14 @@ def waiting_rotator():
             # 2) Hold the current item for its full length, waking early to stop/pause, when
             #    disabled, or when a name arrives. Fire the overlap-switch a hair BEFORE the
             #    natural end so the next content covers the tail instead of the current
-            #    (loop=true) sequence briefly restarting from frame 0 — a seamless handoff.
+            #    (loop=true) sequence briefly restarting from frame 0 - a seamless handoff.
             hold = _waiting_hold_seconds(cur)
             logging.info(f"🔁 Rotator showing waiting content '{cur}' for {hold}s")
             deadline = time.time() + max(0.5, hold - 0.25)
             while time.time() < deadline and not _rotator_should_idle() and not _rotator_busy():
                 time.sleep(min(0.5, max(0.05, deadline - time.time())))
 
-            # 3) Advance to the next item — but never switch under a name or after a stop
+            # 3) Advance to the next item - but never switch under a name or after a stop
             #    (re-checked under the lock). If busy, loop back and re-hold the current item.
             if _rotator_should_idle() or _rotator_busy():
                 continue
@@ -3077,10 +3559,13 @@ def start_waiting_content():
                 return _switch_waiting_content(first['content'], _active_waiting_content)
         return False
 
-    # 0–1 items: single-content behavior. A 1-item list uses that item; else default_playlist.
+    # 0-1 items: single-content behavior. A 1-item list uses that item; else default_playlist.
     if len(lst) == 1 and lst[0].get('content'):
-        return start_default_playlist(lst[0]['content'])
-    return start_default_playlist()
+        ok = start_default_playlist(lst[0]['content'])
+    else:
+        ok = start_default_playlist()
+    _push_waiting_state()   # master: mirror the single waiting content to the remotes
+    return ok
 
 
 def return_to_default_playlist():
@@ -3093,12 +3578,12 @@ def return_to_default_playlist():
 
         import urllib.parse
 
-        # Don't blank between queued names — the next name's display handles its own
+        # Don't blank between queued names - the next name's display handles its own
         # (flash-free) overlay transition. Blanking here would flash between names.
         with queue_lock:
             queue_length = len(message_queue)
         if queue_length > 0:
-            logging.info(f"📋 Queue has {queue_length} more names — skipping return-to-default")
+            logging.info(f"📋 Queue has {queue_length} more names - skipping return-to-default")
             return
 
         # Stop whatever names content was ACTUALLY shown for this name (round-robin/random
@@ -3116,7 +3601,7 @@ def return_to_default_playlist():
 
         def _clear_overlay():
             # Turn the text/image overlay OFF (State 0). Used only when we are NOT
-            # returning to an image — a seq:/none waiting background shows through once
+            # returning to an image - a seq:/none waiting background shows through once
             # the overlay is off. (An image waiting background is instead restored by
             # start_default_playlist, which overwrites the overlay buffer and sets State 2
             # in one step, so there is no blank frame.)
@@ -3125,7 +3610,6 @@ def return_to_default_playlist():
             try:
                 enc = urllib.parse.quote(overlay_model)
                 requests.put(f"{fpp_host}/api/overlays/model/{enc}/state", json={"State": 0}, timeout=3)
-                logging.info("🧹 Overlay cleared (State 0)")
             except Exception as e:
                 logging.warning(f"Could not clear overlay: {e}")
 
@@ -3134,39 +3618,46 @@ def return_to_default_playlist():
             # waiting was never stopped); just restore the overlay for the waiting content.
             if returning_to_image:
                 start_default_playlist(default_content)   # image + State 2, overwrites overlay, no blank
-                logging.info("ℹ️  No names playlist — restored img waiting (no blank)")
             else:
                 _clear_overlay()
-                logging.info("ℹ️  No names playlist — overlay cleared, waiting content shows")
             return
 
-        # 1) Stop the NAME content by type. Never a blanket Stop Now — the main
+        # 1) Stop the NAME content by type. Never a blanket Stop Now - the main
         #    scheduler and any coexisting foreground must keep running.
         if name_playlist.startswith('seq:'):
-            # Stop the names FSEQ Effect — waiting FSEQ (if any) keeps running underneath
             seq_name = name_playlist[4:].removesuffix('.fseq')
-            r = requests.get(f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(seq_name)}", timeout=3)
-            logging.info(f"⏹️  FSEQ Effect Stop (names): {r.status_code} - {r.text}")
+            # CRITICAL: don't stop the name seq if it's the SAME sequence as the active
+            # waiting background. This is the common case on remotes (and any setup that
+            # reuses one background for both names and waiting): the master pushes a name
+            # whose content id equals the waiting content, so the single looping FSEQ is
+            # serving as both layers. Stopping it here would tear down the waiting
+            # background, leaving the output black until the master's ~10s heartbeat
+            # re-pushes it. Just leave it looping and clear the overlay below.
+            waiting_seq = default_content[4:].removesuffix('.fseq') if default_content.startswith('seq:') else None
+            if seq_name == waiting_seq:
+                logging.info(f"⏭️  Name seq '{seq_name}' is also the waiting background - leaving it "
+                             f"running, only clearing the overlay")
+            else:
+                # Stop the names FSEQ Effect - waiting FSEQ (if any) keeps running underneath
+                requests.get(f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(seq_name)}", timeout=3)
         elif name_playlist.startswith('img:'):
-            # Image name used the overlay only — nothing on the output to stop.
+            # Image name used the overlay only - nothing on the output to stop.
             pass
         else:
-            # Names content is a foreground playlist — stop just that playlist
+            # Names content is a foreground playlist - stop just that playlist
             # (not a blanket Stop Now), so any coexisting foreground isn't killed.
-            r = requests.get(f"{fpp_host}/api/playlists/stop", timeout=3)
-            logging.info(f"⏹️  Stopped names playlist ({r.status_code})")
+            requests.get(f"{fpp_host}/api/playlists/stop", timeout=3)
 
         # 2) Restore WAITING content on the overlay.
-        #    - img: waiting → re-render it and set State 2 Opaque. The name display
+        # - img: waiting → re-render it and set State 2 Opaque. The name display
         #      overwrote the overlay buffer (text frames or a name image), so this must
         #      run for every name type. start_default_playlist writes the image and flips
         #      to State 2 in one step, so an image→image return has NO blank frame.
-        #    - seq:/none waiting → just turn the overlay off; the seq (still looping
+        # - seq:/none waiting → just turn the overlay off; the seq (still looping
         #      underneath) or the bare output shows through. No blank either (the
         #      background was there the whole time).
         if returning_to_image:
             start_default_playlist(default_content)
-            logging.info("🖼️  Restored img waiting content (no blank)")
         else:
             _clear_overlay()
 
@@ -3175,15 +3666,15 @@ def return_to_default_playlist():
 
 
 def stop_show_playback():
-    """Stop ONLY the plugin's own content — its background FSEQ effect(s) and its
+    """Stop ONLY the plugin's own content - its background FSEQ effect(s) and its
     text/image overlay. The plugin always runs as a BACKGROUND layer, so this
     deliberately never issues 'Stop Now' or a blanket playlist stop: any OTHER
     foreground sequence on the Pi (e.g. a static house display running the pixels)
     keeps playing. This is the 'lights off' action shared by Stop and the end of a
-    graceful drain — it does NOT touch config['enabled'] (the caller owns that).
+    graceful drain - it does NOT touch config['enabled'] (the caller owns that).
 
-    (If the plugin's own waiting content is itself a foreground playlist/video —
-    not a background effect — we stop that one playlist, since in that case it IS
+    (If the plugin's own waiting content is itself a foreground playlist/video -
+    not a background effect - we stop that one playlist, since in that case it IS
     the plugin's own foreground.)"""
     global stop_rotator, _active_waiting_content
     # Pause the waiting rotator and hold its lock across teardown so it can't start a new
@@ -3209,10 +3700,15 @@ def _stop_show_playback_locked():
         # Stop the plugin's own background FSEQ effects: the single waiting content, every
         # seq: item in the WAITING rotation list, the flat name content, and every seq: item
         # in the names list (any could be the one currently looping). FSEQ Effect Stop on a
-        # non-running seq is harmless.
+        # non-running seq is harmless. ALSO stop whatever is ACTUALLY running right now
+        # (_active_waiting_content / _active_name_content) - on a REMOTE these are pushed by
+        # the master and are NOT in this instance's own config lists, so without them the
+        # remote's waiting seq would keep looping after a Stop.
         _wait_seq = [it.get('content', '') for it in (config.get('default_content_list', []) or [])]
         _names_seq = [it.get('content', '') for it in (config.get('names_content_list', []) or [])]
-        for content in [config.get('default_playlist', ''), config.get('name_display_playlist', ''), *_wait_seq, *_names_seq]:
+        for content in [config.get('default_playlist', ''), config.get('name_display_playlist', ''),
+                        _active_waiting_content or '', _active_name_content or '',
+                        *_wait_seq, *_names_seq]:
             if content.startswith('seq:'):
                 seq_name = content[4:].removesuffix('.fseq')
                 r = requests.get(f"{FPP_HOST}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(seq_name)}", timeout=3)
@@ -3226,14 +3722,14 @@ def _stop_show_playback_locked():
             logging.info("🛑 Overlay cleared")
 
         # Only if the plugin's OWN waiting content is a foreground playlist/video
-        # (not a background seq:/img:) do we stop the foreground — that playlist is
+        # (not a background seq:/img:) do we stop the foreground - that playlist is
         # the plugin's own. Never for seq:/img:, so a coexisting show is untouched.
         default = config.get('default_playlist', '')
         if default and not default.startswith(('seq:', 'img:')):
             r = requests.get(f"{FPP_HOST}/api/playlists/stop", timeout=3)
             logging.info(f"🛑 Stopped plugin foreground playlist: {r.status_code}")
 
-        # Nothing is on the output now — clear the active-waiting marker so a later restart
+        # Nothing is on the output now - clear the active-waiting marker so a later restart
         # brings its first item up as a clean switch rather than a same-file no-op.
         _active_waiting_content = ''
     except Exception as e:
@@ -3259,7 +3755,7 @@ def display_worker():
                 time.sleep(0.1)
                 continue
 
-            save_queue()  # item popped — remove from persistent queue before display starts
+            save_queue()  # item popped - remove from persistent queue before display starts
 
             currently_displaying = _next_item
             
@@ -3267,30 +3763,26 @@ def display_worker():
             phone = currently_displaying['phone']
             
             logging.info(f"🎬 NOW DISPLAYING: {name} (from {phone[-4:]})")
-            
+
             try:
-                logging.info(f"📝 Updating status to 'displaying'...")
                 update_message_status(phone, name, "displaying")
-                logging.info(f"✅ Status updated to 'displaying'")
             except Exception as e:
                 logging.error(f"💥 Error updating status to displaying: {e}")
-            
+
             try:
-                logging.info(f"📺 Sending to FPP display...")
-                send_to_fpp(name)
-                logging.info(f"✅ Sent to FPP display")
+                # On a remote, the item carries the master's pushed {content, duration}.
+                send_to_fpp(name, override=currently_displaying.get('override'))
             except Exception as e:
                 logging.error(f"💥 Error sending to FPP: {e}")
-            
+
             # Per-content duration chosen by send_to_fpp for the item actually shown.
             display_duration = int(_active_display_duration or config.get('display_duration', 30))
-            logging.info(f"⏱️  Displaying for {display_duration} seconds...")
 
             try:
                 name_playlist_chk = _active_name_content or ''
                 overlay_model_chk = config.get('overlay_model_name', '')
                 if not name_playlist_chk and overlay_model_chk:
-                    # No names content — FPP can reset the overlay state while the waiting
+                    # No names content - FPP can reset the overlay state while the waiting
                     # content is active (e.g. playlist steps, effect transitions).
                     # Re-enable State 3 every 2 s to keep the text on screen for the full duration.
                     import urllib.parse as _ul
@@ -3306,22 +3798,25 @@ def display_worker():
                             time.sleep(min(2.0, _rem))
                 else:
                     time.sleep(display_duration)
-                logging.info(f"⏱️  Display duration completed")
             except Exception as e:
                 logging.error(f"💥 Error during display: {e}")
             
-            # Graceful stop: if the show was stopped (enabled=False) while names were
-            # still displaying/queued, keep showing each one, but once this was the
-            # LAST queued name, stop the waiting content instead of resuming it.
+            # Graceful stop: if the show was stopped while names were still displaying/queued,
+            # keep showing each one, but once this was the LAST queued name, stop the waiting
+            # content instead of resuming it. A REMOTE is driven by the master, not its own
+            # `enabled` flag (it's usually never Started locally) - it only stops when the
+            # master has broadcast Stop; otherwise it always returns to its waiting content.
             try:
-                stopping = not config.get('enabled', False)
+                if is_remote():
+                    stopping = _remote_stop_requested
+                else:
+                    stopping = not config.get('enabled', False)
                 with queue_lock:
                     more_queued = len(message_queue) > 0
                 if stopping and not more_queued:
-                    logging.info("🛑 Graceful stop: last name shown — stopping waiting content")
+                    logging.info("🛑 Graceful stop: last name shown - stopping waiting content")
                     stop_show_playback()
                 else:
-                    logging.info(f"🔄 Returning to default playlist...")
                     return_to_default_playlist()
             except Exception as e:
                 logging.error(f"💥 Error returning to default / stopping: {e}")
@@ -3330,7 +3825,6 @@ def display_worker():
             
             try:
                 update_message_status(phone, name, "displayed")
-                logging.info(f"✅ Status updated to 'displayed'")
             except Exception as e:
                 logging.error(f"💥 Error updating status to displayed: {e}")
             
@@ -3372,12 +3866,12 @@ def get_queue_status():
     return status
 
 def parse_name_list(body):
-    """If `body` is a genuine multi-name list — names separated by commas or
-    line breaks, with 2+ that pass name validation — return the list of
+    """If `body` is a genuine multi-name list - names separated by commas or
+    line breaks, with 2+ that pass name validation - return the list of
     extracted names. Otherwise return None, signalling the caller to handle the
     message as a single submission (unchanged behavior).
 
-    Only commas and line breaks separate names — NEVER spaces — so multi-word
+    Only commas and line breaks separate names - NEVER spaces - so multi-word
     names like "Jean Luke" and hyphenated names like "Jean-Luke" each stay a
     single name."""
     tokens = [t.strip() for t in re.split(r'[\n\r,]+', body)]
@@ -3390,7 +3884,7 @@ def parse_name_list(body):
     valid_count = 0
     for t in tokens[:max_names]:
         nm = extract_name(t)
-        if nm == "Guest":          # greeting-only / no usable letters — drop noise
+        if nm == "Guest":          # greeting-only / no usable letters - drop noise
             continue
         names.append(nm)
         if is_valid_name(nm)[0]:
@@ -3407,12 +3901,12 @@ def process_incoming_message(from_number, body):
     blocked → name extraction → rate limit → duplicate → whitelist → profanity
     → queue, sending the appropriate auto-response along the way.
 
-    Source-agnostic — used by both poll_twilio() and poll_google_voice(). Only
+    Source-agnostic - used by both poll_twilio() and poll_google_voice(). Only
     needs the sender identity and message text; per-source dedup bookkeeping
     (SID / IMAP UID) stays in the caller. Behavior is identical to the logic
     that previously lived inline in poll_twilio()."""
     # Phone 'tapback' reactions and emoji-only replies to the display
-    # notification are courtesy responses, not name submissions — silently
+    # notification are courtesy responses, not name submissions - silently
     # drop them so we never fire an invalid_format (or any) auto-response.
     # Returning normally lets the caller advance its dedup marker.
     if is_non_name_message(body):
@@ -3420,14 +3914,14 @@ def process_incoming_message(from_number, body):
         return
 
     if not config.get('enabled', False):
-        # Show not live — reply if enabled, then discard
+        # Show not live - reply if enabled, then discard
         if not is_blocked(from_number):
             send_sms_response(from_number, "show_not_live")
             log_message(from_number, body, "", "show_not_live")
             logging.info(f"🔴 Show not live reply sent to {from_number[-4:]}")
         return
 
-    # Exactly one branch fires — only one SMS response is ever sent per message
+    # Exactly one branch fires - only one SMS response is ever sent per message
     if is_blocked(from_number):
         logging.info(f"🚫 Blocked: {from_number[-4:]}")
         log_message(from_number, body, "", "blocked")
@@ -3536,13 +4030,13 @@ def poll_twilio():
 
     while not stop_polling and my_gen == polling_generation:
         try:
-            # Midnight cleanup — delete daily log files older than 7 days
+            # Midnight cleanup - delete daily log files older than 7 days
             today = datetime.now().date()
             if today != _current_day:
                 _current_day = today
                 try:
                     cleanup_old_logs()
-                    logging.error(f"🌙 Midnight: old daily logs cleaned up for {today}")
+                    logging.info(f"🌙 Midnight: old daily logs cleaned up for {today}")
                 except Exception as e:
                     logging.error(f"Error during midnight cleanup: {e}")
 
@@ -3593,11 +4087,11 @@ def poll_twilio():
                 from_number = msg.from_
                 body = msg.body
 
-                logging.info(f"📱 SMS from {from_number[-4:]}: '{body[:30]}'")  # keep at INFO — new message is significant
+                logging.info(f"📱 SMS from {from_number[-4:]}: '{body[:30]}'")  # keep at INFO - new message is significant
 
                 try:
                     process_incoming_message(from_number, body)
-                    # Advance the dedup marker only on success — an exception
+                    # Advance the dedup marker only on success - an exception
                     # leaves the SID unsaved so the message is retried next poll.
                     last_message_sid = msg.sid
                     save_last_sid(msg.sid)
@@ -3628,7 +4122,7 @@ def poll_twilio():
 
 # Markers that begin the Google Voice footer, which sits BELOW the SMS text.
 # Everything from the earliest marker onward is footer and is discarded. These
-# must be strings that only ever appear in the footer — NOT the bare
+# must be strings that only ever appear in the footer - NOT the bare
 # "voice.google.com" URL, which also appears in the logo link ABOVE the message.
 _GV_FOOTER_MARKERS = (
     "YOUR ACCOUNT",
@@ -3690,7 +4184,7 @@ def _gv_extract_message(text):
     any bare <URL> logo/link lines, and join what's left.
 
     The surviving lines are joined with newlines (not spaces) so that a
-    multi-line submission — e.g. a name list typed one-per-line — stays
+    multi-line submission - e.g. a name list typed one-per-line - stays
     multi-line, matching how Twilio delivers the raw SMS body. The payload was
     already transfer-decoded upstream, so these newlines are the sender's real
     line breaks, not email soft-wraps."""
@@ -3747,13 +4241,13 @@ def _gv_sender_id(msg, display_name):
       2. From local-part: "<yourGVnum>.<sendernum>.<token>@txt.voice.google.com"
       3. The display name (contact name, or the raw number for unknown senders)
     """
-    # 1) Subject line — contains only the sender's number
+    # 1) Subject line - contains only the sender's number
     subj = _gv_decode_header(str(msg.get('Subject', '')))
     num = _gv_normalize_phone(subj)
     if num:
         return num
 
-    # 2) From address local-part — segments are <GVnum>.<sendernum>.<token>;
+    # 2) From address local-part - segments are <GVnum>.<sendernum>.<token>;
     #    the sender's number is the 2nd all-digit segment (1st is your own GV number)
     _n, addr = email.utils.parseaddr(str(msg.get('From', '')))
     local = addr.split('@', 1)[0]
@@ -3782,8 +4276,8 @@ def parse_gv_email(raw_bytes):
     defensive and logs the raw email on failure so drift is diagnosable. Returns
     None for mail that isn't a parseable GV SMS.
 
-    Sender identity: the From display name is the saved contact name, or — for an
-    unknown sender — the raw phone number. When it looks like a number we
+    Sender identity: the From display name is the saved contact name, or - for an
+    unknown sender - the raw phone number. When it looks like a number we
     normalize it to digits so blocklist / rate-limit keys line up with how a
     number would be stored; otherwise the contact name is used as the key.
     """
@@ -3810,7 +4304,7 @@ def parse_gv_email(raw_bytes):
             return None
 
         # Resolve the sender's actual phone number (Subject / From address),
-        # falling back to the display name — so blocklist / rate-limit / display
+        # falling back to the display name - so blocklist / rate-limit / display
         # key on the real number whether or not the sender is a saved contact.
         from_id = _gv_sender_id(msg, display_name)
 
@@ -3844,13 +4338,13 @@ def poll_google_voice():
 
     while not stop_polling and my_gen == polling_generation:
         try:
-            # Midnight cleanup — delete daily log files older than 7 days
+            # Midnight cleanup - delete daily log files older than 7 days
             today = datetime.now().date()
             if today != _current_day:
                 _current_day = today
                 try:
                     cleanup_old_logs()
-                    logging.error(f"🌙 Midnight: old daily logs cleaned up for {today}")
+                    logging.info(f"🌙 Midnight: old daily logs cleaned up for {today}")
                 except Exception as e:
                     logging.error(f"Error during midnight cleanup: {e}")
 
@@ -3935,9 +4429,13 @@ def start_polling_if_needed():
     poller is (or is now) running for the selected source.
 
     If a poller for a different source is already live, its generation is bumped
-    so it exits on its next loop, and a fresh poller is started — this lets the
+    so it exits on its next loop, and a fresh poller is started - this lets the
     provider be switched from the UI without a service restart."""
     global polling_thread, polling_source, polling_generation
+
+    # Remotes never talk to Twilio/Google - they only render names the master pushes.
+    if is_remote():
+        return False
 
     source = config.get('message_source', 'twilio')
     if source == 'google_voice':
@@ -3950,7 +4448,7 @@ def start_polling_if_needed():
             return False
         target = poll_twilio
 
-    # Correct poller already running — nothing to do
+    # Correct poller already running - nothing to do
     if polling_thread and polling_thread.is_alive() and polling_source == source:
         return True
 
@@ -3971,7 +4469,7 @@ def index():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Text My Lights — Configuration</title>
+        <title>Text My Lights - Configuration</title>
         <style>
             body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #ffffff; color: #333; }
             h1 { color: #4CAF50; }
@@ -4020,8 +4518,8 @@ def index():
             <button class="tab-btn active" onclick="showTab('settings', this)">⚙️ Settings</button>
             <button class="tab-btn" onclick="showTab('display', this)">🖥️ Display</button>
             <button class="tab-btn" id="tabbtn-sms" onclick="showTab('sms', this)">📱 SMS Responses</button>
-            <button class="tab-btn" onclick="showTab('testing', this)">🧪 Testing</button>
-            <button class="view-btn" onclick="viewMessages()" style="margin:0 0 0 10px; padding:7px 14px; font-size:13px;">📋 View Message Queue</button>
+            <button class="tab-btn" id="tabbtn-testing" onclick="showTab('testing', this)">🧪 Testing</button>
+            <button class="view-btn" id="btn_view_queue" onclick="viewMessages()" style="margin:0 0 0 10px; padding:7px 14px; font-size:13px;">📋 View Message Queue</button>
             <span id="autosave_status" style="font-size:13px; margin-left:8px;"></span>
             <div style="margin-left:auto; display:flex; gap:4px; align-items:center;">
                 <button id="btn_plugin_toggle" onclick="pluginToggle()" style="background:#2e7d32; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-size:12px; font-weight:bold; cursor:pointer;">▶ Start</button>
@@ -4031,13 +4529,13 @@ def index():
         <!-- Plugin Live Banner -->
         <div id="plugin_live_banner" style="display:none; background:#1b5e20; color:#fff; padding:10px 16px; border-radius:5px; margin-top:10px; font-size:14px; font-weight:bold; align-items:center; gap:10px;">
             <span style="display:inline-block; width:12px; height:12px; background:#69f0ae; border-radius:50%; box-shadow:0 0 6px #69f0ae;"></span>
-            Plugin is Live &mdash; Press Stop or run the "Text My Lights Stop" script to stop displaying incoming messages.
+            Plugin is Live - Press Stop or run the "Text My Lights Stop" script to stop displaying incoming messages.
         </div>
 
         <!-- Plugin Not Live Banner -->
         <div id="plugin_not_live_banner" style="display:none; background:#b71c1c; color:#fff; padding:10px 16px; border-radius:5px; margin-top:10px; font-size:14px; font-weight:bold; align-items:center; gap:10px;">
             <span style="display:inline-block; width:12px; height:12px; background:#ff8a80; border-radius:50%; box-shadow:0 0 6px #ff8a80;"></span>
-            <span>Plugin is Not Live &mdash; Press Start or run the "Text My Lights Start" script to display incoming messages.<br>
+            <span>Plugin is Not Live - Press Start or run the "Text My Lights Start" script to display incoming messages.<br>
             <span style="font-weight:normal; font-size:12px;">Note: Viewers can still send messages, messaging rates will apply, but no messages will be displayed.</span></span>
         </div>
 
@@ -4048,6 +4546,28 @@ def index():
                 <!-- LEFT COLUMN: Twilio + FPP Display + Message Settings -->
                 <div class="column">
                     <div class="section">
+                        <h2>🖥️ Projector Role (Master / Remote)</h2>
+                        <p class="help-text">The <strong>Master</strong> is where the configuration lives and text messages are received. Each <strong>Remote</strong> only displays the names the Master pushes to it.</p>
+                        <p class="help-text" style="margin-top:4px;"><em>Master/Remote here is this <strong>plugin's</strong> role - separate from FPP's own Player/Remote mode. The plugin master does not need to be the FPP master.</em></p>
+                        <label>This instance is:</label>
+                        <select id="plugin_role" onchange="onRoleChange()">
+                            <option value="master" {{ 'selected' if effective_role != 'remote' else '' }}>Master - handles texts &amp; pushes names</option>
+                            <option value="remote" {{ 'selected' if effective_role == 'remote' else '' }}>Remote - only displays pushed names</option>
+                        </select>
+
+                        <div id="remote_mode_note" style="display:none; background:#e3f2fd; border:1px solid #90caf9; color:#0d47a1; border-radius:5px; padding:8px 12px; margin-top:10px; font-size:13px;">
+                            ℹ️ <strong>Remote mode:</strong> the Master's content must also exist on this remote - recommend using <strong>Config → Export/Import</strong>.
+                        </div>
+                        <div id="master_sync_box" style="display:none; margin-top:12px;">
+                            <label style="display:flex; align-items:center; gap:8px;">🔗 Sync to Plugin Master
+                                <button type="button" class="test-btn" id="btn_refresh_masters" onclick="refreshMasters(this)" style="padding:2px 10px; font-size:12px;">🔄 Refresh</button>
+                            </label>
+                            <div id="masters_list" style="margin-top:6px;">
+                                <p class="help-text" id="masters_empty">Looking for plugin masters on the network…</p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="section" id="message_source_section">
                         <h2>Message Source</h2>
                         <label>SMS Provider:</label>
                         <select id="message_source">
@@ -4056,7 +4576,7 @@ def index():
                         </select>
                         <p class="help-text"><a id="provider_help_link" href="plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=help.php#twilio" target="_top">View Twilio Configuration</a></p>
 
-                        <!-- Twilio credentials — shown when Message Source = Twilio -->
+                        <!-- Twilio credentials - shown when Message Source = Twilio -->
                         <div id="twilio_creds">
                             <h3 style="margin:14px 0 6px;">Twilio Settings</h3>
                             <label>Twilio Account SID:</label>
@@ -4074,7 +4594,7 @@ def index():
                             <div id="twilio_test_result" style="margin-top: 8px; font-size: 14px;"></div>
                         </div>
 
-                        <!-- Google Voice credentials — shown when Message Source = Google Voice -->
+                        <!-- Google Voice credentials - shown when Message Source = Google Voice -->
                         <div id="gv_creds" style="display:none;">
                             <h3 style="margin:14px 0 6px;">Google Voice Settings</h3>
                             <label>Gmail Address:</label>
@@ -4091,16 +4611,19 @@ def index():
 
                         <label>Poll Interval (seconds):</label>
                         <input type="number" id="poll_interval" value="{{ config.poll_interval }}" min="1" max="60">
+                    </div>
 
-                        <hr style="border: none; border-top: 1px solid #ddd; margin: 15px 0;">
+                    <!-- FPP Display Settings: shown on BOTH master and remote (the overlay
+                         model + names content are per-projector; a remote needs them). -->
+                    <div class="section">
                         <h2 style="margin-top: 0;">FPP Display Settings</h2>
 
                         <div id="fpp_content_live_warning" style="display:none; background:#b71c1c; color:#fff; border-radius:5px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
-                            🔴 <strong>Plugin is Live</strong> — run Text My Lights Stop to edit
+                            🔴 <strong>Plugin is Live</strong>; run Text My Lights Stop or press Stop to edit
                         </div>
                         <div id="fpp_content_inputs">
                             <div style="display:flex; gap:20px; flex-wrap:wrap; align-items:flex-start;">
-                              <div style="flex:1; min-width:280px;">
+                              <div style="flex:1; min-width:280px;" id="waiting_config_col">
                             <label>Default "Waiting" Content: <span style="color:#f44336;font-size:12px;">* required</span> <span class="help-text" style="font-weight:normal;margin-left:6px;">📺 Loops while waiting for texts. Add 2+ to rotate between them (each sequence plays full length.)</span></label>
                             <!-- Hidden legacy single-value select: kept in sync with the first
                                  list item. Drives the canvas preview background + the
@@ -4118,14 +4641,17 @@ def index():
                                 </div>
                             </div>
                             <div id="waiting_content_none_warning" style="display:none; background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:5px; padding:8px 12px; margin-top:6px; font-size:13px;">
-                                ⚠️ No Waiting content selected — required before you can Start the show.
+                                ⚠️ No Waiting content selected - required before you can Start the show.
                             </div>
                               </div>
-                              <div style="flex:1; min-width:280px;">
-                            <label>Name Display Content: <span class="help-text" style="font-weight:normal;margin-left:6px;">🎬 Background(s) shown when a name appears. Add one or more — each gets its own text layout on the Display tab.</span></label>
+                              <div style="flex:1; min-width:280px;" id="names_config_col">
+                            <label>Name Display Content: <span class="help-text" style="font-weight:normal;margin-left:6px;">🎬 Background(s) shown when a name appears. Add one or more - each gets its own text layout on the Display tab.</span></label>
+                            <div id="names_content_remote_note" style="display:none; background:#e3f2fd; border:1px solid #90caf9; color:#0d47a1; border-radius:5px; padding:8px 12px; margin-bottom:6px; font-size:13px;">
+                                ℹ️ This list is <strong>synced from the Master</strong> (only content that also exists on this Pi appears). Pick a content below to set <em>this</em> projector's text layout for it on the Display tab - your overlay model, sizing, and positioning are independent of the Master.
+                            </div>
                             <div id="names_content_list_box" style="border:1px solid #ddd; border-radius:5px; padding:10px; background:#fff;">
                                 <div id="names_content_items"></div>
-                                <button type="button" onclick="openManageContentModal()" style="margin-top:8px; font-size:13px; padding:6px 14px; cursor:pointer; background:#1976d2; color:#fff; border:none; border-radius:4px;">🗂️ Add / Arrange Content</button>
+                                <button type="button" id="btn_manage_names" onclick="openManageContentModal()" style="margin-top:8px; font-size:13px; padding:6px 14px; cursor:pointer; background:#1976d2; color:#fff; border:none; border-radius:4px;">🗂️ Add / Arrange Content</button>
                                 <div id="names_mode_row" style="display:none; margin-top:12px; padding-top:10px; border-top:1px solid #eee;">
                                     <span style="font-size:13px; color:#555; margin-right:10px;">When a name arrives, pick:</span>
                                     <label style="margin-right:14px; cursor:pointer; color:#333; font-size:13px;"><input type="radio" name="names_mode" value="roundrobin" onchange="onNamesModeChange('roundrobin')" style="width:auto;margin:0 5px 0 0;vertical-align:middle;">Round Robin</label>
@@ -4133,7 +4659,7 @@ def index():
                                 </div>
                             </div>
                             <div id="name_display_none_warning" style="display:none; background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:5px; padding:8px 12px; margin-top:6px; font-size:13px;">
-                                ⚠️ No Names content — names will appear directly over the Waiting content (using the Display-tab text layout).
+                                ⚠️ No Names content - names will appear directly over the Waiting content (using the Display-tab text layout).
                             </div>
                               </div>
                             </div>
@@ -4170,12 +4696,12 @@ def index():
                                 </div>
                             </div>
 
-                            <!-- Manage Waiting Content modal — same two-pane picker as Names, but the
+                            <!-- Manage Waiting Content modal - same two-pane picker as Names, but the
                                  right list is the waiting-content rotation (no per-item text layout). -->
                             <div id="manage_waiting_modal" onclick="if(event.target===this)closeManageWaitingModal()" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:100000; align-items:flex-start; justify-content:center; padding-top:24px; box-sizing:border-box;">
                                 <div onclick="event.stopPropagation()" style="background:#fff; color:#333; border-radius:8px; padding:22px; width:94%; max-width:740px; box-shadow:0 8px 30px rgba(0,0,0,0.35); max-height:90vh; overflow:auto; box-sizing:border-box;">
                                     <h3 style="margin-top:0;">Manage Waiting Content</h3>
-                                    <p class="help-text" style="margin-top:4px;">Select content on the left and click ▶ to add it. With 2+ items the plugin rotates them while idle — each sequence plays its full length, then the next starts seamlessly (no black gap). Reorder with ▲ / ▼ (order matters for Round Robin). Remove with ◀.</p>
+                                    <p class="help-text" style="margin-top:4px;">Select content on the left and click ▶ to add it. With 2+ items the plugin rotates them while idle - each sequence plays its full length, then the next starts seamlessly (no black gap). Reorder with ▲ / ▼ (order matters for Round Robin). Remove with ◀.</p>
                                     <div style="display:flex; gap:10px; align-items:stretch;">
                                         <div style="flex:1; min-width:0;">
                                             <label style="font-size:13px;">Available Content</label>
@@ -4200,13 +4726,14 @@ def index():
                                 </div>
                             </div>
 
-                            <label>Overlay Model Name: <button type="button" onclick="refreshFPPLists(this)" style="font-size:11px;padding:2px 7px;margin-left:8px;cursor:pointer;">↻ Refresh Lists</button> <span class="help-text" style="font-weight:normal;margin-left:6px;">📝 The pixel overlay model for text (e.g., "Texting Matrix")</span></label>
+                            <label>Overlay Model Name: <button type="button" onclick="refreshFPPLists(this)" style="font-size:11px;padding:2px 7px;margin-left:8px;cursor:pointer;">↻ Refresh Lists</button> <span class="help-text" style="font-weight:normal;margin-left:6px;">📝 The pixel overlay model for text (e.g., "Texting Matrix"). On a remote this is local to this projector.</span></label>
                             <select id="overlay_model_name">
                                 <option value="">-- None --</option>
                             </select>
                         </div>
+                    </div>
 
-                        <hr style="border: none; border-top: 1px solid #ddd; margin: 15px 0;">
+                    <div class="section" id="message_settings_section">
                         <h2 style="margin-top: 0;">Message Settings</h2>
 
                         <!-- Display Duration moved to the Display tab (it is now per Names
@@ -4222,7 +4749,7 @@ def index():
                             <input type="number" id="max_length" value="{{ config.max_message_length }}" min="10" max="200">
                         </div>
                         <div id="max_length_disabled_warning" style="display:none; background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:5px; padding:8px 12px; margin-top:6px; font-size:13px;">
-                            ⚠️ <strong>Max Message Length is disabled</strong> — whitelist is enabled. Names are validated against the approved list, not by length.
+                            ⚠️ <strong>Max Message Length is disabled</strong> - whitelist is enabled. Names are validated against the approved list, not by length.
                         </div>
 
                     </div>
@@ -4230,8 +4757,8 @@ def index():
 
             </div>
 
-            <!-- Filters — full width -->
-            <div class="section" style="margin-top:12px;">
+            <!-- Filters - full width -->
+            <div class="section" id="filters_section" style="margin-top:12px;">
                 <h2>Filters</h2>
                 <div style="display:flex; gap:24px; align-items:flex-start; flex-wrap:wrap;">
 
@@ -4243,16 +4770,16 @@ def index():
                             <button class="view-btn" onclick="showBlacklistWarning()" style="margin-top:6px;">🚫 Manage Blacklist</button>
                         </div>
                         <div id="profanity_disabled_warning" style="display:none; background:#f8d7da; border:1px solid #f5c6cb; color:#721c24; border-radius:5px; padding:8px 12px; margin-top:8px; font-size:13px;">
-                            ⚠️ <strong>Profanity filter is disabled</strong> — this is not recommended. Re-enable it to filter names against the Blacklist, or enable the Whitelist instead.
+                            ⚠️ <strong>Profanity filter is disabled</strong> - this is not recommended. Re-enable it to filter names against the Blacklist, or enable the Whitelist instead.
                         </div>
                         <div id="blacklist_disabled_warning" style="display:none; background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:5px; padding:8px 12px; margin-top:8px; font-size:13px;">
-                            ⚠️ <strong>Blacklist inactive</strong> — whitelist is enabled. All names are validated against the whitelist.
+                            ⚠️ <strong>Blacklist inactive</strong> - whitelist is enabled. All names are validated against the whitelist.
                         </div>
 
                         <hr style="border:none; border-top:1px solid #444; margin:15px 0;">
 
                         <label class="toggle-switch"><input type="checkbox" id="use_whitelist" {{ 'checked' if config.get('use_whitelist', False) else '' }} onchange="updateFormatRules(); checkFiltersState(); checkWhitelistResponseState(); saveConfig();"><span class="toggle-slider"></span></label>
-                        <label class="checkbox-label">Enable Name Whitelist — only allow approved names</label><br>
+                        <label class="checkbox-label">Enable Name Whitelist - only allow approved names</label><br>
                         <button class="view-btn" onclick="location.href='/whitelist'" style="margin-top:6px;">📋 Manage Whitelist</button>
                     </div>
 
@@ -4288,7 +4815,7 @@ def index():
                         <hr style="border:none; border-top:1px solid #444; margin:15px 0;">
 
                         <label class="toggle-switch"><input type="checkbox" id="allow_duplicate_names" {{ 'checked' if config.get('allow_duplicate_names', False) else '' }} onchange="checkDuplicateState(); saveConfig();"><span class="toggle-slider"></span></label>
-                        <label class="checkbox-label">Allow Duplicate Names — same phone number can submit the same name multiple times per day</label>
+                        <label class="checkbox-label">Allow Duplicate Names - same phone number can submit the same name multiple times per day</label>
                     </div>
 
                 </div>
@@ -4297,7 +4824,7 @@ def index():
                 <div style="background:#e7f3ff; border:1px solid #4a90d9; color:#1a3d5c; border-radius:6px; padding:10px 14px; margin-top:14px; font-size:13px; line-height:1.55;">
                     <strong>📝 Multiple names in one text</strong><br>
                     Texters can submit several names at once, separated by <strong>commas or line breaks</strong>
-                    (e.g. <em>"Alex, Sam, Jordan"</em>). Multi-word names like <em>"Mary Jane"</em> stay intact —
+                    (e.g. <em>"Alex, Sam, Jordan"</em>). Multi-word names like <em>"Mary Jane"</em> stay intact -
                     only commas and line breaks split names, never spaces.
                     <br><br>
                     To keep replies simple, a grouped text is <strong>all-or-nothing</strong> and is only accepted
@@ -4305,12 +4832,12 @@ def index():
                     <ul style="margin:6px 0 0 18px; padding:0;">
                         <li><strong>Max Messages Per Phone</strong> must be <strong>0</strong> (no rate limiting)</li>
                         <li><strong>Allow Duplicate Names</strong> must be <strong>on</strong></li>
-                        <li>Every name must pass your format rules — or, if the <strong>Whitelist</strong> is on,
+                        <li>Every name must pass your format rules - or, if the <strong>Whitelist</strong> is on,
                             <strong>all</strong> names must be on it</li>
                     </ul>
                     <div style="margin-top:6px;">
                         If any of these isn't met, the whole grouped text gets the <strong>Invalid Format</strong>
-                        reply — and it does <strong>not</strong> count toward the sender's daily limit. Profanity
+                        reply - and it does <strong>not</strong> count toward the sender's daily limit. Profanity
                         anywhere fails the whole message. An accepted group sends <strong>one Success</strong> reply.
                     </div>
                 </div>
@@ -4318,7 +4845,7 @@ def index():
             <script>
                 // Remember the last active format-rule choice so enabling the
                 // whitelist (which clears the rules) and then disabling it restores
-                // exactly what was set before — rather than forcing "Two Words Max".
+                // exactly what was set before - rather than forcing "Two Words Max".
                 var _savedFormatState = {
                     one_word_only: {{ 'true' if config.get('one_word_only', False) else 'false' }},
                     two_words_max: {{ 'true' if config.get('two_words_max', True) else 'false' }}
@@ -4365,7 +4892,7 @@ def index():
                     var cb = document.getElementById('sms_response_duplicate');
                     var warn = document.getElementById('duplicate_disabled_warning');
                     if (!row) return;
-                    // Only disable/grey the row — never change the checkbox's own state,
+                    // Only disable/grey the row - never change the checkbox's own state,
                     // so turning Allow Duplicate Names back off restores the prior on/off choice.
                     if (cb) cb.disabled = allowDupes;
                     if (allowDupes) {
@@ -4399,7 +4926,7 @@ def index():
                     var cb = document.getElementById('sms_response_invalid_format');
                     var warn = document.getElementById('invalid_format_disabled_warning');
                     if (!row) return;  // SMS-responses tab not parsed yet (init runs later)
-                    // Only disable/grey the row — never change the checkbox's own state,
+                    // Only disable/grey the row - never change the checkbox's own state,
                     // so toggling the whitelist off restores the prior on/off choice.
                     if (cb) cb.disabled = whitelistOn;
                     if (warn) warn.style.display = whitelistOn ? '' : 'none';
@@ -4447,7 +4974,7 @@ def index():
                     }
                 }
                 // Rate-Limited response is meaningless when Max Messages Per Phone is 0
-                // (unlimited) — no one is ever rate limited. Lock the row live.
+                // (unlimited) - no one is ever rate limited. Lock the row live.
                 function checkRateLimitResponseState() {
                     var mmEl = document.getElementById('max_messages');
                     var unlimited = !mmEl || parseInt(mmEl.value || '0', 10) === 0;
@@ -4455,7 +4982,7 @@ def index():
                     var cb = document.getElementById('sms_response_rate_limited');
                     var warn = document.getElementById('rate_limited_disabled_warning');
                     if (!row) return;  // SMS-responses tab not parsed yet (init runs later)
-                    // Only disable/grey the row — never change the checkbox's own state,
+                    // Only disable/grey the row - never change the checkbox's own state,
                     // so raising Max Messages above 0 restores the prior on/off choice.
                     if (unlimited) {
                         row.classList.add('locked');
@@ -4469,7 +4996,7 @@ def index():
                     if (warn) warn.style.display = unlimited ? '' : 'none';
                 }
                 // Live preview for the {words} placeholder in the Invalid Format
-                // response — mirrors word_rule_phrase() on the backend.
+                // response - mirrors word_rule_phrase() on the backend.
                 function updateWordsPreview() {
                     var el = document.getElementById('words_preview');
                     if (!el) return;  // SMS-responses tab not parsed yet
@@ -4479,6 +5006,121 @@ def index():
                                    : (two && two.checked) ? '2 words'
                                    : '1-2 words';
                 }
+                // A Remote only displays names the Master pushes - everything else (texts,
+                // replies, limits, filters, testing, queue, Start) is handled on the Master,
+                // so hide it here to avoid confusion.
+                function applyRoleVisibility(remote) {
+                    var showIf = function(id, show){ var el=document.getElementById(id); if(el) el.style.display = show ? '' : 'none'; };
+                    showIf('message_source_section', !remote);
+                    showIf('message_settings_section', !remote);
+                    showIf('master_discovery_box', !remote);
+                    showIf('filters_section', !remote);
+                    // Waiting + Name Display content are master-driven (the remote's names
+                    // list syncs from the master), so hide BOTH content columns on a remote.
+                    // Only the Overlay Model selector stays - it is this projector's own model.
+                    showIf('waiting_config_col', !remote);
+                    showIf('names_config_col', !remote);
+                    showIf('btn_sync_pos_master', remote);   // remote-only: copy master's layout
+                    showIf('tabbtn-sms', !remote);
+                    showIf('tabbtn-testing', !remote);
+                    showIf('btn_view_queue', !remote);
+                    showIf('btn_plugin_toggle', !remote);
+                    // Live/not-live banners are master-only status; the remote is push-driven.
+                    var lb=document.getElementById('plugin_live_banner'); if(lb && remote) lb.style.display='none';
+                    var nb=document.getElementById('plugin_not_live_banner'); if(nb && remote) nb.style.display='none';
+                    var note = document.getElementById('remote_mode_note');
+                    if (note) note.style.display = remote ? 'block' : 'none';
+                    showIf('master_sync_box', remote);   // remote-only: pick which master to follow
+                    // Kick the masters auto-refresh on when switching into remote view.
+                    if (remote && typeof window.startMastersAutoRefresh === 'function') window.startMastersAutoRefresh();
+                    // If a now-hidden tab is active, fall back to Settings.
+                    if (remote) {
+                        var active = document.querySelector('.tab-content.active');
+                        if (active && (active.id === 'tab-sms' || active.id === 'tab-testing')) {
+                            var sbtn = document.querySelector('.tab-btn'); // first = Settings
+                            if (typeof showTab === 'function' && sbtn) showTab('settings', sbtn);
+                        }
+                    }
+                }
+                window.applyRoleVisibility = applyRoleVisibility;
+
+                // --- "Sync to Master" picker (remote only) --------------------------------
+                var _mastersTimer = null;
+                function _esc(s) {
+                    return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){
+                        return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c];
+                    });
+                }
+                function renderMasters(d) {
+                    var box = document.getElementById('masters_list');
+                    if (!box) return;
+                    var masters = (d && d.masters) || [];
+                    if (!masters.length) {
+                        box.innerHTML = '<p class="help-text">No plugin masters found yet. Make sure another FPP is running this plugin in <strong>Master</strong> role on the same MultiSync network, then press Refresh.</p>';
+                        return;
+                    }
+                    var html = '';
+                    masters.forEach(function(m) {
+                        var label = m.name || m.address;
+                        var checked = m.selected ? ' checked' : '';
+                        html += '<label style="display:flex; align-items:center; gap:10px; padding:6px 0; margin:0; font-weight:normal; cursor:pointer;">'
+                             +  '<input type="checkbox" class="master_pick" data-addr="' + _esc(m.address) + '"' + checked + ' onchange="selectMaster(this)" style="width:auto; margin:0; flex-shrink:0;">'
+                             +  '<span style="line-height:1.3;"><strong>' + _esc(label) + '</strong>'
+                             +  '<span class="help-text" style="margin-left:8px;">' + _esc(m.address) + '</span>'
+                             +  '</span>'
+                             +  '</label>';
+                    });
+                    if (d.selected && d.selected_reachable === false) {
+                        html += '<p class="help-text" style="color:#c62828;">warning: the selected master is not reachable right now.</p>';
+                    }
+                    box.innerHTML = html;
+                }
+                function loadMasters(force) {
+                    fetch('/api/plugin/masters' + (force ? '?refresh=1' : ''))
+                        .then(function(r){ return r.json(); })
+                        .then(function(d){ if (d && d.is_remote) renderMasters(d); })
+                        .catch(function(){});
+                }
+                window.loadMasters = loadMasters;
+                function selectMaster(cb) {
+                    // Single-select: unchecking the current one clears the pin (auto / any master).
+                    var picks = document.querySelectorAll('.master_pick');
+                    picks.forEach(function(p){ if (p !== cb) p.checked = false; });
+                    var address = cb.checked ? (cb.getAttribute('data-addr') || '') : '';
+                    fetch('/api/plugin/select-master', {
+                        method: 'POST', headers: {'Content-Type':'application/json'},
+                        body: JSON.stringify({address: address})
+                    }).then(function(){ loadMasters(false); }).catch(function(){});
+                }
+                window.selectMaster = selectMaster;
+                function refreshMasters(btn) {
+                    if (btn) {
+                        btn.disabled = true; var t = btn.textContent; btn.textContent = '...';
+                        setTimeout(function(){ btn.disabled = false; btn.textContent = t; }, 1200);
+                    }
+                    loadMasters(true);
+                }
+                window.refreshMasters = refreshMasters;
+                function startMastersAutoRefresh() {
+                    if (_mastersTimer) return;
+                    loadMasters(false);
+                    _mastersTimer = setInterval(function(){ loadMasters(false); }, 10000);
+                }
+                window.startMastersAutoRefresh = startMastersAutoRefresh;
+
+                function onRoleChange() {
+                    var sel = document.getElementById('plugin_role');
+                    var remote = sel && sel.value === 'remote';
+                    window._roleManualUntil = Date.now() + 4000;  // let the save land before reconcileRole re-reads
+                    applyRoleVisibility(remote);
+                    if (typeof saveConfig === 'function') saveConfig();
+                }
+                window.onRoleChange = onRoleChange;
+                // Apply role visibility on first paint (reconcileRole() below keeps it live).
+                (function(){
+                    var sel = document.getElementById('plugin_role');
+                    applyRoleVisibility(sel && sel.value === 'remote');
+                })();
                 updateFormatRules();
                 checkFiltersState();
                 checkDuplicateState();
@@ -4488,7 +5130,7 @@ def index():
             <!-- Backup & Restore -->
             <div class="section">
                 <h2>💾 Backup &amp; Restore</h2>
-                <p class="help-text" style="margin-bottom:12px;">Export all plugin settings, the content it uses (playlists, sequences, images), and the overlay model into one file — then import it on another Pi to reproduce this setup exactly. <strong>Credentials are not included</strong> (Twilio auth token / Google Voice app password); re-enter them after importing. <a id="backup_help_link" href="#" target="_top">Learn more</a></p>
+                <p class="help-text" style="margin-bottom:12px;">Export all plugin settings, the content it uses (playlists, sequences, images), and the overlay model into one file - then import it on another Pi to reproduce this setup exactly. <strong>Credentials are not included</strong>; re-enter them after importing. <a id="backup_help_link" href="#" target="_top">Learn more</a></p>
                 <div id="backup_actions" style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
                     <button type="button" class="test-btn" onclick="openExportModal()"
                        style="background:#4CAF50;">⬇️ Export Config</button>
@@ -4496,9 +5138,14 @@ def index():
                     <button type="button" class="test-btn" onclick="document.getElementById('import_file').click()">⬆️ Import Config</button>
                     <span id="import_status" style="font-size:13px;"></span>
                 </div>
+                <label style="display:block; margin-top:10px; font-size:13px; font-weight:normal;">
+                    <input type="checkbox" id="import_mode_cb" style="width:auto; margin:0 8px 0 0; vertical-align:middle;">
+                    Also import the <strong>Master/Remote mode</strong> from the bundle.
+                    <span class="help-text" style="font-weight:normal;">Off by default, so importing keeps THIS Pi's role (and which master a remote follows). Tick only if you want the bundle's role to replace it.</span>
+                </label>
             </div>
 
-            <!-- Local export modal — only used when the page is opened directly
+            <!-- Local export modal - only used when the page is opened directly
                  (not inside the FPP iframe). In the normal framed case the modal is
                  owned by the parent (ui.php) so it is a true fixed, centred overlay
                  that ignores scrolling. Here position:fixed works because a directly
@@ -4506,7 +5153,7 @@ def index():
             <div id="export_modal" onclick="if(event.target===this)closeExportModal()" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:100000; align-items:center; justify-content:center;">
                 <div id="export_dialog" style="background:#fff; color:#333; max-width:460px; width:92%; border-radius:8px; padding:22px; box-shadow:0 8px 30px rgba(0,0,0,0.35); max-height:88vh; overflow-y:auto; box-sizing:border-box;">
                     <h3 style="margin:0 0 6px; color:#333;">Export Config</h3>
-                    <p class="help-text" style="margin:0 0 14px;">Choose what to include. Only the content <strong>this plugin is set to use</strong> is exported — never all of FPP's files. <strong>Credentials are never included.</strong></p>
+                    <p class="help-text" style="margin:0 0 14px;">Choose what to include. Only the content <strong>this plugin is set to use</strong> is exported - never all of FPP's files. <strong>Credentials are never included.</strong></p>
                     <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 12px;">
                         <input type="checkbox" id="exp_settings" checked style="width:auto; margin:3px 0 0;">
                         <span><strong>Plugin settings</strong><br><span class="help-text">Display lines, message rules, response text, filters, poll interval, selected content &amp; overlay model.</span></span>
@@ -4517,7 +5164,7 @@ def index():
                     </label>
                     <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 12px;">
                         <input type="checkbox" id="exp_content" checked style="width:auto; margin:3px 0 0;">
-                        <span><strong>Content files</strong><br><span class="help-text">The Waiting &amp; Name Display sequences, images, and videos this plugin uses — copied file-for-file. Can be large.</span></span>
+                        <span><strong>Content files</strong><br><span class="help-text">The Waiting &amp; Name Display sequences, images, and videos this plugin uses - copied file-for-file. Can be large.</span></span>
                     </label>
                     <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 18px;">
                         <input type="checkbox" id="exp_overlay" checked style="width:auto; margin:3px 0 0;">
@@ -4536,7 +5183,7 @@ def index():
                  Strings are plain ASCII to avoid any encoding edge cases. -->
             <script>
                 // Point the "Learn more" link at FPP's own web server (default port),
-                // not this plugin service (:5000) where the page actually runs — a
+                // not this plugin service (:5000) where the page actually runs - a
                 // relative plugin.php link would 404 against :5000.
                 (function() {
                     var hl = document.getElementById('backup_help_link');
@@ -4626,6 +5273,8 @@ def index():
                 function _tmlDoImport(file) {
                     var fd = new FormData();
                     fd.append('file', file);
+                    var modeCb = document.getElementById('import_mode_cb');
+                    fd.append('import_mode', (modeCb && modeCb.checked) ? '1' : '0');
                     return fetch('/api/config/import', { method: 'POST', body: fd })
                         .then(function(r) { return r.json(); });
                 }
@@ -4763,7 +5412,7 @@ def index():
                                             <option value="B2T" {{ 'selected' if lm[0] == 'B2T' else '' }}>Scroll Bottom to Top</option>
                                         </select>
                                         <div id="line_1_speed_row" class="line-speed-row" style="{{ '' if lm[0] != 'Center' else 'display:none;' }}">
-                                            <label class="line-speed-auto" title="Time the scroll to the whole display duration — the text enters at the start and finishes right at the end, whatever its length. Set how many full passes to make in that window."><input type="checkbox" id="line_1_speed_auto" {{ 'checked' if s0 <= 0 else '' }} onchange="onLineSpeedAutoChange(0)"> Fit to time</label>
+                                            <label class="line-speed-auto" title="Time the scroll to the whole display duration - the text enters at the start and finishes right at the end, whatever its length. Set how many full passes to make in that window."><input type="checkbox" id="line_1_speed_auto" {{ 'checked' if s0 <= 0 else '' }} onchange="onLineSpeedAutoChange(0)"> Fit to time</label>
                                             <span id="line_1_speed_wrap" class="line-speed-sub" style="{{ 'display:none;' if s0 <= 0 else '' }}">
                                                 <label>Speed:</label>
                                                 <input type="number" id="line_1_speed" min="1" max="100" step="1" value="{{ s0 if s0 > 0 else 50 }}" onchange="onLineSpeedChange(0)">
@@ -4815,7 +5464,7 @@ def index():
                                             <option value="B2T" {{ 'selected' if lm[1] == 'B2T' else '' }}>Scroll Bottom to Top</option>
                                         </select>
                                         <div id="line_2_speed_row" class="line-speed-row" style="{{ '' if lm[1] != 'Center' else 'display:none;' }}">
-                                            <label class="line-speed-auto" title="Time the scroll to the whole display duration — the text enters at the start and finishes right at the end, whatever its length. Set how many full passes to make in that window."><input type="checkbox" id="line_2_speed_auto" {{ 'checked' if s1 <= 0 else '' }} onchange="onLineSpeedAutoChange(1)"> Fit to time</label>
+                                            <label class="line-speed-auto" title="Time the scroll to the whole display duration - the text enters at the start and finishes right at the end, whatever its length. Set how many full passes to make in that window."><input type="checkbox" id="line_2_speed_auto" {{ 'checked' if s1 <= 0 else '' }} onchange="onLineSpeedAutoChange(1)"> Fit to time</label>
                                             <span id="line_2_speed_wrap" class="line-speed-sub" style="{{ 'display:none;' if s1 <= 0 else '' }}">
                                                 <label>Speed:</label>
                                                 <input type="number" id="line_2_speed" min="1" max="100" step="1" value="{{ s1 if s1 > 0 else 50 }}" onchange="onLineSpeedChange(1)">
@@ -4867,7 +5516,7 @@ def index():
                                             <option value="B2T" {{ 'selected' if lm[2] == 'B2T' else '' }}>Scroll Bottom to Top</option>
                                         </select>
                                         <div id="line_3_speed_row" class="line-speed-row" style="{{ '' if lm[2] != 'Center' else 'display:none;' }}">
-                                            <label class="line-speed-auto" title="Time the scroll to the whole display duration — the text enters at the start and finishes right at the end, whatever its length. Set how many full passes to make in that window."><input type="checkbox" id="line_3_speed_auto" {{ 'checked' if s2 <= 0 else '' }} onchange="onLineSpeedAutoChange(2)"> Fit to time</label>
+                                            <label class="line-speed-auto" title="Time the scroll to the whole display duration - the text enters at the start and finishes right at the end, whatever its length. Set how many full passes to make in that window."><input type="checkbox" id="line_3_speed_auto" {{ 'checked' if s2 <= 0 else '' }} onchange="onLineSpeedAutoChange(2)"> Fit to time</label>
                                             <span id="line_3_speed_wrap" class="line-speed-sub" style="{{ 'display:none;' if s2 <= 0 else '' }}">
                                                 <label>Speed:</label>
                                                 <input type="number" id="line_3_speed" min="1" max="100" step="1" value="{{ s2 if s2 > 0 else 50 }}" onchange="onLineSpeedChange(2)">
@@ -4919,7 +5568,7 @@ def index():
                                             <option value="B2T" {{ 'selected' if lm[3] == 'B2T' else '' }}>Scroll Bottom to Top</option>
                                         </select>
                                         <div id="line_4_speed_row" class="line-speed-row" style="{{ '' if lm[3] != 'Center' else 'display:none;' }}">
-                                            <label class="line-speed-auto" title="Time the scroll to the whole display duration — the text enters at the start and finishes right at the end, whatever its length. Set how many full passes to make in that window."><input type="checkbox" id="line_4_speed_auto" {{ 'checked' if s3 <= 0 else '' }} onchange="onLineSpeedAutoChange(3)"> Fit to time</label>
+                                            <label class="line-speed-auto" title="Time the scroll to the whole display duration - the text enters at the start and finishes right at the end, whatever its length. Set how many full passes to make in that window."><input type="checkbox" id="line_4_speed_auto" {{ 'checked' if s3 <= 0 else '' }} onchange="onLineSpeedAutoChange(3)"> Fit to time</label>
                                             <span id="line_4_speed_wrap" class="line-speed-sub" style="{{ 'display:none;' if s3 <= 0 else '' }}">
                                                 <label>Speed:</label>
                                                 <input type="number" id="line_4_speed" min="1" max="100" step="1" value="{{ s3 if s3 > 0 else 50 }}" onchange="onLineSpeedChange(3)">
@@ -4960,12 +5609,14 @@ def index():
 
                         <!-- Canvas: per-line drag in static mode; block preview in scroll modes -->
                         <div id="canvas_section">
-                            <p id="canvas_hint" style="font-weight:bold; font-size:13px; color:#4fc3f7; margin:4px 0 8px;">🖱️ Click a line to select it, then drag inside its box to move it, or drag an edge/corner to resize. Text auto-sizes to fill the box — the box is the MAX size text can be.</p>
-                            <p class="help-text" style="margin:-4px 0 8px;">↔️ For scrolling text (Left/Right/Top/Bottom movement), the box is also where the text is allowed to show — it enters and exits at the box's own edges, not the display's, and always starts fully off-page before scrolling in.</p>
+                            <p id="canvas_hint" style="font-weight:bold; font-size:13px; color:#4fc3f7; margin:4px 0 8px;">🖱️ Click a line to select it, then drag inside its box to move it, or drag an edge/corner to resize. Text auto-sizes to fill the box - the box is the MAX size text can be.</p>
+                            <p class="help-text" style="margin:-4px 0 8px;">↔️ For scrolling text (Left/Right/Top/Bottom movement), the box is also where the text is allowed to show - it enters and exits at the box's own edges, not the display's, and always starts fully off-page before scrolling in.</p>
                             <canvas id="matrix_canvas" style="width:100%; display:block; background:#000; border:2px solid #555; border-radius:4px; cursor:default;"></canvas>
                             <div style="display:flex; gap:8px; margin-top:6px; align-items:center;">
                                 <button type="button" onclick="resetAllLines()" style="background:#555; padding:6px 12px; font-size:12px;">Reset All to Center</button>
+                                <button type="button" id="btn_sync_pos_master" onclick="syncPositionFromMaster(this)" style="display:none; background:#1976d2; color:#fff; padding:6px 12px; font-size:12px;" title="Copy the Master's text layout for this content, scaled to this projector's model">🔗 Sync Position from Master</button>
                                 <span id="pos_display" style="font-size:12px; color:#888;"></span>
+                                <span id="sync_pos_status" style="font-size:12px; color:#888;"></span>
                             </div>
 
                             <div style="margin-top:10px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
@@ -5031,7 +5682,7 @@ def index():
             <div class="section" style="border: 2px solid #2196F3; margin-top: 20px;">
                 <h2>📱 SMS Auto-Response Settings</h2>
                 <p class="help-text">💡 Enable a response for each event type individually. Only one response is ever sent per incoming message.</p>
-                <!-- Twilio-specific delivery warnings — hidden when Google Voice is the source -->
+                <!-- Twilio-specific delivery warnings - hidden when Google Voice is the source -->
                 <div id="twilio_sms_warnings">
                     <div style="background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:5px; padding:10px 14px; margin:10px 0; font-size:13px;">
                         ⚠️ <strong>Message &amp; data rates may apply.</strong>
@@ -5039,8 +5690,8 @@ def index():
                     <div style="background:#f8d7da; border:2px solid #f5c6cb; color:#721c24; border-radius:6px; padding:12px 16px; margin:10px 0; font-size:14px; font-weight:bold;">
                         ⛔ SMS responses will NOT be delivered unless your Twilio number is registered:<br>
                         <span style="font-weight:normal; font-size:13px; display:block; margin-top:6px;">
-                            • <strong>Local 10-digit number</strong> — requires a valid A2P 10DLC brand &amp; campaign approval<br>
-                            • <strong>Toll-free number</strong> — requires a completed toll-free verification (recommended)
+                            • <strong>Local 10-digit number</strong> - requires a valid A2P 10DLC brand &amp; campaign approval<br>
+                            • <strong>Toll-free number</strong> - requires a completed toll-free verification (recommended)
                         </span>
                     </div>
                 </div>
@@ -5074,7 +5725,7 @@ def index():
                 <div id="row_success" class="resp-row">
                     <div class="resp-toggle">
                         <label class="toggle-switch"><input type="checkbox" id="sms_response_success" {{ 'checked' if config.get('sms_response_success', False) else '' }} onchange="toggleResp('success')"><span class="toggle-slider"></span></label>
-                        <label for="sms_response_success" style="margin-left:10px;vertical-align:middle;">✅ Success — Send Response</label>
+                        <label for="sms_response_success" style="margin-left:10px;vertical-align:middle;">✅ Success - Send Response</label>
                     </div>
                     <textarea id="response_success" rows="2">{{ config.get('response_success', 'Thanks! Your name will appear on our display soon! 🎄') }}</textarea>
                 </div>
@@ -5082,7 +5733,7 @@ def index():
                 <div id="row_show_not_live" class="resp-row">
                     <div class="resp-toggle">
                         <label class="toggle-switch"><input type="checkbox" id="sms_response_show_not_live" {{ 'checked' if config.get('sms_response_show_not_live', False) else '' }} onchange="toggleResp('show_not_live')"><span class="toggle-slider"></span></label>
-                        <label for="sms_response_show_not_live" style="margin-left:10px;vertical-align:middle;">🔴 Show Not Live — Send Response</label>
+                        <label for="sms_response_show_not_live" style="margin-left:10px;vertical-align:middle;">🔴 Show Not Live - Send Response</label>
                     </div>
                     <p class="help-text" style="margin:4px 0 6px;">Sent to anyone who texts while the show is not active.</p>
                     <textarea id="response_show_not_live" rows="2">{{ config.get('response_show_not_live', "Ho, Ho, Ho, It looks like our show isn't running now. Try again later.") }}</textarea>
@@ -5094,10 +5745,10 @@ def index():
                                {{ 'checked' if config.get('sms_response_invalid_format', False) else '' }}
                                {{ 'disabled' if config.get('use_whitelist', False) else '' }}
                                onchange="toggleResp('invalid_format')"><span class="toggle-slider"></span></label>
-                        <label for="sms_response_invalid_format" style="margin-left:10px;vertical-align:middle;">❌ Invalid Format — Send Response</label>
+                        <label for="sms_response_invalid_format" style="margin-left:10px;vertical-align:middle;">❌ Invalid Format - Send Response</label>
                     </div>
-                    <p class="help-text">💡 Type <code>{words}</code> anywhere in this message to auto-fill your current word limit — it becomes "<span id="words_preview">2 words</span>" in the reply, based on your <strong>Name Format Rules</strong> (One Word Only → "1 word", Two Words Maximum → "2 words").</p>
-                    <p id="invalid_format_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('use_whitelist', False) else 'display:none;' }}">⚠️ Invalid Format responses are disabled when the whitelist is active — all names are validated against the whitelist instead of format rules.</p>
+                    <p class="help-text">💡 Type <code>{words}</code> anywhere in this message to auto-fill your current word limit - it becomes "<span id="words_preview">2 words</span>" in the reply, based on your <strong>Name Format Rules</strong> (One Word Only → "1 word", Two Words Maximum → "2 words").</p>
+                    <p id="invalid_format_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('use_whitelist', False) else 'display:none;' }}">⚠️ Invalid Format responses are disabled when the whitelist is active - all names are validated against the whitelist instead of format rules.</p>
                     <textarea id="response_invalid_format" rows="2">{{ config.get('response_invalid_format', 'Please send only 1 name ({words}, no sentences).') }}</textarea>
                 </div>
 
@@ -5107,17 +5758,17 @@ def index():
                                {{ 'checked' if config.get('sms_response_too_long', False) else '' }}
                                {{ 'disabled' if config.get('use_whitelist', False) else '' }}
                                onchange="toggleResp('too_long')"><span class="toggle-slider"></span></label>
-                        <label for="sms_response_too_long" style="margin-left:10px;vertical-align:middle;">📏 Message Too Long — Send Response</label>
+                        <label for="sms_response_too_long" style="margin-left:10px;vertical-align:middle;">📏 Message Too Long - Send Response</label>
                     </div>
                     <p class="help-text">📏 Sent when a message is longer than your <strong>Max Message Length</strong>. Applies whether or not the word-count rules are on.</p>
-                    <p id="too_long_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('use_whitelist', False) else 'display:none;' }}">⚠️ Too Long responses are disabled when the whitelist is active — names are validated against the whitelist, not by length.</p>
+                    <p id="too_long_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('use_whitelist', False) else 'display:none;' }}">⚠️ Too Long responses are disabled when the whitelist is active - names are validated against the whitelist, not by length.</p>
                     <textarea id="response_too_long" rows="2">{{ config.get('response_too_long', "I'm sorry, your message exceeds our max message length. Please only send your name.") }}</textarea>
                 </div>
 
                 <div id="row_profanity" class="resp-row">
                     <div class="resp-toggle">
                         <label class="toggle-switch"><input type="checkbox" id="sms_response_profanity" {{ 'checked' if config.get('sms_response_profanity', False) else '' }} onchange="toggleResp('profanity')"><span class="toggle-slider"></span></label>
-                        <label for="sms_response_profanity" style="margin-left:10px;vertical-align:middle;">🤬 Profanity Detected — Send Response</label>
+                        <label for="sms_response_profanity" style="margin-left:10px;vertical-align:middle;">🤬 Profanity Detected - Send Response</label>
                     </div>
                     <textarea id="response_profanity" rows="2">{{ config.get('response_profanity', 'Sorry, your message contains inappropriate content and cannot be displayed.') }}</textarea>
                 </div>
@@ -5125,7 +5776,7 @@ def index():
                 <div id="row_blocked" class="resp-row">
                     <div class="resp-toggle">
                         <label class="toggle-switch"><input type="checkbox" id="sms_response_blocked" {{ 'checked' if config.get('sms_response_blocked', False) else '' }} onchange="toggleResp('blocked')"><span class="toggle-slider"></span></label>
-                        <label for="sms_response_blocked" style="margin-left:10px;vertical-align:middle;">🚫 Blocked Number — Send Response</label>
+                        <label for="sms_response_blocked" style="margin-left:10px;vertical-align:middle;">🚫 Blocked Number - Send Response</label>
                     </div>
                     <textarea id="response_blocked" rows="2">{{ config.get('response_blocked', 'You have been blocked from sending messages.') }}</textarea>
                 </div>
@@ -5136,7 +5787,7 @@ def index():
                                {{ 'checked' if config.get('sms_response_rate_limited', False) else '' }}
                                {{ 'disabled' if config.get('max_messages_per_phone', 0) == 0 else '' }}
                                onchange="toggleResp('rate_limited')"><span class="toggle-slider"></span></label>
-                        <label for="sms_response_rate_limited" style="margin-left:10px;vertical-align:middle;">⛔ Rate Limited — Send Response</label>
+                        <label for="sms_response_rate_limited" style="margin-left:10px;vertical-align:middle;">⛔ Rate Limited - Send Response</label>
                     </div>
                     <p id="rate_limited_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('max_messages_per_phone', 0) == 0 else 'display:none;' }}">⚠️ Rate-Limited responses are disabled when Max Messages Per Phone is 0 (unlimited).</p>
                     <textarea id="response_rate_limited" rows="2">{{ config.get('response_rate_limited', "You've reached the maximum number of messages allowed. Please try again tomorrow!") }}</textarea>
@@ -5148,9 +5799,9 @@ def index():
                                {{ 'checked' if config.get('sms_response_duplicate', False) else '' }}
                                {{ 'disabled' if config.get('allow_duplicate_names', False) else '' }}
                                onchange="toggleResp('duplicate')"><span class="toggle-slider"></span></label>
-                        <label for="sms_response_duplicate" style="margin-left:10px;vertical-align:middle;">🔄 Duplicate Name — Send Response</label>
+                        <label for="sms_response_duplicate" style="margin-left:10px;vertical-align:middle;">🔄 Duplicate Name - Send Response</label>
                     </div>
-                    <p id="duplicate_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('allow_duplicate_names', False) else 'display:none;' }}">⚠️ <strong>Allow Duplicate Names is enabled</strong> — This response is disabled.</p>
+                    <p id="duplicate_disabled_warning" class="resp-locked-note" style="{{ '' if config.get('allow_duplicate_names', False) else 'display:none;' }}">⚠️ <strong>Allow Duplicate Names is enabled</strong> - This response is disabled.</p>
                     <textarea id="response_duplicate" rows="2">{{ config.get('response_duplicate', "You've already sent this name today!") }}</textarea>
                 </div>
 
@@ -5160,9 +5811,9 @@ def index():
                                {{ 'checked' if config.get('sms_response_not_whitelisted', False) else '' }}
                                {{ 'disabled' if not config.get('use_whitelist', False) else '' }}
                                onchange="toggleResp('not_whitelisted')"><span class="toggle-slider"></span></label>
-                        <label for="sms_response_not_whitelisted" style="margin-left:10px;vertical-align:middle;">📋 Not on Whitelist — Send Response</label>
+                        <label for="sms_response_not_whitelisted" style="margin-left:10px;vertical-align:middle;">📋 Not on Whitelist - Send Response</label>
                     </div>
-                    <p id="not_whitelisted_disabled_warning" class="resp-locked-note" style="{{ '' if not config.get('use_whitelist', False) else 'display:none;' }}">⚠️ <strong>Name Whitelist is disabled</strong> — This response is disabled.</p>
+                    <p id="not_whitelisted_disabled_warning" class="resp-locked-note" style="{{ '' if not config.get('use_whitelist', False) else 'display:none;' }}">⚠️ <strong>Name Whitelist is disabled</strong> - This response is disabled.</p>
                     <textarea id="response_not_whitelisted" rows="2">{{ config.get('response_not_whitelisted', 'Sorry, that name is not on our approved list.') }}</textarea>
                 </div>
 
@@ -5176,7 +5827,7 @@ def index():
                 <h2>🧪 Message Testing</h2>
 
                 <div id="show_not_live_banner" style="display:none; background:#ffecb3; border:1px solid #FF9800; border-radius:6px; padding:10px 14px; margin-bottom:14px; color:#7a4f00; font-size:14px;">
-                    🔴 Show is not live — press <strong>Start</strong> or run the <strong>Text My Lights Start</strong> script to activate the display before testing.
+                    🔴 Show is not live - press <strong>Start</strong> or run the <strong>Text My Lights Start</strong> script to activate the display before testing.
                 </div>
 
                 <div id="test_form_inner">
@@ -5216,6 +5867,15 @@ def index():
             }
 
             function updateLiveStatus() {
+                // On a Remote there is no Start/Stop or live state - the Master runs the show.
+                // Keep those controls hidden and skip the master-only status UI entirely.
+                var _rs = document.getElementById('plugin_role');
+                if (_rs && _rs.value === 'remote') {
+                    var t=document.getElementById('btn_plugin_toggle'); if(t) t.style.display='none';
+                    var lb=document.getElementById('plugin_live_banner'); if(lb) lb.style.display='none';
+                    var nb=document.getElementById('plugin_not_live_banner'); if(nb) nb.style.display='none';
+                    return;
+                }
                 fetch('/api/queue/status').then(r => r.json()).then(data => {
                     const live = data.show_live === true;
                     _pluginLive = live;
@@ -5425,7 +6085,7 @@ def index():
 
             // Per-line Font select
             function onLineFontChange(i) {
-                // Can't call getLineFont(i) here — it's local to initCanvasPreview()'s
+                // Can't call getLineFont(i) here - it's local to initCanvasPreview()'s
                 // closure, not visible in this scope. Read the select directly instead,
                 // same as onLineMovementChange/onLineSpeedChange do for their inputs.
                 var el = document.getElementById('line_' + (i + 1) + '_font');
@@ -5463,7 +6123,7 @@ def index():
                 canvas.height = Math.round(640 * window._canvasModelH / window._canvasModelW);
 
                 // Load per-line boxes from config (injected as JS by server to avoid HTML
-                // attribute quote issues). Each box is the MAX area a line renders into —
+                // attribute quote issues). Each box is the MAX area a line renders into -
                 // font size auto-fits to it. x/y < 0 means auto-position; w/h are always
                 // concrete (there's no "auto size" for the fit target itself).
                 var initLB = (window._lineBoxesInit && Array.isArray(window._lineBoxesInit))
@@ -5708,8 +6368,8 @@ def index():
 
                     // Kick off loading of every line's font (no-op if already loaded/loading).
                     // ensureFontLoaded repaints when a font finishes, so a preview drawn before
-                    // a custom font is ready — the common post-reboot / two-different-fonts case
-                    // — corrects itself without needing to toggle the font dropdown.
+                    // a custom font is ready - the common post-reboot / two-different-fonts case
+                    // - corrects itself without needing to toggle the font dropdown.
                     if (typeof ensureFontLoaded === 'function') {
                         for (var _ff = 0; _ff < 4; _ff++) {
                             try { ensureFontLoaded(getLineFont(_ff)); } catch(e) {}
@@ -5849,7 +6509,7 @@ def index():
                             ctx.restore();
 
                             // Clip to the intersection of the box and the model's true visible
-                            // area — matches the runtime, where a box extending past the model
+                            // area - matches the runtime, where a box extending past the model
                             // edge is cut off there regardless of how far the box itself
                             // continues (there are no pixels beyond the model edge to draw into).
                             var clipX0 = Math.max(boxX, gutterOriginX), clipY0 = Math.max(boxY, gutterOriginY);
@@ -6043,7 +6703,7 @@ def index():
 
                 // Boxes are always freely movable + resizable in both dimensions now,
                 // regardless of movement type. Any of the 8 handles (4 corners + 4 edges)
-                // on the selected line's box can be grabbed — corners resize both width and
+                // on the selected line's box can be grabbed - corners resize both width and
                 // height together, edges resize just one dimension, like a normal image
                 // resize in Word/PowerPoint.
                 function hitTestHandle(cx, cy) {
@@ -6072,7 +6732,7 @@ def index():
                         var r = lineRects[selectedLine];
                         var b = window._lineBoxes[selectedLine];
                         // Resolve any -1 (auto) position to concrete model coords from the
-                        // last render — resizing needs a real edge to anchor against.
+                        // last render - resizing needs a real edge to anchor against.
                         var curX = b.x === -1 ? Math.round(r.x / modelScaleX) : b.x;
                         var curY = b.y === -1 ? Math.round(r.y / modelScaleY) : b.y;
                         b.x = curX; b.y = curY;
@@ -6119,7 +6779,7 @@ def index():
                         renderCanvasPreview();
                     } else if (dragging && selectedLine >= 0) {
                         var r2 = lineRects[selectedLine] || {w: 20, h: 20};
-                        var pxX = Math.max(0, Math.min(canvas.width  - r2.w, c.cx - dragOffX));
+                        var pxX = Math.max(0, Math.min(canvas.width - r2.w, c.cx - dragOffX));
                         var pxY = Math.max(0, Math.min(canvas.height - r2.h, c.cy - dragOffY));
                         var newX = Math.round(pxX / modelScaleX);
                         var newY = Math.round(pxY / modelScaleY);
@@ -6152,7 +6812,7 @@ def index():
                     if (!dragging && !resizing) { hoveredLine = -1; canvas.style.cursor = 'default'; renderCanvasPreview(); }
                 });
 
-                // Arrow key nudging — moves selected line 1px per press, 10px with Shift
+                // Arrow key nudging - moves selected line 1px per press, 10px with Shift
                 // saveConfig is debounced so holding a key doesn't spam the server
                 var _arrowSaveTimer = null;
                 document.addEventListener('keydown', function(e) {
@@ -6206,7 +6866,7 @@ def index():
             }
 
             // ---------------------------------------------------------------------------
-            // Canvas background preview — supports FSEQ (.fseq), video (vid:), image (img:)
+            // Canvas background preview - supports FSEQ (.fseq), video (vid:), image (img:)
             // ---------------------------------------------------------------------------
             (function() {
                 var _fseqMeta   = null;
@@ -6246,7 +6906,7 @@ def index():
                     if (val.startsWith('img:')) {
                         return { type: 'img', file: val.replace(/^img:/, '') };
                     }
-                    return null;  // plain playlist — no canvas preview
+                    return null;  // plain playlist - no canvas preview
                 }
 
                 // ===================== Names Content List =====================
@@ -6337,7 +6997,7 @@ def index():
                     if (box) {
                         box.innerHTML='';
                         if (lst.length===0) {
-                            box.innerHTML='<div style="font-size:13px;color:#777;">No content added — names show over the Waiting content.</div>';
+                            box.innerHTML='<div style="font-size:13px;color:#777;">No content added - names show over the Waiting content.</div>';
                         } else {
                             lst.forEach(function(it, i){
                                 var row=document.createElement('div');
@@ -6370,7 +7030,7 @@ def index():
                     var prow=document.getElementById('preview_content_row');
                     if (prow) prow.style.display=(lst.length>1)?'block':'none';
                     var scope=document.getElementById('content_duration_scope');
-                    if (scope) scope.textContent=(lst.length>0)?('— for content '+(window._namesSelectedIndex+1)):'— shown over waiting content';
+                    if (scope) scope.textContent=(lst.length>0)?('- for content '+(window._namesSelectedIndex+1)):'- shown over waiting content';
                 }
 
                 // ---- Manage Content modal (Available <-> Names list, with arrows) ----
@@ -6536,6 +7196,52 @@ def index():
                 window.collectEditorLayout=collectEditorLayout;
                 window.applyLayoutToEditor=applyLayoutToEditor;
 
+                // Remote only: copy the Master's text layout for the selected content, scaling
+                // the box positions/sizes from the Master's overlay model to THIS projector's
+                // model so it lands in the same relative spot. Auto-centered boxes (x/y = -1)
+                // stay auto, so they adapt regardless of model size.
+                function syncPositionFromMaster(btn) {
+                    var lst = window._namesContentList || [];
+                    var idx = window._namesSelectedIndex;
+                    var content = (lst[idx] && lst[idx].content) || '';
+                    var status = document.getElementById('sync_pos_status');
+                    if (!content) { if(status){status.style.color='#f44336'; status.textContent='Pick a content first.';} return; }
+                    if (btn) btn.disabled = true;
+                    if (status){ status.style.color='#888'; status.textContent='Fetching from master…'; }
+                    fetch('/api/plugin/master-layout?content=' + encodeURIComponent(content))
+                      .then(function(r){ return r.json(); })
+                      .then(function(d){
+                        if (!d || !d.found) {
+                            if(status){ status.style.color='#f44336'; status.textContent = (d && d.error) ? d.error : 'Master has no layout for this content.'; }
+                            return;
+                        }
+                        var L = d.layout || {};
+                        var rw = parseInt(document.getElementById('overlay_model_width').value)||0;
+                        var rh = parseInt(document.getElementById('overlay_model_height').value)||0;
+                        var sx = (d.model_w>0 && rw>0) ? (rw/d.model_w) : 1;
+                        var sy = (d.model_h>0 && rh>0) ? (rh/d.model_h) : 1;
+                        var boxes = (L.line_boxes||[]).map(function(b){
+                            b = b || {x:-1,y:-1,w:300,h:60};
+                            return { x: (b.x<0?b.x:Math.round(b.x*sx)),
+                                     y: (b.y<0?b.y:Math.round(b.y*sy)),
+                                     w: Math.max(1, Math.round((b.w||300)*sx)),
+                                     h: Math.max(1, Math.round((b.h||60)*sy)) };
+                        });
+                        applyLayoutToEditor({
+                            message_lines: L.message_lines, line_boxes: boxes, line_colors: L.line_colors,
+                            line_movements: L.line_movements, line_speeds: L.line_speeds,
+                            line_fonts: L.line_fonts, line_orientations: L.line_orientations,
+                            display_duration: L.display_duration
+                        });
+                        flushEditorToSelected();
+                        if (typeof saveConfig==='function') saveConfig();
+                        if(status){ status.style.color='#4CAF50'; status.textContent = (sx===1&&sy===1) ? '✓ Synced from master' : '✓ Synced + scaled to this model'; }
+                      })
+                      .catch(function(){ if(status){ status.style.color='#f44336'; status.textContent='Could not reach master.'; } })
+                      .finally(function(){ if (btn) btn.disabled = false; });
+                }
+                window.syncPositionFromMaster = syncPositionFromMaster;
+
                 // ===================== Waiting Content Rotation List =====================
                 window._waitingContentList = Array.isArray(window._waitingContentListInit) ? window._waitingContentListInit : [];
                 window._waitingMode = window._waitingContentModeInit || 'roundrobin';
@@ -6556,7 +7262,7 @@ def index():
                     if (box) {
                         box.innerHTML='';
                         if (lst.length===0) {
-                            box.innerHTML='<div style="font-size:13px;color:#777;">No content added yet — click below to choose the sequence(s) that loop while waiting.</div>';
+                            box.innerHTML='<div style="font-size:13px;color:#777;">No content added yet - click below to choose the sequence(s) that loop while waiting.</div>';
                         } else {
                             lst.forEach(function(it, i){
                                 var row=document.createElement('div');
@@ -6735,6 +7441,22 @@ def index():
                     if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
                 }
 
+                // Seconds to cap the preview scrubber at: the SELECTED names content's own
+                // display_duration (from the data model, which is correct from page load),
+                // falling back to the DOM duration fields. Reading the data model avoids a
+                // timing bug where loadBgPreview ran before content_duration was populated and
+                // fell back to the global 30s.
+                function _previewCapSeconds() {
+                    var lst = window._namesContentList || [];
+                    var idx = window._namesSelectedIndex;
+                    if (lst.length > 0 && idx != null && idx >= 0 && idx < lst.length) {
+                        var d = parseInt(lst[idx].display_duration);
+                        if (d > 0) return d;
+                    }
+                    var el = document.getElementById('content_duration') || document.getElementById('display_duration');
+                    return (el && parseInt(el.value)) || 30;
+                }
+
                 function loadBgPreview() {
                     var ct = getConfiguredContent();
                     if (!ct) return;
@@ -6772,8 +7494,7 @@ def index():
                                 // send_to_fpp/display loop) -- anything past that point in the
                                 // FSEQ is never actually seen behind a message, so cap the
                                 // scrubber there instead of the file's full length.
-                                var _durEl = document.getElementById('content_duration') || document.getElementById('display_duration');
-                                var displayDur = (_durEl && parseInt(_durEl.value)) || 30;
+                                var displayDur = _previewCapSeconds();
                                 var totalSec = Math.min(displayDur, Math.max(1, Math.floor(data.duration_ms / 1000)));
                                 var scrubber = document.getElementById('fseq_scrubber');
                                 scrubber.max = totalSec;
@@ -6797,8 +7518,7 @@ def index():
                         // Capped to display_duration, not the video's own length -- playback
                         // always restarts from 0 and is cut off after display_duration seconds
                         // each time a message shows, so nothing past that point is ever seen.
-                        var _vDurEl = document.getElementById('content_duration') || document.getElementById('display_duration');
-                        scrubber.max = (_vDurEl && parseInt(_vDurEl.value)) || 30;
+                        scrubber.max = Math.max(1, _previewCapSeconds());
                         scrubber.value = 0;
                         window._scrubSeconds = 0;
                         document.getElementById('fseq_scrubber_row').style.display = '';
@@ -6924,7 +7644,7 @@ def index():
                 if (warn) warn.style.display = ((window._namesContentList || []).length === 0) ? 'block' : 'none';
             }
 
-            // All DOM elements are above this script block — call init functions directly.
+            // All DOM elements are above this script block - call init functions directly.
             // Each step is isolated: a failure in one (e.g. the FSEQ preview) must not
             // abort the rest, or the credential-block toggle (setupAutoSave →
             // updateSourceUI) would never run and the page would show the wrong
@@ -6944,6 +7664,56 @@ def index():
             _init('duplicateResp', checkDuplicateState);
             _init('wordsPreview', updateWordsPreview);
             _init('autoSave', setupAutoSave);
+            // Keep the role toggle + remote view in sync with the LIVE role while the page is
+            // open, so switching FPP player↔remote flips the UI without a manual refresh.
+            function reconcileRole() {
+                // Don't stomp a just-made manual selection while its save is in flight.
+                if (window._roleManualUntil && Date.now() < window._roleManualUntil) return;
+                fetch('/api/plugin_role').then(function(r){return r.json();}).then(function(d){
+                    if (!d || !d.role) return;
+                    if (window._roleManualUntil && Date.now() < window._roleManualUntil) return;
+                    var sel = document.getElementById('plugin_role');
+                    if (sel) sel.value = d.role;
+                    // Always enforce visibility to match the LIVE role - not only when the select
+                    // value changed - so the shown tabs can never drift out of sync with the role
+                    // (e.g. a remote that somehow still shows the SMS/Testing tabs).
+                    if (typeof window.applyRoleVisibility === 'function') window.applyRoleVisibility(d.role === 'remote');
+                }).catch(function(){});
+            }
+            reconcileRole();
+            setInterval(reconcileRole, 5000);
+            // Remote: live-refresh the names content list when the master adds/removes content,
+            // so the Display dropdown/list updates without a manual reload. Only acts on
+            // MEMBERSHIP changes (ids added/removed/reordered) so it never stomps layout edits
+            // to a surviving selected item.
+            function refreshRemoteNamesContent() {
+                var _rs = document.getElementById('plugin_role');
+                if (!_rs || _rs.value !== 'remote') return;
+                fetch('/api/plugin/names-content').then(function(r){return r.json();}).then(function(d){
+                    if (!d || !d.is_remote || !Array.isArray(d.names_content_list)) return;
+                    var serverIds = d.names_content_list.map(function(it){ return it.content || ''; });
+                    var cur = window._namesContentList || [];
+                    var localIds = cur.map(function(it){ return it.content || ''; });
+                    if (JSON.stringify(serverIds) === JSON.stringify(localIds)) return;  // no membership change
+                    var prevSelId = (cur[window._namesSelectedIndex] || {}).content || null;
+                    var byId = {}; cur.forEach(function(it){ if (it.content) byId[it.content] = it; });
+                    // Rebuild in server order, keeping the local item (with any in-progress
+                    // layout edits) for surviving ids; use the server item for new ids.
+                    window._namesContentList = d.names_content_list.map(function(it){ return byId[it.content] || it; });
+                    var lst = window._namesContentList;
+                    var newIdx = -1;
+                    if (prevSelId) { for (var i = 0; i < lst.length; i++) { if (lst[i].content === prevSelId) { newIdx = i; break; } } }
+                    if (newIdx < 0) newIdx = (lst.length > 0) ? 0 : -1;
+                    var selectionChanged = (newIdx < 0) || !prevSelId || (lst[newIdx] && lst[newIdx].content !== prevSelId);
+                    window._namesSelectedIndex = newIdx;
+                    if (typeof window.renderNamesList === 'function') window.renderNamesList();
+                    // Only reset the editor if the selected content actually changed (so edits
+                    // to a surviving selected item are not stomped).
+                    if (selectionChanged && newIdx >= 0 && typeof applyLayoutToEditor === 'function') applyLayoutToEditor(lst[newIdx]);
+                    if (typeof window.toggleFseqPreview === 'function') window.toggleFseqPreview();
+                }).catch(function(){});
+            }
+            setInterval(refreshRemoteNamesContent, 10000);
             _init('liveStatus', updateLiveStatus);
             setInterval(updateLiveStatus, 5000);
             for (var _li = 0; _li < 4; _li++) { updateLineSpeedRowVisibility(_li); updateLineOrientationRowVisibility(_li); }
@@ -7021,7 +7791,7 @@ def index():
                             sel.innerHTML = '<option value="FreeSans">FreeSans (default)</option>';
                         }
                     }
-                    // Font dropdowns are now populated — safe for autosave to read them.
+                    // Font dropdowns are now populated - safe for autosave to read them.
                     window._fontsReady = !!(fonts && fonts.length > 0);
                     return Promise.all(currentFonts.map(ensureFontLoaded));
                 })
@@ -7116,7 +7886,7 @@ def index():
                         saveConfig();
                     });
 
-                    // Names list UI (and the modal picker) are ready — render them.
+                    // Names list UI (and the modal picker) are ready - render them.
                     try { if (window.initNamesUI) window.initNamesUI(); } catch(e) { console.error('Names UI init error:', e); }
                     // Waiting content rotation list UI (needs _fppSeqList/_fppImgList populated).
                     try { if (window.initWaitingUI) window.initWaitingUI(); } catch(e) { console.error('Waiting UI init error:', e); }
@@ -7146,6 +7916,7 @@ var _saveTimer = null;
                 if (typeof window.flushEditorToSelected === 'function') window.flushEditorToSelected();
 
                 const data = {
+                    plugin_role: (document.getElementById('plugin_role')||{}).value || '',
                     message_source: document.getElementById('message_source').value,
                     twilio_account_sid: document.getElementById('account_sid').value,
                     twilio_auth_token: document.getElementById('auth_token').value,
@@ -7213,7 +7984,7 @@ var _saveTimer = null;
                 // populated the font dropdowns. Otherwise an autosave that fires
                 // during page init (e.g. model-dimension sync or the stale-content
                 // reset, both inside loadFPPData) would read empty <select>s and
-                // overwrite the saved/imported fonts with the FreeSans default —
+                // overwrite the saved/imported fonts with the FreeSans default -
                 // which is exactly why imported fonts appeared to "not transfer".
                 // Omitting the key leaves the server's stored line_fonts untouched.
                 if (window._fontsReady) {
@@ -7242,13 +8013,13 @@ var _saveTimer = null;
 
             function setupAutoSave() {
                 // The show's live state (config.enabled) is owned by the Start/Stop
-                // scheduler commands (api_activate / api_deactivate) — there is no
+                // scheduler commands (api_activate / api_deactivate) - there is no
                 // manual enable toggle, so config saves here never touch it.
 
                 // Turn on the auto-responses that can actually fire under Google
                 // Voice (Twilio keeps them off / hidden). Skips rows locked by another
                 // setting: rate-limited (unlimited), duplicate (dupes allowed),
-                // invalid-format (whitelist on) — those stay off.
+                // invalid-format (whitelist on) - those stay off.
                 function enableGvResponses() {
                     ['show_not_live','blocked','profanity','invalid_format','not_whitelisted','success'].forEach(function(id) {
                         var cb = document.getElementById('sms_response_' + id);
@@ -7259,7 +8030,7 @@ var _saveTimer = null;
                         }
                     });
                 }
-                // Message source selector — swap the visible credential block, apply
+                // Message source selector - swap the visible credential block, apply
                 // the source's rate-limit default, and save.
                 var srcEl = document.getElementById('message_source');
                 if (srcEl) srcEl.addEventListener('change', function() {
@@ -7276,7 +8047,7 @@ var _saveTimer = null;
                     if (isGV) enableGvResponses();  // Google Voice: turn on the usable responses
                     saveConfig();
                 });
-                // Google Voice credential fields — save on blur (like Twilio creds)
+                // Google Voice credential fields - save on blur (like Twilio creds)
                 ['gv_email','gv_app_password'].forEach(function(id) {
                     var el = document.getElementById(id);
                     if (el) el.addEventListener('blur', saveConfig);
@@ -7287,7 +8058,7 @@ var _saveTimer = null;
                 // Reflect the saved source on initial load
                 updateSourceUI();
 
-                // Checkboxes, selects, color picker — save immediately on change
+                // Checkboxes, selects, color picker - save immediately on change
                 ['profanity_filter','use_whitelist','allow_duplicate_names',
                  'default_playlist','name_display_playlist','overlay_model_name',
                  'one_word_only','two_words_max',
@@ -7308,14 +8079,14 @@ var _saveTimer = null;
                         updateNameDisplayWarning();
                     });
                 });
-                // The scrubber's range is capped to Display Duration (see loadBgPreview) —
+                // The scrubber's range is capped to Display Duration (see loadBgPreview) -
                 // reload it on change so that cap stays in sync with the field.
                 var displayDurationEl = document.getElementById('display_duration');
                 if (displayDurationEl) displayDurationEl.addEventListener('change', function() {
                     if (window.toggleFseqPreview) window.toggleFseqPreview();
                 });
 
-                // Text, number inputs — save when user clicks away
+                // Text, number inputs - save when user clicks away
                 ['account_sid','auth_token','phone_number',
                  'poll_interval','display_duration','max_messages','max_length',
                  'line_1','line_2','line_3','line_4',
@@ -7355,7 +8126,7 @@ var _saveTimer = null;
 
                 // Point the help link at the selected provider's config section.
                 // This page runs inside the plugin's own service (port 5000), so a
-                // relative URL would resolve there instead of the FPP web server —
+                // relative URL would resolve there instead of the FPP web server -
                 // build an absolute URL to the FPP host (default port) explicitly.
                 var helpLink = document.getElementById('provider_help_link');
                 if (helpLink) {
@@ -7456,7 +8227,7 @@ var _saveTimer = null;
 
             // ===== Per-line saved-color palette popover =====
             // Lets you save the current swatch color, or recall a previously-saved one,
-            // right where you pick a line's color — there's no separate global picker.
+            // right where you pick a line's color - there's no separate global picker.
             function toggleColorPalette(i) {
                 var pop = document.getElementById('line_' + (i + 1) + '_palette_popover');
                 if (!pop) return;
@@ -7556,7 +8327,9 @@ var _saveTimer = null;
     </html>
     """
 
-    return render_template_string(html, config=config, secret_sentinel=SECRET_SENTINEL)
+    _eff_role = get_plugin_role()
+    return render_template_string(html, config=config, secret_sentinel=SECRET_SENTINEL,
+                                  effective_role=_eff_role)
 
 @app.route('/api/config', methods=['POST'])
 def update_config():
@@ -7573,12 +8346,24 @@ def update_config():
                 new_config.pop(_sk, None)
         config.update(new_config)
 
-        # Sanitize the names content list — never trust client array shapes/lengths.
+        # Sanitize the names content list - never trust client array shapes/lengths.
         if 'names_content_list' in new_config:
             raw_list = new_config.get('names_content_list')
             if not isinstance(raw_list, list):
                 raw_list = []
-            config['names_content_list'] = [_sanitize_names_item(it) for it in raw_list]
+            sanitized = [_sanitize_names_item(it) for it in raw_list]
+            if is_remote():
+                # On a REMOTE the master sync owns list MEMBERSHIP; the browser may only edit
+                # per-content LAYOUTS. Merge the posted layouts into the existing items by
+                # content id - never add or drop items here. This stops a remote's autosave
+                # (which may run with a stale/empty list) from wiping the master-synced list.
+                posted = {it.get('content'): it for it in sanitized if it.get('content')}
+                config['names_content_list'] = [
+                    posted.get(it.get('content'), it)
+                    for it in (config.get('names_content_list') or [])
+                ]
+            else:
+                config['names_content_list'] = sanitized
         if config.get('names_content_mode') not in ('roundrobin', 'random'):
             config['names_content_mode'] = 'roundrobin'
         # Keep the round-robin cursor valid if the list changed/shrank.
@@ -7605,7 +8390,20 @@ def update_config():
         if _wlst:
             config['default_playlist'] = _wlst[0]['content']
 
-        # Normalize phone number to E.164 (strip spaces, dashes, parens — keep + and digits)
+        # Multi-instance role/discovery keys.
+        if 'plugin_role' in new_config:
+            _r = str(new_config.get('plugin_role') or '').strip().lower()
+            config['plugin_role'] = _r if _r in ('master', 'remote') else ''
+            global _resolved_role, _remotes_cache_time, _tml_peer_cache_time, polling_generation
+            _resolved_role = None   # re-resolve the FPP-mode default next time if unset
+            _remotes_cache_time = 0
+            _tml_peer_cache_time = 0
+            # Switched to remote: retire any running poller (a remote never polls/responds).
+            # Switched to master: a poller will be (re)started by start_polling_if_needed below.
+            if is_remote():
+                polling_generation += 1
+
+        # Normalize phone number to E.164 (strip spaces, dashes, parens - keep + and digits)
         if config.get('twilio_phone_number'):
             config['twilio_phone_number'] = re.sub(r'[^\d+]', '', config['twilio_phone_number'])
 
@@ -7634,7 +8432,7 @@ def update_config():
 # FPP content the plugin references (the waiting + name-display playlists and
 # the sequences/images/videos they use), and the FPP overlay-model definition
 # into a single .zip, so another Pi can be brought up identically. Credentials
-# (Twilio auth token, Google Voice app password) are DELIBERATELY excluded —
+# (Twilio auth token, Google Voice app password) are DELIBERATELY excluded -
 # plugin.json on disk never contains them (see save_config), and we re-scrub on
 # import for good measure. Import restores everything and preserves the target
 # Pi's own credentials.
@@ -7672,7 +8470,7 @@ def _content_source_files(content_value, warnings):
     # Otherwise it's a playlist name.
     pl_path = os.path.join(FPP_PLAYLISTS_PATH, content_value + '.json')
     if not os.path.isfile(pl_path):
-        warnings.append(f"Playlist '{content_value}' not found on disk — skipped")
+        warnings.append(f"Playlist '{content_value}' not found on disk - skipped")
         return files
     files.append(('content/playlists', pl_path))
 
@@ -7701,7 +8499,7 @@ def _content_source_files(content_value, warnings):
                 elif os.path.isfile(img):
                     files.append(('content/images', img))
                 else:
-                    warnings.append(f"Media '{media}' (in playlist '{content_value}') not found — skipped")
+                    warnings.append(f"Media '{media}' (in playlist '{content_value}') not found - skipped")
     except Exception as e:
         warnings.append(f"Could not read playlist '{content_value}': {e}")
 
@@ -7740,7 +8538,7 @@ def export_config():
                 ('settings', BLACKLIST_REMOVED_FILE),
             ]
 
-        # Referenced content ONLY — the Waiting + Name Display content this plugin
+        # Referenced content ONLY - the Waiting + Name Display content this plugin
         # is set to use and the files they reference. Never all of FPP's media.
         content_files = []
         if inc_content:
@@ -7752,7 +8550,7 @@ def export_config():
                     _seen_cv.add(cv)
                     content_files.extend(_content_source_files(cv, warnings))
 
-        # Overlay model ("matrix") — just the selected model's entry, not the whole
+        # Overlay model ("matrix") - just the selected model's entry, not the whole
         # channel-output config (written to the zip as a small JSON payload below).
         overlay_payload = _extract_overlay_model(warnings) if inc_overlay else None
 
@@ -7839,11 +8637,11 @@ def _extract_overlay_model(warnings):
     equals the configured model name (robust to FPP's field naming)."""
     model = (config.get('overlay_model_name', '') or '').strip()
     if not model:
-        warnings.append("No overlay model selected — overlay model not exported")
+        warnings.append("No overlay model selected - overlay model not exported")
         return None
     ovl_file = _find_overlay_config_file()
     if not ovl_file:
-        warnings.append("Overlay model config not found — overlay model not exported")
+        warnings.append("Overlay model config not found - overlay model not exported")
         return None
     try:
         with open(ovl_file, 'r') as f:
@@ -7853,7 +8651,7 @@ def _extract_overlay_model(warnings):
         return None
     container_key, items = _overlay_items(data)
     if items is None:
-        warnings.append("Overlay config had an unexpected shape — overlay model not exported")
+        warnings.append("Overlay config had an unexpected shape - overlay model not exported")
         return None
     entry, name_field = None, None
     for it in items:
@@ -7866,7 +8664,7 @@ def _extract_overlay_model(warnings):
         if entry is not None:
             break
     if entry is None:
-        warnings.append(f"Overlay model '{model}' not found in the config — not exported")
+        warnings.append(f"Overlay model '{model}' not found in the config - not exported")
         return None
     payload = {
         "__tml_overlay__": 1,
@@ -7885,7 +8683,7 @@ def _merge_overlay_model(payload_bytes, warnings):
     try:
         payload = json.loads(payload_bytes)
     except Exception:
-        warnings.append("Overlay model in bundle was not valid JSON — skipped")
+        warnings.append("Overlay model in bundle was not valid JSON - skipped")
         return
 
     # Legacy bundle (a whole config file, pre single-model export): full replace.
@@ -7908,7 +8706,7 @@ def _merge_overlay_model(payload_bytes, warnings):
     name_field = payload.get('name_field') or 'description'
     entry      = payload.get('model')
     if not isinstance(entry, dict):
-        warnings.append("Overlay model entry missing from bundle — skipped")
+        warnings.append("Overlay model entry missing from bundle - skipped")
         return
     model_name = entry.get(name_field)
 
@@ -7919,7 +8717,7 @@ def _merge_overlay_model(payload_bytes, warnings):
             with open(dest_path, 'r') as f:
                 dest = json.load(f)
         except Exception:
-            warnings.append(f"Target {dest_file} was unreadable — overlay model skipped")
+            warnings.append(f"Target {dest_file} was unreadable - overlay model skipped")
             return
 
     if key:
@@ -7960,6 +8758,10 @@ def import_config():
         if upload is None:
             return jsonify({"success": False, "error": "No file uploaded"}), 400
 
+        # Whether to also adopt the bundle's Master/Remote mode. Default OFF: an import keeps
+        # THIS Pi's role so restoring settings never silently flips a master into a remote.
+        import_mode = str(request.form.get('import_mode', '')).strip().lower() in ('1', 'true', 'yes', 'on')
+
         data = upload.read()
         try:
             zf = zipfile.ZipFile(io.BytesIO(data))
@@ -7968,7 +8770,7 @@ def import_config():
 
         names = set(zf.namelist())
         if 'manifest.json' not in names:
-            return jsonify({"success": False, "error": "Missing manifest.json — not a Text My Lights bundle"}), 400
+            return jsonify({"success": False, "error": "Missing manifest.json - not a Text My Lights bundle"}), 400
         try:
             manifest = json.loads(zf.read('manifest.json'))
         except Exception:
@@ -7980,7 +8782,7 @@ def import_config():
         summary = {"settings": False, "content": 0, "overlay_model": False}
 
         # Map each export subdir to its destination directory on this Pi. basename
-        # is used for every write (zip-slip safe — no attacker-controlled paths).
+        # is used for every write (zip-slip safe - no attacker-controlled paths).
         dest_dirs = {
             'content/playlists':  FPP_PLAYLISTS_PATH,
             'content/sequences':  FSEQ_SEQUENCE_PATH,
@@ -8003,12 +8805,12 @@ def import_config():
         total_uncompressed = sum(zi.file_size for zi in zf.infolist())
         if total_uncompressed > MAX_IMPORT_UNCOMPRESSED:
             return jsonify({"success": False,
-                            "error": "Bundle contents are too large — refusing to import"}), 400
+                            "error": "Bundle contents are too large - refusing to import"}), 400
 
         # Accept ONLY bundles whose every entry is a file this plugin itself writes on
         # export (settings we know, our content subdirs, or the overlay payload). If the
         # archive contains anything else, reject the WHOLE import rather than partially
-        # applying it — so a hand-built or tampered .zip can't smuggle stray files in.
+        # applying it - so a hand-built or tampered .zip can't smuggle stray files in.
         def _entry_allowed(entry):
             if entry.endswith('/') or entry == 'manifest.json':
                 return True
@@ -8020,7 +8822,7 @@ def import_config():
         bad = [e for e in names if not _entry_allowed(e)]
         if bad:
             return jsonify({"success": False,
-                            "error": "Bundle contains unexpected files — not a clean "
+                            "error": "Bundle contains unexpected files - not a clean "
                                      "Text My Lights export; import cancelled.",
                             "unexpected": sorted(bad)[:10]}), 400
 
@@ -8039,10 +8841,17 @@ def import_config():
                     try:
                         imported = json.loads(zf.read(entry))
                     except Exception:
-                        warnings.append("plugin.json in bundle was invalid — settings skipped")
+                        warnings.append("plugin.json in bundle was invalid - settings skipped")
                         continue
                     for sk in SECRET_KEYS:
                         imported.pop(sk, None)
+                    # Mode/identity keys (this box's Master/Remote role, which master a remote
+                    # follows, its advertised name) are box-specific. Keep THIS Pi's values
+                    # unless the user explicitly opted to import them (import_mode checkbox).
+                    if not import_mode:
+                        for mk in MODE_KEYS:
+                            imported.pop(mk, None)
+                        logging.info("Import: kept this Pi's Master/Remote mode (import_mode off)")
                     config.update(imported)
                     save_config()
                     summary["settings"] = True
@@ -8052,7 +8861,7 @@ def import_config():
                     with open(target, 'wb') as f:
                         f.write(zf.read(entry))
                 else:
-                    warnings.append(f"Unknown settings file '{base}' — skipped")
+                    warnings.append(f"Unknown settings file '{base}' - skipped")
 
             elif arc_dir in dest_dirs:
                 target_dir = dest_dirs[arc_dir]
@@ -8068,7 +8877,7 @@ def import_config():
                 summary["overlay_model"] = True
 
             else:
-                warnings.append(f"Unrecognized entry '{entry}' — skipped")
+                warnings.append(f"Unrecognized entry '{entry}' - skipped")
 
         # Refresh in-memory state: force cache reloads and re-sync Twilio client.
         _blocklist_cache = None
@@ -8100,7 +8909,7 @@ def fpp_fonts_endpoint():
 @app.route('/api/fonts/file/<name>')
 def serve_font_file(name):
     """Serve raw font bytes so the browser can @font-face them for the config
-    page's canvas preview — otherwise the preview silently falls back to a
+    page's canvas preview - otherwise the preview silently falls back to a
     generic sans-serif for every font, since the browser never has the actual
     file. Only serves fonts found by _enumerate_fonts(); name is matched
     against that list, never used to build a filesystem path directly."""
@@ -8168,7 +8977,7 @@ def test_fpp_api():
 
 @app.route('/api/fseq/debug')
 def fseq_debug():
-    """Diagnostic endpoint — returns JSON describing exactly how the FSEQ frame would be read.
+    """Diagnostic endpoint - returns JSON describing exactly how the FSEQ frame would be read.
     ?sequence=name&model=ModelName   (same params as /api/fseq/frame)
     Helps diagnose channel-offset and bpp issues without needing SSH."""
     seq        = request.args.get('sequence', '').strip()
@@ -8178,7 +8987,7 @@ def fseq_debug():
         return jsonify({'error': 'No sequence specified'}), 400
 
     name     = seq.removeprefix('seq:').removesuffix('.fseq')
-    name     = os.path.basename(name)   # no path traversal — keep filename only
+    name     = os.path.basename(name)   # no path traversal - keep filename only
     filepath = os.path.join(FSEQ_SEQUENCE_PATH, name + '.fseq')
     if not os.path.exists(filepath):
         return jsonify({'error': f'Sequence not found: {name}.fseq'}), 404
@@ -8293,7 +9102,7 @@ def fseq_info():
     if not seq:
         return jsonify({'error': 'No sequence specified'}), 400
     name = seq.removeprefix('seq:').removesuffix('.fseq')
-    name = os.path.basename(name)   # no path traversal — keep filename only
+    name = os.path.basename(name)   # no path traversal - keep filename only
     filepath = os.path.join(FSEQ_SEQUENCE_PATH, name + '.fseq')
     if not os.path.exists(filepath):
         return jsonify({'error': f'Sequence not found: {name}.fseq'}), 404
@@ -8318,7 +9127,7 @@ def fseq_info():
 def fseq_frame():
     """Return a single FSEQ frame as a PNG image for the canvas background preview."""
     if not PIL_AVAILABLE:
-        return jsonify({'error': 'Pillow not installed — run fpp_install.sh'}), 503
+        return jsonify({'error': 'Pillow not installed - run fpp_install.sh'}), 503
 
     seq        = request.args.get('sequence', '').strip()
     frame_idx  = max(0, int(request.args.get('frame', 0)))
@@ -8331,10 +9140,10 @@ def fseq_frame():
     if not seq:
         return jsonify({'error': 'No sequence specified'}), 400
     if width <= 0 or height <= 0:
-        return jsonify({'error': 'Overlay model dimensions unknown — select a model first'}), 400
+        return jsonify({'error': 'Overlay model dimensions unknown - select a model first'}), 400
 
     name = seq.removeprefix('seq:').removesuffix('.fseq')
-    name = os.path.basename(name)   # no path traversal — keep filename only
+    name = os.path.basename(name)   # no path traversal - keep filename only
     filepath = os.path.join(FSEQ_SEQUENCE_PATH, name + '.fseq')
     if not os.path.exists(filepath):
         return jsonify({'error': f'Sequence not found: {name}.fseq'}), 404
@@ -8361,7 +9170,7 @@ def fseq_frame():
         frame_idx    = min(frame_idx, hdr['frame_count'] - 1)
         start_ch     = start_ch_1 - 1   # convert to 0-indexed
         num_pixels   = width * height
-        # bytes_per_pixel: 3 for RGB, 4 for RGBW — derived from actual channel count
+        # bytes_per_pixel: 3 for RGB, 4 for RGBW - derived from actual channel count
         bpp          = max(3, ch_count // num_pixels) if num_pixels > 0 else 3
 
         raw = read_fseq_frame(hdr, frame_idx, start_ch, ch_count)
@@ -8395,12 +9204,12 @@ def fseq_frame():
 @app.route('/api/media/preview')
 def media_preview():
     """Return a canvas-preview PNG for an image or video file.
-    ?type=img&file=filename.jpg  — resize image to model dims and return as PNG.
-    ?type=vid&file=filename.mp4&time=0 — extract a frame at `time` seconds via ffmpeg,
+    ?type=img&file=filename.jpg - resize image to model dims and return as PNG.
+    ?type=vid&file=filename.mp4&time=0 - extract a frame at `time` seconds via ffmpeg,
         resize to model dims, return as PNG.  Falls back to a black frame if ffmpeg
         is unavailable or extraction fails."""
     if not PIL_AVAILABLE:
-        return jsonify({'error': 'Pillow not installed — run fpp_install.sh'}), 503
+        return jsonify({'error': 'Pillow not installed - run fpp_install.sh'}), 503
 
     media_type = request.args.get('type', '').strip()   # 'img' or 'vid'
     filename   = request.args.get('file', '').strip()
@@ -8411,9 +9220,9 @@ def media_preview():
     if not filename or media_type not in ('img', 'vid'):
         return jsonify({'error': 'Requires ?type=img|vid&file=filename'}), 400
     if width <= 0 or height <= 0:
-        return jsonify({'error': 'Overlay model dimensions unknown — select a model first'}), 400
+        return jsonify({'error': 'Overlay model dimensions unknown - select a model first'}), 400
 
-    # Security: no path traversal — strip all directory components
+    # Security: no path traversal - strip all directory components
     filename = os.path.basename(filename)
 
     try:
@@ -8443,10 +9252,10 @@ def media_preview():
                     img = Image.open(io.BytesIO(result.stdout)).convert('RGB')
                     img = img.resize((width, height), Image.LANCZOS)
                 else:
-                    # ffmpeg failed — return a dark grey placeholder
+                    # ffmpeg failed - return a dark grey placeholder
                     img = Image.new('RGB', (width, height), (32, 32, 32))
             except (FileNotFoundError, _sp.TimeoutExpired):
-                # ffmpeg not installed on this system — return placeholder
+                # ffmpeg not installed on this system - return placeholder
                 img = Image.new('RGB', (width, height), (32, 32, 32))
 
         buf = io.BytesIO()
@@ -8478,7 +9287,7 @@ def test_google_voice_conn():
     if not email_addr or not app_pw:
         return jsonify({"success": False, "error": "Enter your Gmail address and app password first."})
 
-    # IMAP — required for reading incoming texts
+    # IMAP - required for reading incoming texts
     try:
         imap = imaplib.IMAP4_SSL(config.get('gv_imap_host', 'imap.gmail.com'))
         try:
@@ -8496,7 +9305,7 @@ def test_google_voice_conn():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
 
-    # SMTP — only needed for outbound auto-responses; report but don't fail on it
+    # SMTP - only needed for outbound auto-responses; report but don't fail on it
     reply_ready = False
     reply_error = ""
     try:
@@ -8547,6 +9356,89 @@ def get_messages_by_date(date_str):
         return _client_error("get_messages_by_date", e, 500)
     return jsonify(redact_messages(list(reversed(messages)), date_str))
 
+@app.route('/api/plugin_role')
+def api_plugin_role():
+    """Current effective role (master/remote), so the config page can reflect the live value.
+    `plugin_role` is the user's EXPLICIT choice ('' = auto, follow FPP mode); `fpp_mode` + detail
+    show what FPP reports (diagnostic - explicit choice always wins over it)."""
+    return jsonify({"role": get_plugin_role(),
+                    "plugin_role": (config.get('plugin_role') or ''),
+                    "fpp_mode": _last_fpp_mode,
+                    "fpp_mode_detail": _fpp_mode_detail})
+
+
+@app.route('/api/plugin/masters')
+def api_plugin_masters():
+    """Remote (browser-facing): the plugin masters discovered on the FPP network, each with a
+    friendly name + source number, and which one this remote is currently pinned to. Drives the
+    'Sync to Master' picker + its auto-refresh. Normal token auth."""
+    if not is_remote():
+        return jsonify({"masters": [], "selected": "", "is_remote": False})
+    force = request.args.get('refresh') in ('1', 'true', 'yes')
+    masters = discover_masters(force=force)
+    # Auto-pin when there's exactly one master and nothing's been chosen yet, so the box shows
+    # it checked without the user having to pick.
+    _maybe_auto_select_single_master()
+    sel = _selected_master_addr()
+    return jsonify({
+        "is_remote": True,
+        "selected": sel,
+        "selected_reachable": any(m['address'] == sel for m in masters) if sel else True,
+        "masters": [{"address": m["address"], "name": m["name"], "phone": m["phone"],
+                     "selected": (m["address"] == sel)} for m in masters],
+    })
+
+
+@app.route('/api/plugin/names-content')
+def api_plugin_names_content():
+    """Remote (browser-facing): the current master-synced names content list, so the open
+    Display page can live-refresh its dropdown/list when the master adds/removes content
+    without a manual reload. Normal token auth."""
+    if not is_remote():
+        return jsonify({"is_remote": False, "names_content_list": []})
+    return jsonify({"is_remote": True,
+                    "names_content_list": config.get('names_content_list', []) or []})
+
+
+@app.route('/api/plugin/select-master', methods=['POST'])
+def api_plugin_select_master():
+    """Remote (browser-facing): pin this remote to ONE plugin master (by address), or clear the
+    pin. An explicit clear stores 'none' (follow nobody) rather than '' so the single-master
+    auto-select won't immediately re-pick it. Only one master at a time."""
+    if not is_remote():
+        return jsonify({"success": False, "error": "This instance is not a remote."}), 409
+    data = request.json or {}
+    addr = str(data.get('address', '') or '').strip()
+    global _masters_cache_time
+    config['selected_master'] = addr if addr else 'none'
+    save_config()
+    _masters_cache_time = 0   # force a fresh probe on the next read
+    logging.info(f"🔗 Remote pinned to plugin master: {addr or '(none - follow nobody)'}")
+    # Immediately re-mirror the newly selected master's name-content list.
+    try:
+        sync_names_content_from_master()
+    except Exception as e:
+        logging.debug(f"select-master resync failed: {e}")
+    return jsonify({"success": True, "selected": addr})
+
+
+@app.route('/api/plugin/master-layout')
+def api_master_layout():
+    """Remote (browser-facing): fetch the master's text layout for a content id so the Display
+    tab's 'Sync Position from Master' can copy it. Normal token auth; proxies to the master."""
+    if not is_remote():
+        return jsonify({"found": False, "error": "This instance is not a remote."}), 409
+    content = request.args.get('content', '')
+    master = _find_master_base()
+    if not master:
+        return jsonify({"found": False, "error": "Master not found on the network."}), 404
+    try:
+        r = requests.get(f"{master}/api/tml/layout", params={"content": content}, timeout=3)
+        return jsonify(r.json())
+    except Exception as e:
+        return jsonify({"found": False, "error": f"Could not reach master: {e}"}), 502
+
+
 @app.route('/api/queue/status')
 def queue_status():
     try:
@@ -8563,7 +9455,7 @@ def test_message_submission():
         test_phone = data.get('phone', 'Local Testing')
         
         if not config.get('enabled', False):
-            return jsonify({"success": False, "error": "Show is not live — press Start or run the Text My Lights Start script first"})
+            return jsonify({"success": False, "error": "Show is not live - press Start or run the Text My Lights Start script first"})
 
         if not test_name:
             return jsonify({"success": False, "error": "Name is required"})
@@ -8604,7 +9496,7 @@ def api_block_phone():
         phone = data.get('phone')
         # Preferred path: block by message reference (date + timestamp). The full
         # number is resolved from the on-disk log server-side, so the browser only
-        # ever holds the masked value — never the real number.
+        # ever holds the masked value - never the real number.
         if not phone and data.get('ts'):
             phone = _phone_from_log_ref(data.get('date'), data.get('ts'))
         if phone:
@@ -8619,7 +9511,7 @@ def api_block_phone():
 def api_respond():
     """Send a manual custom reply to a logged message from the queue page.
 
-    Google Voice only — Twilio has no reply path in this plugin. The message is
+    Google Voice only - Twilio has no reply path in this plugin. The message is
     identified by (date, timestamp); its stored reply context is resolved
     server-side so the real reply-to address never touches the browser."""
     try:
@@ -8633,10 +9525,10 @@ def api_respond():
         ctx = _reply_ctx_from_log_ref(data.get('date'), data.get('ts'))
         if not ctx or not ctx.get('to'):
             return jsonify({"success": False,
-                            "error": "No reply context stored for this message — it can't be answered."}), 400
+                            "error": "No reply context stored for this message - it can't be answered."}), 400
         if send_gv_reply(text, "manual_reply", ctx=ctx):
             return jsonify({"success": True})
-        return jsonify({"success": False, "error": "Send failed — see the plugin log for details."})
+        return jsonify({"success": False, "error": "Send failed - see the plugin log for details."})
     except Exception as e:
         return _client_error("api_respond", e)
 
@@ -8756,7 +9648,7 @@ def api_add_whitelist():
 
         if name in global_names:
             if name in removed:
-                # Name was blocked by user — un-remove it to make it active again
+                # Name was blocked by user - un-remove it to make it active again
                 removed.discard(name)
                 with open(WHITELIST_REMOVED_FILE, 'w', encoding='utf-8') as f:
                     f.write('\n'.join(sorted(removed)) + '\n')
@@ -8853,7 +9745,7 @@ def view_whitelist():
         </div>
         {% if not config.get('use_whitelist', False) %}
         <div style="background:#fff3cd; border:1px solid #ffc107; color:#856404; padding:10px 14px; border-radius:5px; margin:10px 0; font-size:14px; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
-            <span>⚠️ <strong>Whitelist is not enabled</strong> — All names will be shown regardless of this list.</span>
+            <span>⚠️ <strong>Whitelist is not enabled</strong> - All names will be shown regardless of this list.</span>
             <button onclick="toggleSetting('use_whitelist', true)" style="background:#4CAF50; color:white; border:none; padding:6px 14px; border-radius:4px; cursor:pointer; font-size:13px; white-space:nowrap;">✓ Enable Whitelist</button>
         </div>
         {% else %}
@@ -8984,7 +9876,7 @@ def view_whitelist():
                     hint.textContent = 'Showing ' + showing + ' of ' + currentFiltered.length + ' matches';
                 } else {
                     hint.textContent = 'Showing ' + showing + ' of ' + allNames.length.toLocaleString() + ' names' +
-                        (showing < allNames.length ? ' — scroll down to load more' : '');
+                        (showing < allNames.length ? ' - scroll down to load more' : '');
                 }
             }
 
@@ -9035,7 +9927,7 @@ def view_blacklist_page():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Profanity Filter — Blacklist</title>
+        <title>Profanity Filter - Blacklist</title>
         <style>
             body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #ffffff; color: #333; }
             h1 { color: #f44336; }
@@ -9067,7 +9959,7 @@ def view_blacklist_page():
         </div>
         {% if not config.get('profanity_filter', True) %}
         <div style="background:#fff3cd; border:1px solid #ffc107; color:#856404; padding:10px 14px; border-radius:5px; margin:10px 0; font-size:14px; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
-            <span>⚠️ <strong>Blacklist is not enabled</strong> — Words on this list will still be shown.</span>
+            <span>⚠️ <strong>Blacklist is not enabled</strong> - Words on this list will still be shown.</span>
             <button onclick="toggleSetting('profanity_filter', true)" style="background:#4CAF50; color:white; border:none; padding:6px 14px; border-radius:4px; cursor:pointer; font-size:13px; white-space:nowrap;">✓ Enable Profanity Filter</button>
         </div>
         {% else %}
@@ -9198,7 +10090,7 @@ def view_blacklist_page():
                     hint.textContent = 'Showing ' + showing + ' of ' + currentFiltered.length + ' matches';
                 } else {
                     hint.textContent = 'Showing ' + showing + ' of ' + allWords.length.toLocaleString() + ' words' +
-                        (showing < allWords.length ? ' — scroll down to load more' : '');
+                        (showing < allWords.length ? ' - scroll down to load more' : '');
                 }
             }
 
@@ -9331,7 +10223,7 @@ def status_page():
         </style>
     </head>
     <body><script>if('scrollRestoration'in history)history.scrollRestoration='manual';function _toTop(){{window.scrollTo(0,0);document.documentElement.scrollTop=0;document.body.scrollTop=0;try{{window.parent.postMessage({{type:'scrollTop'}},'*');}}catch(e){{}}}}_toTop();document.addEventListener('DOMContentLoaded',_toTop);window.addEventListener('load',_toTop);</script>
-        <h1>🔧 Text My Lights — Status</h1>
+        <h1>🔧 Text My Lights - Status</h1>
         <button onclick="location.href='/'">← Back</button>
         <button onclick="location.reload()">🔄 Refresh</button>
         
@@ -9428,7 +10320,7 @@ def view_messages():
         <!-- PAST DAY TAB PANELS -->
         {% for tab in tabs[1:] %}
         <div class="tab-panel" id="panel-{{ tab.date }}">
-            <div class="history-note">Past day snapshot — no live queue.</div>
+            <div class="history-note">Past day snapshot - no live queue.</div>
             <div id="history-content-{{ tab.date }}"><p style="color:#aaa;">Click tab to load.</p></div>
         </div>
         {% endfor %}
@@ -9446,7 +10338,7 @@ def view_messages():
                     <button id="modal-block-name-btn" style="background:#FF9800; color:white; padding:12px; border:none; border-radius:5px; cursor:pointer;"
                             onclick="blockNameFromDisplay()">Block this name from being displayed</button>
                     <p id="whitelist-warning" style="color:#f44336; font-size:12px; margin:0; padding:4px 0; display:none;">
-                        Whitelist is not enabled — this name may appear again
+                        Whitelist is not enabled - this name may appear again
                     </p>
                     <button style="background:#aaa; color:white; padding:10px; border:none; border-radius:5px; cursor:pointer;"
                             onclick="closeBlockModal()">Cancel</button>
@@ -9516,7 +10408,7 @@ def view_messages():
                     clearTimeout(refreshTimer);
                     if (!loadedTabs[date]) { loadedTabs[date] = true; loadHistoryTab(date); }
                 }
-                // Class change doesn't trigger MutationObserver — report height explicitly
+                // Class change doesn't trigger MutationObserver - report height explicitly
                 requestAnimationFrame(function() {
                     window.parent.postMessage({ type: 'iframeHeight', height: document.body.scrollHeight }, '*');
                 });
@@ -9589,7 +10481,7 @@ def view_messages():
                     var label = statusLabel[msg.status] || esc(msg.status);
                     var btn = '';
                     if (showBlock && msg.phone_full !== 'Local Testing') {
-                        // Block by reference (timestamp + log date) — the full number
+                        // Block by reference (timestamp + log date) - the full number
                         // stays server-side; we only carry the masked value for display.
                         btn = '<button class="block-btn" data-ts="' + esc(msg.timestamp) + '" data-date="' + esc(msg._log_date || '') +
                               '" data-masked="' + esc(msg.phone) + '" data-name="' + esc(msg.extracted_name) +
@@ -9726,12 +10618,135 @@ def view_messages():
     return render_template_string(html, config=config, tabs=tabs, today_messages=today_messages)
 
 
+# ── Multi-instance (master/remote) endpoints ────────────────────────────────
+# Authenticated in _require_access_token by trusting known FPP MultiSync peers (no secret).
+
+@app.route('/api/tml/ping', methods=['GET'])
+def api_tml_ping():
+    """Identify this instance to a discovering peer: plugin name + effective role, plus a
+    friendly name and source number so a remote can tell multiple masters apart. A master
+    pushes only to peers that answer here with role == 'remote'."""
+    return jsonify({"plugin": "textmylights", "role": get_plugin_role(),
+                    "name": _instance_label(), "phone": _instance_phone_label()})
+
+
+@app.route('/api/tml/content-list', methods=['GET'])
+def api_tml_content_list():
+    """Master: the content ids in its Name Display list, so a remote can mirror them into its
+    own Display-tab dropdown (and give each its own overlay layout). Content ids only - no
+    layouts, no sequence data."""
+    names = [it.get('content', '') for it in (config.get('names_content_list', []) or []) if it.get('content')]
+    return jsonify({"names": names})
+
+
+@app.route('/api/tml/layout', methods=['GET'])
+def api_tml_layout():
+    """Master: the saved text layout for a content id + this master's overlay model size, so a
+    remote can copy the positioning ('Sync Position from Master'), scaled to its own model."""
+    content = request.args.get('content', '')
+    item = next((it for it in (config.get('names_content_list', []) or [])
+                 if it.get('content') == content), None)
+    mw, mh = _overlay_model_dims()
+    if not item:
+        return jsonify({"found": False, "model_w": mw, "model_h": mh})
+    return jsonify({"found": True, "model_w": mw, "model_h": mh, "layout": {
+        k: item.get(k) for k in ('message_lines', 'line_boxes', 'line_colors', 'line_movements',
+                                 'line_speeds', 'line_fonts', 'line_orientations', 'display_duration')
+    }})
+
+
+def _apply_remote_waiting(content):
+    """Remote: switch the base waiting/background layer to the master-pushed content - unless
+    it's already showing that content (no-op, so the master's heartbeat re-push doesn't cause
+    a visible restart), or this instance lacks that content (keep whatever is showing)."""
+    content = content or ''
+    if content == _active_waiting_content:
+        return  # already on it - ignore repeat/heartbeat pushes
+    if content and not _content_exists_locally(content):
+        logging.info(f"ℹ️  Remote: pushed waiting content '{content}' not present - keeping current")
+        return
+    with rotator_lock:
+        _switch_waiting_content(content, _active_waiting_content)
+
+
+def _push_from_selected_master():
+    """Remote: True only if the current request comes from the master this remote is pinned to.
+    With no master selected the remote follows nobody, so ALL pushes are ignored - nothing is
+    displayed until a master is explicitly picked in the 'Sync to Master' list."""
+    sel = _selected_master_addr()
+    if not sel:
+        return False
+    return request.remote_addr == sel
+
+
+@app.route('/api/tml/state', methods=['POST'])
+def api_tml_state():
+    """Remote: apply the master's chosen display state. A name event ({name, content,
+    duration}) shows that name over the content using THIS instance's own layout; a waiting
+    event ({content}) switches the background. Only remotes act on it, and only when the push
+    comes from the master this remote is pinned to (so several masters can coexist)."""
+    if not is_remote():
+        return jsonify({"success": False, "error": "not in remote mode"}), 409
+    if not _push_from_selected_master():
+        return jsonify({"success": True, "ignored": "not the selected master"})
+    data = request.json or {}
+    content = str(data.get('content', '') or '')
+    name = str(data.get('name', '') or '').strip()
+    duration = data.get('duration')
+    global _remote_last_state, _remote_last_state_time, _remote_stop_requested
+    _remote_last_state = {"name": name, "content": content}
+    _remote_last_state_time = time.time()
+    try:
+        if name:
+            add_to_queue(name, "REMOTE", name,
+                         override={"content": content, "duration": duration})
+        else:
+            # A waiting push with real content means the master is live - clear any prior
+            # stop request so this remote resumes returning to its waiting content between
+            # names. (An empty-content push is a stopped/cleared master; don't re-arm on it.)
+            if content:
+                _remote_stop_requested = False
+            _apply_remote_waiting(content)
+        return jsonify({"success": True})
+    except Exception as e:
+        return _client_error("api_tml_state", e)
+
+
+@app.route('/api/tml/stop', methods=['POST'])
+def api_tml_stop():
+    """Remote: the master was Stopped, so stop here too. Same graceful behavior as the local
+    Stop - any names the master already pushed drain first, then the waiting content stops.
+    Only remotes act on it (the peer-IP allowlist in before_request gates who may call it), and
+    only from the master this remote is pinned to."""
+    if not is_remote():
+        return jsonify({"success": False, "error": "not in remote mode"}), 409
+    if not _push_from_selected_master():
+        return jsonify({"success": True, "ignored": "not the selected master"})
+    global _remote_stop_requested
+    _remote_stop_requested = True   # the display worker tears down once its queue drains
+    try:
+        return jsonify(_deactivate_local())
+    except Exception as e:
+        return _client_error("api_tml_stop", e)
+
+
 @app.route('/api/activate', methods=['GET', 'POST'])
 def api_activate():
     """FPP scheduler hook: enable the plugin, start SMS polling, and start the waiting playlist."""
     global polling_thread, stop_polling
 
-    # Require waiting content — a single default_playlist or a rotation list. Without one
+    # A remote never polls/responds - it just needs to be enabled to render pushed names and
+    # show its own waiting content as a fallback until the master pushes. Skip the
+    # content-required check + polling for remotes.
+    if is_remote():
+        config['enabled'] = True
+        save_config()
+        result = start_waiting_content()
+        logging.info("✅ Text My Lights Start (remote) - ready to receive names from the master")
+        return jsonify({"success": True, "playlist_started": result, "role": "remote",
+                        "message": "Text My Lights remote activated"})
+
+    # Require waiting content - a single default_playlist or a rotation list. Without one
     # the show has no defined state.
     _has_list = len(config.get('default_content_list', []) or []) > 0
     if not config.get('default_playlist', '').strip() and not _has_list:
@@ -9750,17 +10765,17 @@ def api_activate():
     # Start the waiting content (single, or the rotator for a 2+ item list)
     result = start_waiting_content()
 
-    logging.info(f"✅ Text My Lights Start activated — playlist {'started' if result else 'FAILED to start'}")
+    logging.info(f"✅ Text My Lights Start activated - playlist {'started' if result else 'FAILED to start'}")
     return jsonify({"success": True, "playlist_started": result,
                     "message": "Text My Lights plugin activated"})
 
 
-@app.route('/api/deactivate', methods=['GET', 'POST'])
-def api_deactivate():
-    """FPP scheduler hook: disable the plugin and stop the show. If names are
-    still displaying or queued, let them finish first (the display worker stops
-    the waiting content once the queue drains); only stop immediately when the
-    queue is idle. The polling thread keeps running to send show_not_live replies."""
+def _deactivate_local():
+    """Disable the plugin and stop the show on THIS instance. If names are still displaying
+    or queued, let them finish first (the display worker stops the waiting content once the
+    queue drains); only stop immediately when the queue is idle. Returns the JSON response
+    body. Shared by the scheduler hook (/api/deactivate) and the master's stop broadcast
+    (/api/tml/stop)."""
     config['enabled'] = False    # stop accepting new names right away
     save_config()
 
@@ -9770,15 +10785,26 @@ def api_deactivate():
     draining = pending or (currently_displaying is not None)
 
     if draining:
-        logging.info("🛑 Text My Lights Stop: draining — names still playing/queued; "
+        logging.info("🛑 Text My Lights Stop: draining - names still playing/queued; "
                      "waiting content will stop after they finish")
-        return jsonify({"success": True, "draining": True,
-                        "message": "Stopping after current names finish"})
+        return {"success": True, "draining": True,
+                "message": "Stopping after current names finish"}
 
-    # Nothing queued or displaying — stop the waiting content now.
+    # Nothing queued or displaying - stop the waiting content now.
     stop_show_playback()
     logging.info("🛑 Text My Lights Stop: disabled and playback stopped")
-    return jsonify({"success": True, "message": "Text My Lights plugin deactivated"})
+    return {"success": True, "message": "Text My Lights plugin deactivated"}
+
+
+@app.route('/api/deactivate', methods=['GET', 'POST'])
+def api_deactivate():
+    """FPP scheduler hook: disable the plugin and stop the show. The polling thread keeps
+    running to send show_not_live replies. When this is the master, the Stop is also
+    broadcast to every remote so pressing Stop here takes the whole show down."""
+    # Tell the remotes to stop too (no-op unless this instance is the master). Fire this
+    # first so they begin draining in parallel with the master.
+    broadcast_stop_to_remotes()
+    return jsonify(_deactivate_local())
 
 
 if __name__ == '__main__':
@@ -9794,7 +10820,7 @@ if __name__ == '__main__':
             try:
                 import shutil
                 shutil.copy2(_old, _new)
-                logging.error(f"Migrated {_old} → {_new}")
+                logging.info(f"Migrated {_old} → {_new}")
             except Exception as _e:
                 logging.error(f"Migration failed {_old}: {_e}")
 
@@ -9825,7 +10851,17 @@ if __name__ == '__main__':
     rotator_thread = threading.Thread(target=waiting_rotator, daemon=True)
     rotator_thread.start()
 
-    # Polling thread starts if the selected source is configured — runs in
+    # Master heartbeat: keeps remotes' waiting content in sync even if one joins late.
+    threading.Thread(target=master_sync_heartbeat, daemon=True).start()
+
+    # Follow FPP's own mode: switch the plugin role to match when FPP changes player↔remote.
+    threading.Thread(target=fpp_mode_watcher, daemon=True).start()
+
+    # Remote: mirror the master's Name-content list into this box's Display dropdown so each
+    # content can be given this remote's own overlay layout.
+    threading.Thread(target=remote_content_sync, daemon=True).start()
+
+    # Polling thread starts if the selected source is configured - runs in
     # standby (show_not_live replies) when disabled, and processes names normally
     # when enabled. Picks Twilio or Google Voice based on message_source.
     start_polling_if_needed()
@@ -9840,7 +10876,7 @@ if __name__ == '__main__':
 
     logging.info("Text My Lights plugin starting...")
     if os.path.exists(AUTH_DISABLE_FILE):
-        logging.warning("⚠️  AUTH DISABLED at startup (.disable_auth present) — access "
+        logging.warning("⚠️  AUTH DISABLED at startup (.disable_auth present) - access "
                         "control is OFF for everyone on the network. This is for debugging "
                         f"only; delete {AUTH_DISABLE_FILE} before normal use.")
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)

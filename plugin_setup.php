@@ -19,7 +19,7 @@ $pluginConfigFile = $settings['configDirectory'] . "/plugin." . $pluginName . ".
 $pluginPythonScript = $pluginDirectory . "/sms_plugin.py";
 
 // Log files
-$pluginLogFile = $settings['logDirectory'] . "/sms_plugin.log";
+$pluginLogFile = $settings['logDirectory'] . "/plugin-fpp-plugin-textmylights.log";
 $messageLogFile = $settings['configDirectory'] . "/received_messages.json";
 
 // Check if plugin is enabled

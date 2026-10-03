@@ -62,6 +62,7 @@ log_and_show "✓ Sudoers rule and helper removed"
 
 # Remove log files
 log_and_show "Removing log files..."
+rm -f /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log
 rm -f /home/fpp/media/logs/sms_plugin.log
 rm -f /home/fpp/media/logs/sms_plugin_install.log
 rm -f /home/fpp/media/logs/received_messages.json

@@ -90,6 +90,12 @@ BLOCKLIST_FILE  = os.path.join(PLUGIN_DATA_DIR, "blocked_phones.json")
 # threshold auto-block (see register_profanity_strike). Stores a single date stamp;
 # a new day wipes the tally (midnight reset).
 PROFANITY_STRIKES_FILE = os.path.join(PLUGIN_DATA_DIR, "profanity_strikes.json")
+# Admin whitelist-approval-over-SMS state (Google Voice only). admin_reply_ctx.json
+# stores the thread context used to text the admin (GV can only reply into an existing
+# thread) plus the phone it belongs to; pending_approvals.json is the FIFO list of
+# outstanding name requests awaiting an admin Y/N. See _maybe_handle_admin_message().
+ADMIN_CTX_FILE          = os.path.join(PLUGIN_DATA_DIR, "admin_reply_ctx.json")
+PENDING_APPROVALS_FILE  = os.path.join(PLUGIN_DATA_DIR, "pending_approvals.json")
 
 FSEQ_SEQUENCE_PATH = '/home/fpp/media/sequences'
 FPP_VIDEOS_PATH    = '/home/fpp/media/videos'
@@ -412,6 +418,22 @@ DEFAULT_CONFIG = {
     "response_invalid_format": "Please send only 1 name ({words}, no sentences).",
     "response_too_long": "I'm sorry, your message exceeds our max message length. Please only send your name.",
     "response_not_whitelisted": "Sorry, that name is not on our approved list and cannot be shown.",
+    # --- Admin whitelist approval over SMS (Google Voice ONLY) ---
+    # When the whitelist is ON and a texter sends a name NOT on the list, optionally
+    # text the show admin to approve it live. admin_phone empty = feature off (texter
+    # just gets response_not_whitelisted, unchanged). Not built for Twilio: Twilio
+    # outbound now needs an A2P campaign, so Twilio SMS replies are effectively off.
+    # The admin must text the Google Voice number once to seed the reply context
+    # (GV can only reply into an existing thread); until then the feature falls back
+    # to the standard not-whitelisted reply. See _maybe_handle_admin_message() and
+    # ADMIN_CTX_FILE / PENDING_APPROVALS_FILE.
+    "admin_phone": "",
+    "response_whitelist_pending": "Your name isn't on our whitelist, please wait a few moments while I get permission to display.",
+    "response_admin_denied": "Sorry, this name has not been added to our whitelist.",
+    "admin_approval_prompt": "New name request: '{name}'. Reply Y to add and show it, or N to deny.",
+    # Minutes a pending request waits for an admin Y/N before it expires (0 = never).
+    # On expiry the texter gets the standard not-whitelisted reply so they aren't left waiting.
+    "admin_approval_timeout_mins": 10,
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -2481,6 +2503,288 @@ def is_on_whitelist(name):
     name_lower = name.lower().strip()
     return name_lower in whitelist
 
+# ============================================================================
+# ADMIN WHITELIST APPROVAL OVER SMS (Google Voice only)
+# ----------------------------------------------------------------------------
+# When the whitelist is on and a texter sends a name that is not on it, text the
+# show admin so they can approve it live by replying Y/N. GV can only SEND by
+# replying into an existing email thread, so the admin must text the Google Voice
+# number once to seed a reply context; we store that (admin_reply_ctx.json) and
+# the texter's own context in each pending record (pending_approvals.json) so we
+# can reply to whoever we need to, asynchronously, after the admin answers.
+# ============================================================================
+
+def _normalize_phone(value):
+    """Reduce a phone value to comparable digits so '+1 (555) 123-4567',
+    '15551234567' and '5551234567' all compare equal: strip non-digits, then drop a
+    leading US country code."""
+    digits = re.sub(r'\D', '', str(value or ''))
+    if len(digits) == 11 and digits.startswith('1'):
+        digits = digits[1:]
+    return digits
+
+def load_admin_ctx():
+    """Load the stored admin reply context ({to, message_id, references, subject,
+    phone}) or None. Read fresh each call - it is tiny and changes rarely."""
+    try:
+        if os.path.exists(ADMIN_CTX_FILE):
+            with open(ADMIN_CTX_FILE, 'r') as f:
+                ctx = json.load(f)
+                return ctx if isinstance(ctx, dict) else None
+    except Exception as e:
+        logging.error(f"Error loading admin reply ctx: {e}")
+    return None
+
+def save_admin_ctx(ctx):
+    try:
+        with open(ADMIN_CTX_FILE, 'w') as f:
+            json.dump(ctx, f, indent=2)
+    except Exception as e:
+        logging.error(f"Error saving admin reply ctx: {e}")
+
+def clear_admin_ctx():
+    """Forget the seeded admin context (used when admin_phone changes so the
+    bootstrap banner reappears until the new number texts in)."""
+    try:
+        if os.path.exists(ADMIN_CTX_FILE):
+            os.remove(ADMIN_CTX_FILE)
+    except Exception as e:
+        logging.error(f"Error clearing admin reply ctx: {e}")
+
+def admin_ctx_is_seeded():
+    """True only when an admin reply context is stored AND it belongs to the number
+    currently configured as admin_phone (digit-normalized). Drives the config-page
+    bootstrap banner and the approval feature's can-we-text-the-admin check."""
+    admin_phone = config.get('admin_phone', '').strip()
+    if not admin_phone:
+        return False
+    ctx = load_admin_ctx()
+    if not ctx or not ctx.get('to'):
+        return False
+    return _normalize_phone(ctx.get('phone', '')) == _normalize_phone(admin_phone)
+
+def load_pending_approvals():
+    try:
+        if os.path.exists(PENDING_APPROVALS_FILE):
+            with open(PENDING_APPROVALS_FILE, 'r') as f:
+                data = json.load(f)
+                return data if isinstance(data, list) else []
+    except Exception as e:
+        logging.error(f"Error loading pending approvals: {e}")
+    return []
+
+def save_pending_approvals(items):
+    try:
+        with open(PENDING_APPROVALS_FILE, 'w') as f:
+            json.dump(items, f, indent=2)
+    except Exception as e:
+        logging.error(f"Error saving pending approvals: {e}")
+
+def prune_pending_approvals(items=None):
+    """Drop pendings older than admin_approval_timeout_mins. On expiry, reply to the
+    texter with the standard not-whitelisted message so they are not left waiting
+    forever. Returns the surviving list (persisted only if something changed)."""
+    if items is None:
+        items = load_pending_approvals()
+    timeout = int(config.get('admin_approval_timeout_mins', 10) or 0)
+    if timeout <= 0:
+        return items
+    cutoff = time.time() - timeout * 60
+    survivors, expired = [], []
+    for it in items:
+        if float(it.get('created_ts', 0) or 0) < cutoff:
+            expired.append(it)
+        else:
+            survivors.append(it)
+    for it in expired:
+        logging.info(f"⌛ Pending approval expired: '{it.get('name')}' "
+                     f"from {str(it.get('texter_phone', ''))[-4:]}")
+        _send_feature_reply(it.get('texter_ctx'),
+                            config.get('response_not_whitelisted', ''),
+                            'not_whitelisted_timeout')
+        log_message(it.get('texter_phone', ''), it.get('body', ''),
+                    it.get('name', ''), "admin_timeout")
+    if expired:
+        save_pending_approvals(survivors)
+    return survivors
+
+def add_name_to_whitelist(name):
+    """Add a name to the user whitelist (the non-HTTP core of api_add_whitelist):
+    lowercase, add to WHITELIST_ADDED_FILE, un-remove from WHITELIST_REMOVED_FILE,
+    invalidate the cache. Returns True on success."""
+    global _whitelist_cache, _whitelist_mtime
+    name = (name or '').strip().lower()
+    if not name:
+        return False
+    try:
+        global_names = set()
+        if os.path.exists(WHITELIST_FILE):
+            with open(WHITELIST_FILE, 'r', encoding='latin-1') as f:
+                global_names = {line.strip().lower() for line in f if line.strip()}
+        removed = load_removed_names()
+        if name not in global_names:
+            added = load_whitelist_added()
+            if name not in added:
+                added.add(name)
+                with open(WHITELIST_ADDED_FILE, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(sorted(added)) + '\n')
+        if name in removed:
+            removed.discard(name)
+            with open(WHITELIST_REMOVED_FILE, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(sorted(removed)) + '\n' if removed else '')
+        _whitelist_cache = None
+        _whitelist_mtime = None
+        logging.info(f"Added '{name}' to whitelist via admin approval")
+        return True
+    except Exception as e:
+        logging.error(f"Error adding '{name}' to whitelist: {e}")
+        return False
+
+def _send_feature_reply(ctx, text, message_type):
+    """Send a Google Voice reply for the admin-approval feature using an explicit
+    stored ctx (the texter's or the admin's). No-op if text or ctx is missing.
+    GV-only feature, so this always routes through send_gv_reply()."""
+    if not text or not ctx:
+        return False
+    return send_gv_reply(text, message_type, ctx=ctx)
+
+def _parse_admin_decision(body):
+    """Interpret an admin reply as an approve/deny decision. Accepts a bare
+    Y/YES/N/NO (case-insensitive), optionally followed by a target name
+    ('Y Grandma'). Returns (decision, target): decision is 'approve', 'deny', or
+    None (not a decision); target is the name to match or '' for FIFO."""
+    if not body:
+        return None, ''
+    parts = body.strip().split(None, 1)
+    if not parts:
+        return None, ''
+    head = parts[0].strip().lower().rstrip('.!,')
+    target = parts[1].strip() if len(parts) > 1 else ''
+    if head in ('y', 'yes'):
+        return 'approve', target
+    if head in ('n', 'no'):
+        return 'deny', target
+    return None, ''
+
+def _maybe_handle_admin_message(from_number, body):
+    """If Google Voice is the source and `from_number` is the configured admin,
+    refresh the stored admin reply context from the current message and, when the
+    body is a bare Y/N, resolve the matching pending approval. Returns True only
+    when a Y/N was consumed (caller stops processing); False otherwise so the
+    admin's ordinary texts still flow through the normal pipeline."""
+    if config.get('message_source') != 'google_voice':
+        return False
+    admin_phone = config.get('admin_phone', '').strip()
+    if not admin_phone:
+        return False
+    if _normalize_phone(from_number) != _normalize_phone(admin_phone):
+        return False
+
+    # Seed/refresh the reply context for the admin's number from THIS message, so
+    # the operator only has to text the GV number once and it self-refreshes after.
+    if _gv_reply_ctx and _gv_reply_ctx.get('to'):
+        ctx = dict(_gv_reply_ctx)
+        ctx['phone'] = _normalize_phone(admin_phone)
+        save_admin_ctx(ctx)
+        logging.info("🔑 Admin reply context refreshed from inbound admin message")
+
+    decision, target = _parse_admin_decision(body)
+    if decision is None:
+        return False  # admin texted a real name - let normal processing handle it
+
+    pending = prune_pending_approvals()
+    if not pending:
+        logging.info("Admin Y/N received but no pending approvals; ignoring")
+        return True  # consume it so a bare 'Y'/'N' is never shown as a name
+
+    # A name-targeted reply resolves that request; otherwise FIFO (oldest first).
+    idx = 0
+    if target:
+        for i, it in enumerate(pending):
+            if it.get('name', '').lower() == target.lower():
+                idx = i
+                break
+    record = pending.pop(idx)
+    save_pending_approvals(pending)
+
+    name = record.get('name', '')
+    texter_ctx = record.get('texter_ctx')
+    texter_phone = record.get('texter_phone', '')
+    admin_ctx = load_admin_ctx()
+
+    if decision == 'approve':
+        add_name_to_whitelist(name)
+        add_to_queue(name, texter_phone, record.get('body', name))
+        log_message(texter_phone, record.get('body', ''), name, "admin_approved")
+        _send_feature_reply(texter_ctx, config.get('response_success', ''), 'success')
+        _send_feature_reply(admin_ctx, f"Added and showing '{name}'.", 'admin_ack')
+        logging.info(f"✅ Admin approved '{name}' - added to whitelist and queued")
+    else:  # deny
+        log_message(texter_phone, record.get('body', ''), name, "admin_denied")
+        _send_feature_reply(texter_ctx, config.get('response_admin_denied', ''), 'admin_denied')
+        _send_feature_reply(admin_ctx, f"Denied '{name}'.", 'admin_ack')
+        logging.info(f"🚫 Admin denied '{name}'")
+    return True
+
+def _maybe_request_admin_approval(name, from_number, body):
+    """When admin approval is active, create a pending request, text the admin the
+    approval prompt, and tell the texter to wait. Returns True if the approval flow
+    was started (caller skips the standard not-whitelisted reply), False to fall
+    back to it. GV-only; requires a seeded admin reply context."""
+    # The approval flow only runs while the show is live (Text My Lights Start). When
+    # it is not, the texter gets the Show Not Live response instead - that is handled
+    # by the enabled-check earlier in process_incoming_message, which returns before
+    # this branch is ever reached; this guard encodes the same intent defensively.
+    if not config.get('enabled', False):
+        return False
+    if config.get('message_source') != 'google_voice':
+        return False
+    admin_phone = config.get('admin_phone', '').strip()
+    if not admin_phone:
+        return False
+    # Never prompt the admin for a name that would be rejected as profanity anyway.
+    if config.get('profanity_filter') and contains_profanity(body):
+        return False
+    admin_ctx = load_admin_ctx()
+    if not admin_ctx or not admin_ctx.get('to') or \
+            _normalize_phone(admin_ctx.get('phone', '')) != _normalize_phone(admin_phone):
+        logging.warning("Admin approval configured but admin has not texted the GV "
+                        "number yet (no reply context); using not-whitelisted reply")
+        return False
+
+    pending = prune_pending_approvals()
+    texter_ctx = dict(_gv_reply_ctx) if _gv_reply_ctx else None
+
+    # Dedupe by (texter phone, name): a repeat just re-assures the texter; no re-prompt.
+    for it in pending:
+        if _normalize_phone(it.get('texter_phone', '')) == _normalize_phone(from_number) \
+                and it.get('name', '').lower() == name.lower():
+            logging.info(f"Duplicate pending approval for '{name}' from {from_number[-4:]}; not re-prompting")
+            _send_feature_reply(texter_ctx, config.get('response_whitelist_pending', ''), 'whitelist_pending')
+            log_message(from_number, body, name, "admin_pending")
+            return True
+
+    record = {
+        "name": name,
+        "texter_phone": from_number,
+        "texter_ctx": texter_ctx,
+        "body": body,
+        "created_ts": time.time(),
+    }
+    pending.append(record)
+    # Cap the list so a flood can never grow it without bound (oldest dropped).
+    MAX_PENDING = 50
+    if len(pending) > MAX_PENDING:
+        pending = pending[-MAX_PENDING:]
+    save_pending_approvals(pending)
+
+    prompt = config.get('admin_approval_prompt', '').replace('{name}', name)
+    _send_feature_reply(admin_ctx, prompt, 'admin_prompt')
+    _send_feature_reply(texter_ctx, config.get('response_whitelist_pending', ''), 'whitelist_pending')
+    log_message(from_number, body, name, "admin_pending")
+    logging.info(f"📨 Requested admin approval for '{name}' from {from_number[-4:]}")
+    return True
+
 def send_sms_response(to_phone, message_type):
     """Send an SMS response to the user based on message type.
 
@@ -3984,6 +4288,13 @@ def process_incoming_message(from_number, body):
     needs the sender identity and message text; per-source dedup bookkeeping
     (SID / IMAP UID) stays in the caller. Behavior is identical to the logic
     that previously lived inline in poll_twilio()."""
+    # Admin whitelist-approval interception (Google Voice only). Runs first so the
+    # admin's reply context is refreshed on every inbound from them and a bare Y/N
+    # approval is never mistaken for a name submission. Any other admin message
+    # returns False here and falls through to the normal pipeline below.
+    if _maybe_handle_admin_message(from_number, body):
+        return
+
     # Phone 'tapback' reactions and emoji-only replies to the display
     # notification are courtesy responses, not name submissions - silently
     # drop them so we never fire an invalid_format (or any) auto-response.
@@ -4080,9 +4391,13 @@ def process_incoming_message(from_number, body):
             send_sms_response(from_number, resp)
 
         elif not is_on_whitelist(name):
-            logging.info(f"❌ Not on whitelist: {name}")
-            log_message(from_number, body, name, "not_on_whitelist")
-            send_sms_response(from_number, "not_whitelisted")
+            # If admin approval is active (GV + admin_phone + seeded), ask the admin
+            # to approve instead of rejecting outright; the texter gets the pending
+            # reply and later Success (Y) or admin-denied (N). Otherwise unchanged.
+            if not _maybe_request_admin_approval(name, from_number, body):
+                logging.info(f"❌ Not on whitelist: {name}")
+                log_message(from_number, body, name, "not_on_whitelist")
+                send_sms_response(from_number, "not_whitelisted")
 
         elif config['profanity_filter'] and contains_profanity(body):
             logging.info(f"❌ Profanity rejected")
@@ -4875,6 +5190,82 @@ def index():
                         <label class="toggle-switch"><input type="checkbox" id="use_whitelist" {{ 'checked' if config.get('use_whitelist', False) else '' }} onchange="updateFormatRules(); checkFiltersState(); checkWhitelistResponseState(); saveConfig();"><span class="toggle-slider"></span></label>
                         <label class="checkbox-label">Enable Name Whitelist - only allow approved names</label><br>
                         <button class="view-btn" onclick="location.href='/whitelist'" style="margin-top:6px;">📋 Manage Whitelist</button>
+
+                        {% if config.get('message_source','twilio') == 'google_voice' %}
+                        <hr style="border:none; border-top:1px solid #444; margin:15px 0;">
+                        <div id="admin_approval_block">
+                            <label class="checkbox-label" style="font-weight:bold;">🙋 Live Name Approval (Google Voice)</label>
+                            <p class="help-text" style="margin:4px 0 8px;">When a texter sends a name that is not on the whitelist, text your phone so you can approve it live - reply <strong>Y</strong> to add the name and show it, or <strong>N</strong> to deny. Leave the number blank to turn this off (texters just get the Not-on-Whitelist response).</p>
+
+                            <div id="admin_bootstrap_banner" style="{{ '' if (config.get('admin_phone','') and not admin_ctx_seeded) else 'display:none;' }} background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:6px; padding:10px 14px; margin-bottom:10px; font-size:13px;">
+                                ⚠️ <strong>Action needed:</strong> text your Google Voice number once from the admin phone (<span id="admin_banner_num">{{ config.get('admin_phone','') }}</span>) to turn on live approvals. You will not receive approval requests until you do. This clears automatically once your text arrives.
+                            </div>
+                            <div id="admin_connected_note" style="{{ '' if (config.get('admin_phone','') and admin_ctx_seeded) else 'display:none;' }} background:#e8f5e9; border:1px solid #66bb6a; color:#2e7d32; border-radius:6px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
+                                ✅ Admin phone connected - live approvals are active.
+                            </div>
+
+                            <label>Admin Phone Number:</label>
+                            <input type="text" id="admin_phone" value="{{ config.get('admin_phone','') }}" placeholder="e.g. 5551234567" style="width:100%; max-width:260px;">
+
+                            <label style="margin-top:10px; display:block;">Approval Timeout (minutes):</label>
+                            <input type="number" id="admin_approval_timeout_mins" min="0" max="1440" value="{{ config.get('admin_approval_timeout_mins', 10) }}" style="width:90px;">
+                            <p class="help-text" style="margin:3px 0 10px;">How long a request waits for your Y/N before it expires (the texter then gets the Not-on-Whitelist reply). 0 = never expire.</p>
+
+                            <label style="margin-top:6px; display:block;">Text to Admin (approval prompt):</label>
+                            <textarea id="admin_approval_prompt" rows="2" style="width:100%;">{{ config.get('admin_approval_prompt', "New name request: '{name}'. Reply Y to add and show it, or N to deny.") }}</textarea>
+                            <p class="help-text" style="margin:3px 0 2px;">Use <code>{name}</code> where the requested name should appear.</p>
+                            <button type="button" class="reset-default-btn" style="opacity:1; pointer-events:auto;" onclick="resetAdminField('admin_approval_prompt')">↩️ Reset to default</button>
+
+                            <label style="margin-top:10px; display:block;">Reply to Texter (while waiting):</label>
+                            <textarea id="response_whitelist_pending" rows="2" style="width:100%;">{{ config.get('response_whitelist_pending', "Your name isn't on our whitelist, please wait a few moments while I get permission to display.") }}</textarea>
+                            <button type="button" class="reset-default-btn" style="opacity:1; pointer-events:auto;" onclick="resetAdminField('response_whitelist_pending')">↩️ Reset to default</button>
+
+                            <label style="margin-top:10px; display:block;">Reply to Texter (if denied):</label>
+                            <textarea id="response_admin_denied" rows="2" style="width:100%;">{{ config.get('response_admin_denied', 'Sorry, this name has not been added to our whitelist.') }}</textarea>
+                            <button type="button" class="reset-default-btn" style="opacity:1; pointer-events:auto;" onclick="resetAdminField('response_admin_denied')">↩️ Reset to default</button>
+
+                            <script>
+                                window._adminDefaults = {
+                                    admin_approval_prompt: "New name request: '{name}'. Reply Y to add and show it, or N to deny.",
+                                    response_whitelist_pending: "Your name isn't on our whitelist, please wait a few moments while I get permission to display.",
+                                    response_admin_denied: "Sorry, this name has not been added to our whitelist."
+                                };
+                                function resetAdminField(id) {
+                                    var el = document.getElementById(id);
+                                    if (!el || !window._adminDefaults[id]) return;
+                                    el.value = window._adminDefaults[id];
+                                    if (window.saveConfig) saveConfig();
+                                }
+                                (function() {
+                                    // Save admin fields on change/blur.
+                                    ['admin_phone','admin_approval_timeout_mins','admin_approval_prompt','response_whitelist_pending','response_admin_denied'].forEach(function(id) {
+                                        var el = document.getElementById(id);
+                                        if (!el) return;
+                                        el.addEventListener('change', function(){ if (window.saveConfig) saveConfig(); });
+                                        el.addEventListener('blur', function(){ if (window.saveConfig) saveConfig(); });
+                                    });
+                                    // Poll the seeded status so the bootstrap banner clears live once the
+                                    // admin texts in (and reappears if the number changes to an unseeded one).
+                                    function pollAdminStatus() {
+                                        var phoneEl = document.getElementById('admin_phone');
+                                        var banner = document.getElementById('admin_bootstrap_banner');
+                                        var connected = document.getElementById('admin_connected_note');
+                                        if (!phoneEl || !banner || !connected) return;
+                                        var phone = (phoneEl.value || '').trim();
+                                        if (!phone) { banner.style.display = 'none'; connected.style.display = 'none'; return; }
+                                        fetch('/api/plugin/admin-approval-status')
+                                            .then(function(r){ return r.json(); })
+                                            .then(function(d){
+                                                if (d && d.seeded) { banner.style.display = 'none'; connected.style.display = 'block'; }
+                                                else { banner.style.display = 'block'; connected.style.display = 'none'; }
+                                            })
+                                            .catch(function(){});
+                                    }
+                                    setInterval(pollAdminStatus, 5000);
+                                })();
+                            </script>
+                        </div>
+                        {% endif %}
                     </div>
 
                     <!-- Sub-col 2: Name Format Rules -->
@@ -8104,6 +8495,18 @@ var _saveTimer = null;
                     response_show_not_live: document.getElementById('response_show_not_live').value
                 };
 
+                // Admin whitelist-approval fields exist only in Google Voice mode.
+                // Include them ONLY when present so a Twilio-mode save never clears
+                // the stored values (an absent key leaves the server's value intact).
+                var _apEl = document.getElementById('admin_phone');
+                if (_apEl) {
+                    data.admin_phone = _apEl.value;
+                    data.admin_approval_timeout_mins = parseInt((document.getElementById('admin_approval_timeout_mins')||{}).value) || 0;
+                    data.admin_approval_prompt = (document.getElementById('admin_approval_prompt')||{}).value || '';
+                    data.response_whitelist_pending = (document.getElementById('response_whitelist_pending')||{}).value || '';
+                    data.response_admin_denied = (document.getElementById('response_admin_denied')||{}).value || '';
+                }
+
                 // Only persist the per-line fonts once loadFonts() has actually
                 // populated the font dropdowns. Otherwise an autosave that fires
                 // during page init (e.g. model-dimension sync or the stale-content
@@ -8457,7 +8860,8 @@ var _saveTimer = null;
     # restore exactly what a fresh install ships (and track future default changes).
     _resp_defaults = {k: v for k, v in DEFAULT_CONFIG.items() if k.startswith('response_')}
     return render_template_string(html, config=config, secret_sentinel=SECRET_SENTINEL,
-                                  effective_role=_eff_role, response_defaults=_resp_defaults)
+                                  effective_role=_eff_role, response_defaults=_resp_defaults,
+                                  admin_ctx_seeded=admin_ctx_is_seeded())
 
 @app.route('/api/config', methods=['POST'])
 def update_config():
@@ -8544,6 +8948,22 @@ def update_config():
         if config.get('twilio_phone_number'):
             config['twilio_phone_number'] = re.sub(r'[^\d+]', '', config['twilio_phone_number'])
 
+        # Admin approval (GV only): normalize the admin phone to digits and, if the
+        # operator changed it, drop the seeded reply context so it no longer counts
+        # as "connected" - the new number must text the GV number once to re-seed
+        # (the bootstrap banner reappears until it does).
+        if 'admin_phone' in new_config:
+            config['admin_phone'] = _normalize_phone(config.get('admin_phone', ''))
+            _ctx = load_admin_ctx()
+            if _ctx and _normalize_phone(_ctx.get('phone', '')) != config['admin_phone']:
+                clear_admin_ctx()
+        if 'admin_approval_timeout_mins' in new_config:
+            try:
+                _to = int(new_config.get('admin_approval_timeout_mins', 10) or 0)
+            except (TypeError, ValueError):
+                _to = 10
+            config['admin_approval_timeout_mins'] = max(0, min(_to, 1440))
+
         save_config()
 
         # Keep the Twilio client in sync whenever credentials are present, so the
@@ -8561,6 +8981,16 @@ def update_config():
         return jsonify({"success": True})
     except Exception as e:
         return _client_error("update_config", e)
+
+@app.route('/api/plugin/admin-approval-status')
+def api_admin_approval_status():
+    """Tiny status signal for the config page's bootstrap banner: whether the admin
+    phone has texted the Google Voice number yet (so there is a reply context to
+    text them). Polled only while the banner is showing."""
+    return jsonify({
+        "admin_phone": config.get('admin_phone', ''),
+        "seeded": admin_ctx_is_seeded(),
+    })
 
 # ============================================================================
 # Config Export / Import

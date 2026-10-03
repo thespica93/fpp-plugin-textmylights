@@ -86,6 +86,10 @@ MESSAGES_DIR    = os.path.join(PLUGIN_DATA_DIR, "logs", "messages")
 LAST_SID_FILE   = os.path.join(PLUGIN_DATA_DIR, "last_message_sid.txt")
 LAST_GV_UID_FILE = os.path.join(PLUGIN_DATA_DIR, "last_gv_uid.txt")
 BLOCKLIST_FILE  = os.path.join(PLUGIN_DATA_DIR, "blocked_phones.json")
+# Per-day tally of blacklisted words each sender has texted, used by the profanity
+# threshold auto-block (see register_profanity_strike). Stores a single date stamp;
+# a new day wipes the tally (midnight reset).
+PROFANITY_STRIKES_FILE = os.path.join(PLUGIN_DATA_DIR, "profanity_strikes.json")
 
 FSEQ_SEQUENCE_PATH = '/home/fpp/media/sequences'
 FPP_VIDEOS_PATH    = '/home/fpp/media/videos'
@@ -341,6 +345,10 @@ DEFAULT_CONFIG = {
     "two_words_max": True,
     "use_whitelist": False,
     "profanity_filter": True,
+    # Auto-block a sender after they text this many blacklisted words in one day
+    # (tally resets at midnight). 0 disables the feature. Once blocked, only the
+    # operator can release them from the Phone Blocklist. See register_profanity_strike().
+    "profanity_threshold": 3,
     "fpp_host": "http://127.0.0.1",
     "default_playlist": "",
     # Waiting-content rotation list (v2.8+): each item is a background the plugin loops
@@ -397,7 +405,7 @@ DEFAULT_CONFIG = {
     "sms_response_blocked": False,
     "response_show_not_live": "Ho, Ho, Ho, It looks like our show isn't running now. Try again later.",
     "response_success": "Merry Christmas! Your name will appear on our display soon! 🎄",
-    "response_profanity": "Sorry, your message contains inappropriate content and cannot be displayed. Please keep within the Christmas spirit! 🎅",
+    "response_profanity": "Ho Ho Ho! That one didn't make the nice list. More texts with profanity may block your phone 🎅",
     "response_blocked": "Sorry, Your phone number has been blocked from sending messages.",
     "response_rate_limited": "You've reached the maximum number of messages allowed. Please try again tomorrow!",
     "response_duplicate": "You've already sent this name today!",
@@ -2770,7 +2778,69 @@ def contains_profanity(text):
     if pattern.search(text_lower):
         logging.info(f"🚫 Profanity detected in '{text}'")
         return True
-    
+
+    return False
+
+def count_profanity_words(text):
+    """Number of blacklisted-word occurrences in text (0 if the filter is off or
+    nothing matches). The combined blacklist regex has no capturing groups, so
+    findall yields one entry per matched word."""
+    if not config.get('profanity_filter', True):
+        return 0
+    pattern = load_blacklist()
+    if not pattern:
+        return 0
+    return len(pattern.findall(text.lower()))
+
+def _load_profanity_strikes():
+    """Read the per-day profanity tally file, or {} if missing/unreadable."""
+    try:
+        with open(PROFANITY_STRIKES_FILE, 'r') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    except Exception as e:
+        logging.error(f"Error reading profanity strikes: {e}")
+        return {}
+
+def register_profanity_strike(phone, text):
+    """Tally a sender's blacklisted-word count for TODAY and auto-add them to the
+    phone blocklist once they reach profanity_threshold words in a single day.
+
+    The tally carries a date stamp; the first strike on a new day wipes it, so a
+    sender who never hits the threshold is effectively back to 0 at midnight. Once
+    blocked, only the operator can release them (via the Phone Blocklist page).
+
+    A threshold of 0 disables the feature entirely (nothing is tracked). Returns
+    True only on the message that crosses the threshold and triggers the block."""
+    try:
+        threshold = int(config.get('profanity_threshold', 3) or 0)
+    except (TypeError, ValueError):
+        threshold = 0
+    if threshold <= 0:
+        return False
+
+    words = count_profanity_words(text)
+    if words <= 0:
+        return False
+
+    today = datetime.now().date().isoformat()
+    data = _load_profanity_strikes()
+    if data.get('date') != today:   # new day → reset the whole tally
+        data = {'date': today, 'counts': {}}
+    counts = data.setdefault('counts', {})
+    counts[phone] = int(counts.get(phone, 0) or 0) + words
+
+    try:
+        with open(PROFANITY_STRIKES_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logging.error(f"Error saving profanity strikes: {e}")
+
+    if counts[phone] >= threshold and not is_blocked(phone):
+        block_phone(phone)
+        return True
     return False
 
 def _parse_log_date(log_entry):
@@ -3965,6 +4035,8 @@ def process_incoming_message(from_number, body):
             logging.info(f"❌ Grouped text profanity rejected: {from_number[-4:]}")
             log_message(from_number, body, "", "profanity", counts=False)
             send_sms_response(from_number, "profanity")
+            if register_profanity_strike(from_number, body):
+                logging.info(f"🚫 Profanity threshold reached - auto-blocked {from_number[-4:]}")
 
         else:
             # Fully open + clean → queue every name, one Success reply.
@@ -4016,6 +4088,8 @@ def process_incoming_message(from_number, body):
             logging.info(f"❌ Profanity rejected")
             log_message(from_number, body, name, "profanity")
             send_sms_response(from_number, "profanity")
+            if register_profanity_strike(from_number, body):
+                logging.info(f"🚫 Profanity threshold reached - auto-blocked {from_number[-4:]}")
 
         else:
             if add_to_queue(name, from_number, body):
@@ -4522,6 +4596,11 @@ def index():
     </head>
     <body><script>if('scrollRestoration'in history)history.scrollRestoration='manual';function _toTop(){window.scrollTo(0,0);document.documentElement.scrollTop=0;document.body.scrollTop=0;try{window.parent.postMessage({type:'scrollTop'},'*');}catch(e){}}_toTop();document.addEventListener('DOMContentLoaded',_toTop);window.addEventListener('load',_toTop);</script>
 
+        <!-- SMS cost disclaimer - shown on every role (master and remote) -->
+        <div style="background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:6px; padding:10px 14px; margin:14px 0 0 0; font-size:13px; line-height:1.5;">
+            <strong>DISCLAIMER:</strong> The author and supporters of this plugin are NOT responsible for SMS charges that may be incurred by using this plugin.
+        </div>
+
         <!-- Tab navigation -->
         <div class="tabs" style="display:flex; align-items:center; gap:2px;">
             <button class="tab-btn active" onclick="showTab('settings', this)">⚙️ Settings</button>
@@ -4777,6 +4856,12 @@ def index():
                             <label class="toggle-switch"><input type="checkbox" id="profanity_filter" {{ 'checked' if config.profanity_filter else '' }} onchange="checkFiltersState(); saveConfig();"><span class="toggle-slider"></span></label>
                             <label class="checkbox-label">Enable Profanity Filter</label><br>
                             <button class="view-btn" onclick="showBlacklistWarning()" style="margin-top:6px;">🚫 Manage Blacklist</button>
+                            <div style="margin-top:10px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                                <label for="profanity_threshold" style="font-weight:bold;">Auto-block after</label>
+                                <input type="number" id="profanity_threshold" value="{{ config.get('profanity_threshold', 3) }}" min="0" max="100" style="width:60px;">
+                                <label for="profanity_threshold">blacklisted words / day</label>
+                            </div>
+                            <p class="help-text" style="margin-top:4px;">ℹ️ When a sender texts this many blacklisted words in one day, their number is added to the Phone Blocklist (only you can release it). The daily tally resets at midnight. Set to <strong>0</strong> to turn off auto-blocking.</p>
                         </div>
                         <div id="profanity_disabled_warning" style="display:none; background:#f8d7da; border:1px solid #f5c6cb; color:#721c24; border-radius:5px; padding:8px 12px; margin-top:8px; font-size:13px;">
                             ⚠️ <strong>Profanity filter is disabled</strong> - this is not recommended. Re-enable it to filter names against the Blacklist, or enable the Whitelist instead.
@@ -7940,6 +8025,7 @@ var _saveTimer = null;
                     one_word_only: document.getElementById('one_word_only')?.checked ?? false,
                     two_words_max: document.getElementById('two_words_max')?.checked ?? true,
                     profanity_filter: document.getElementById('profanity_filter').checked,
+                    profanity_threshold: parseInt(document.getElementById('profanity_threshold').value) || 0,
                     use_whitelist: document.getElementById('use_whitelist').checked,
                     default_playlist: document.getElementById('default_playlist').value,
                     // Waiting content is a rotation list; default_playlist above is kept in
@@ -8098,6 +8184,7 @@ var _saveTimer = null;
                 // Text, number inputs - save when user clicks away
                 ['account_sid','auth_token','phone_number',
                  'poll_interval','display_duration','max_messages','max_length',
+                 'profanity_threshold',
                  'line_1','line_2','line_3','line_4',
                  'response_success','response_profanity','response_rate_limited',
                  'response_duplicate','response_invalid_format','response_too_long',
@@ -8354,6 +8441,15 @@ def update_config():
             if str(new_config.get(_sk, '')) == SECRET_SENTINEL:
                 new_config.pop(_sk, None)
         config.update(new_config)
+
+        # Profanity auto-block threshold: non-negative int, 0 = off. Clamp so a bad
+        # client value can't disable the feature by accident or run away.
+        if 'profanity_threshold' in new_config:
+            try:
+                _pt = int(new_config.get('profanity_threshold', 3) or 0)
+            except (TypeError, ValueError):
+                _pt = 3
+            config['profanity_threshold'] = max(0, min(_pt, 100))
 
         # Sanitize the names content list - never trust client array shapes/lengths.
         if 'names_content_list' in new_config:

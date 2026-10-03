@@ -10,6 +10,7 @@ Access the Whitelist Manager at: **`http://YOUR_FPP_IP:5000/whitelist`**
 
 - [What Is the Whitelist?](#what-is-the-whitelist)
 - [Enabling the Whitelist](#enabling-the-whitelist)
+- [Live Name Approval over Text (Google Voice)](#live-name-approval-over-text-google-voice)
 - [The Default Whitelist](#the-default-whitelist)
 - [Whitelist Manager Page](#whitelist-manager-page)
 - [Adding Names](#adding-names)
@@ -44,6 +45,44 @@ You can also enable/disable the whitelist directly from the Whitelist Manager pa
 |--------|---------|
 | 🟡 Yellow warning | Whitelist is **disabled** — all names pass through |
 | 🟢 Green banner | Whitelist is **enabled** — only listed names are shown |
+
+---
+
+## Live Name Approval over Text (Google Voice)
+
+> **Google Voice only.** This feature is not available with Twilio.
+
+Normally, with the whitelist **on**, a name that is not on the list is rejected automatically. **Live Name Approval** lets you make that call yourself, from your phone, while the show is running.
+
+When a visitor texts a name that is **not** on the whitelist, the plugin texts **you** (the admin) the name. You reply:
+
+| Your reply | What happens |
+|------------|--------------|
+| **Y** | The name is added to the whitelist and shown; the visitor gets the success reply. |
+| **N** | The name is denied; the visitor gets the standard **Not on Whitelist** reply. There is no separate "denied" message. |
+| *(no reply in time)* | The request expires after the **Approval Timeout** and the visitor gets the Not on Whitelist reply. Reply **Y** later and the name is still added to the whitelist for next time, but it is **not** shown now. |
+
+It runs **only while the show is live**. Leave the Admin Phone Number blank to turn it off.
+
+### Connecting your admin phone
+
+Google Voice can only **send** a text by replying inside an existing email conversation, so your admin phone has to start one first:
+
+1. Go to **Settings → Message Source → Google Voice** and enter your **Admin Phone Number**.
+2. From that phone, text the word **admin** to your Google Voice number.
+3. The yellow "Action needed" banner turns green ("Admin phone connected") within a few seconds.
+
+> 💡 The word **admin** is reserved — it is used only to connect and is **never shown on the display**. The plugin also scans your existing Google Voice history in Gmail, so if your admin phone has already texted the number it may connect on its own. If you change the admin number, text **admin** again from the new phone.
+
+### ⚠️ Keep the conversation thread
+
+Approvals work **only while the Google Voice conversation with your admin number is still in your Gmail inbox.** If you delete it or archive it out of the inbox:
+
+- The plugin notices (it re-checks that exact message periodically, searching for it directly rather than scanning the whole mailbox).
+- The banner reverts to "Action needed."
+- Approvals pause until you text **admin** again to re-establish the thread.
+
+The approval prompt and the visitor-facing "please wait" message are editable on the **SMS Responses** tab, grouped under the **Not on Whitelist** response (which is also what a denial or a timeout sends).
 
 ---
 

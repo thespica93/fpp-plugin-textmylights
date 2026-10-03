@@ -1,14 +1,14 @@
 <?php
 // Plugin Name: Text My Lights
 // Plugin Description: Viewers text a name that appears on your display (Twilio or Google Voice)
-// Plugin Version: 2.5
+// Plugin Version: 3.1
 // Plugin Author: Nick
 // Plugin URL: https://github.com/thespica93/fpp-plugin-textmylights
 
 // This file is required by FPP to recognize and install the plugin
 
 $pluginName = "fpp-plugin-textmylights";
-$pluginVersion = "2.5";
+$pluginVersion = "3.1";
 $pluginDescription = "Text My Lights - Viewers text a name that appears on your display (Twilio or Google Voice)";
 $pluginAuthor = "Nick";
 

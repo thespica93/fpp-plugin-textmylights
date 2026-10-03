@@ -5254,7 +5254,7 @@ def index():
                         <div id="gv_approval" style="display:none;">
                             <hr style="border:none; border-top:1px solid #444; margin:16px 0;">
                             <h3 style="margin:14px 0 6px;">🙋 Live Name Approval (optional) <span id="live_approval_wl_state" style="font-size:13px; font-weight:normal; margin-left:6px; padding:2px 8px; border-radius:10px;"></span></h3>
-                            <p class="help-text" style="margin:4px 0 8px;">When the whitelist is on and the show is live, a texter who sends a name that is not on the list can be approved by you over text - reply <strong>Y</strong> to add and show it, or <strong>N</strong> to deny. Leave the number blank to turn this off. </p>
+                            <p class="help-text" style="margin:4px 0 8px;">When the whitelist is on and the show is live, a texter who sends a name that is not on the list can be approved by you over text. Leave the number blank to turn this off. </p>
 
                             <div id="admin_bootstrap_banner" style="{{ '' if (config.get('admin_phone','') and not admin_ctx_seeded) else 'display:none;' }} background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:6px; padding:10px 14px; margin-bottom:10px; font-size:13px;">
                                 ⚠️ <strong>Action needed:</strong> from the admin phone (<span id="admin_banner_num">{{ config.get('admin_phone','') }}</span>), text the word <strong>admin</strong> to your Google Voice number to connect. You will not receive approval requests until you do. The word "admin" is never shown on the display.
@@ -6514,11 +6514,11 @@ def index():
                      set (configured on the Message Source tab) and Google Voice is the source. -->
                 <div id="admin_approval_responses" class="resp-row enabled" style="{{ '' if (config.get('message_source','twilio')=='google_voice' and config.get('admin_phone','')) else 'display:none;' }} margin-left:22px; border-left:3px solid #90caf9;">
                     <div class="resp-toggle" style="font-weight:bold;">🙋 Live Name Approval (Google Voice)</div>
-                    <p class="help-text" style="margin:2px 0 12px;">An extension of the <strong>Not on Whitelist</strong> response above: when a texter sends a name that is not on the whitelist and you have an <strong>Admin Phone Number</strong> set (Message Source tab), you get the Y/N prompt; the texter gets the waiting message, then the Success response (Y). A denial (N) or a timeout sends the <strong>Not on Whitelist</strong> response above.</p>
+                    <p class="help-text" style="margin:2px 0 12px;">An extension of the <strong>Not on Whitelist</strong> response above: when a texter sends a name that is not on the whitelist and you have an <strong>Admin Phone Number</strong> set (Message Source tab), you get the Y/N prompt; the texter gets the waiting message, then the Success response (Y). A denial (N) sends the <strong>Not on Whitelist</strong> response above.</p>
 
                     <label>Approval Timeout (minutes):</label>
                     <input type="number" id="admin_approval_timeout_mins" min="0" max="1440" value="{{ config.get('admin_approval_timeout_mins', 10) }}" style="width:90px;">
-                    <p class="help-text" style="margin:3px 0 14px;">How long a request waits for your Y/N before it expires (the texter then gets the Not-on-Whitelist reply). 0 = never expire.</p>
+                    <p class="help-text" style="margin:3px 0 14px;">How long a request waits for your Y/N before it expires. 0 = never expire.</p>
 
                     <label>Text to Admin (approval prompt):</label>
                     <textarea id="admin_approval_prompt" rows="2">{{ config.get('admin_approval_prompt', "New name request: '{name}'. Reply Y to add to whitelist, or N to deny.") }}</textarea>
@@ -6528,7 +6528,6 @@ def index():
                     <label style="margin-top:14px; display:block;">Reply to Texter (while waiting):</label>
                     <textarea id="response_whitelist_pending" rows="2">{{ config.get('response_whitelist_pending', "Your name isn't on our whitelist, please wait a few moments while I get approval to display.") }}</textarea>
                     <button type="button" class="reset-default-btn" style="opacity:1; pointer-events:auto;" onclick="resetAdminField('response_whitelist_pending')">↩️ Reset to default</button>
-                    <p class="help-text" style="margin:10px 0 2px;">If you deny the request (or it times out), the texter is sent the <strong>Not on Whitelist</strong> response above.</p>
                 </div>
 
                 <script>

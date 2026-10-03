@@ -2563,6 +2563,81 @@ def admin_ctx_is_seeded():
         return False
     return _normalize_phone(ctx.get('phone', '')) == _normalize_phone(admin_phone)
 
+_last_admin_seed_scan = 0.0
+
+def seed_admin_ctx_from_inbox(force=False):
+    """Seed the admin reply context from the most recent Google Voice email ALREADY in
+    the inbox that came from the configured admin number. This lets the feature turn on
+    from existing texting history, instead of only from a brand-new text the poller
+    happens to see after the number is set. Lightweight (headers only) and throttled so
+    the status poll can call it cheaply. Returns True if a context is now seeded."""
+    global _last_admin_seed_scan
+    if config.get('message_source') != 'google_voice':
+        return False
+    admin_phone = config.get('admin_phone', '').strip()
+    if not admin_phone:
+        return False
+    if admin_ctx_is_seeded():
+        return True
+    now = time.time()
+    if not force and (now - _last_admin_seed_scan) < 20:
+        return False
+    _last_admin_seed_scan = now
+
+    email_addr = config.get('gv_email', '').strip()
+    app_pw = config.get('gv_app_password', '').strip()
+    if not email_addr or not app_pw:
+        return False
+
+    want = _normalize_phone(admin_phone)
+    imap = None
+    try:
+        # Explicit timeout: this can run from the config page's status request, so a
+        # hung Gmail connection must not stall the web response.
+        imap = imaplib.IMAP4_SSL(config.get('gv_imap_host', 'imap.gmail.com'), timeout=20)
+        imap.login(email_addr, app_pw)
+        imap.select(config.get('gv_imap_folder', 'INBOX'))
+        typ, data = imap.uid('search', None, 'FROM', 'txt.voice.google.com')
+        raw_uids = data[0].split() if (typ == 'OK' and data and data[0]) else []
+        uids = sorted((int(u) for u in raw_uids), reverse=True)  # newest first
+        # Only headers are needed to match the sender and build the reply context.
+        # Scan newest-first and stop at the first match - the admin usually texts often
+        # so the match is near the top; the cap just bounds a one-time setup scan (this
+        # never runs once a context is seeded). Reads Gmail history, so age does not
+        # matter as long as the email is still in the inbox.
+        hdr_spec = '(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT MESSAGE-ID REFERENCES)])'
+        for uid in uids[:500]:
+            typ, msg_data = imap.uid('fetch', str(uid), hdr_spec)
+            if typ != 'OK' or not msg_data or not msg_data[0]:
+                continue
+            hdr = email.message_from_bytes(msg_data[0][1])
+            disp, addr = email.utils.parseaddr(str(hdr.get('From', '')))
+            disp = _gv_decode_header(disp)
+            fid = _gv_sender_id(hdr, disp)
+            if _normalize_phone(fid) != want or not addr:
+                continue
+            ctx = {
+                'to': addr,
+                'message_id': str(hdr.get('Message-ID', '')).strip(),
+                'references': str(hdr.get('References', '')).strip(),
+                'subject': _gv_decode_header(str(hdr.get('Subject', ''))),
+                'phone': want,
+            }
+            save_admin_ctx(ctx)
+            logging.info("🔑 Admin reply context seeded from existing inbox history")
+            return True
+        logging.info("Admin ctx scan: no existing GV message from the admin number found")
+        return False
+    except Exception as e:
+        logging.error(f"Admin ctx inbox scan failed: {e}")
+        return False
+    finally:
+        if imap is not None:
+            try:
+                imap.logout()
+            except Exception:
+                pass
+
 def load_pending_approvals():
     try:
         if os.path.exists(PENDING_APPROVALS_FILE):
@@ -5010,6 +5085,21 @@ def index():
 
                             <button class="test-btn" onclick="testGoogleVoice()">🔌 Test Google Voice Connection</button>
                             <div id="gv_test_result" style="margin-top: 8px; font-size: 14px;"></div>
+
+                            <hr style="border:none; border-top:1px solid #444; margin:16px 0;">
+                            <h3 style="margin:14px 0 6px;">🙋 Live Name Approval (optional)</h3>
+                            <p class="help-text" style="margin:4px 0 8px;">When the whitelist is on and the show is live, a texter who sends a name that is not on the list can be approved by you over text - reply <strong>Y</strong> to add and show it, or <strong>N</strong> to deny. Leave the number blank to turn this off. The messages are configured on the <strong>SMS Responses</strong> tab.</p>
+
+                            <div id="admin_bootstrap_banner" style="{{ '' if (config.get('admin_phone','') and not admin_ctx_seeded) else 'display:none;' }} background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:6px; padding:10px 14px; margin-bottom:10px; font-size:13px;">
+                                ⚠️ <strong>Action needed:</strong> text your Google Voice number once from the admin phone (<span id="admin_banner_num">{{ config.get('admin_phone','') }}</span>) to turn on live approvals. You will not receive approval requests until you do. This clears automatically once a text from your number is found (we also check your existing Google Voice history in Gmail).
+                            </div>
+                            <div id="admin_connected_note" style="{{ '' if (config.get('admin_phone','') and admin_ctx_seeded) else 'display:none;' }} background:#e8f5e9; border:1px solid #66bb6a; color:#2e7d32; border-radius:6px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
+                                ✅ Admin phone connected - live approvals are active.
+                            </div>
+
+                            <label>Admin Phone Number:</label>
+                            <input type="text" id="admin_phone" value="{{ config.get('admin_phone','') }}" placeholder="e.g. 5551234567" style="width:100%; max-width:260px;">
+                            <p class="help-text" style="margin:3px 0 0;">The phone that approves names. It must have texted your Google Voice number at least once (any message) so replies can reach it.</p>
                         </div>
 
                         <label>Poll Interval (seconds):</label>
@@ -5190,82 +5280,6 @@ def index():
                         <label class="toggle-switch"><input type="checkbox" id="use_whitelist" {{ 'checked' if config.get('use_whitelist', False) else '' }} onchange="updateFormatRules(); checkFiltersState(); checkWhitelistResponseState(); saveConfig();"><span class="toggle-slider"></span></label>
                         <label class="checkbox-label">Enable Name Whitelist - only allow approved names</label><br>
                         <button class="view-btn" onclick="location.href='/whitelist'" style="margin-top:6px;">📋 Manage Whitelist</button>
-
-                        {% if config.get('message_source','twilio') == 'google_voice' %}
-                        <hr style="border:none; border-top:1px solid #444; margin:15px 0;">
-                        <div id="admin_approval_block">
-                            <label class="checkbox-label" style="font-weight:bold;">🙋 Live Name Approval (Google Voice)</label>
-                            <p class="help-text" style="margin:4px 0 8px;">When a texter sends a name that is not on the whitelist, text your phone so you can approve it live - reply <strong>Y</strong> to add the name and show it, or <strong>N</strong> to deny. Leave the number blank to turn this off (texters just get the Not-on-Whitelist response).</p>
-
-                            <div id="admin_bootstrap_banner" style="{{ '' if (config.get('admin_phone','') and not admin_ctx_seeded) else 'display:none;' }} background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:6px; padding:10px 14px; margin-bottom:10px; font-size:13px;">
-                                ⚠️ <strong>Action needed:</strong> text your Google Voice number once from the admin phone (<span id="admin_banner_num">{{ config.get('admin_phone','') }}</span>) to turn on live approvals. You will not receive approval requests until you do. This clears automatically once your text arrives.
-                            </div>
-                            <div id="admin_connected_note" style="{{ '' if (config.get('admin_phone','') and admin_ctx_seeded) else 'display:none;' }} background:#e8f5e9; border:1px solid #66bb6a; color:#2e7d32; border-radius:6px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
-                                ✅ Admin phone connected - live approvals are active.
-                            </div>
-
-                            <label>Admin Phone Number:</label>
-                            <input type="text" id="admin_phone" value="{{ config.get('admin_phone','') }}" placeholder="e.g. 5551234567" style="width:100%; max-width:260px;">
-
-                            <label style="margin-top:10px; display:block;">Approval Timeout (minutes):</label>
-                            <input type="number" id="admin_approval_timeout_mins" min="0" max="1440" value="{{ config.get('admin_approval_timeout_mins', 10) }}" style="width:90px;">
-                            <p class="help-text" style="margin:3px 0 10px;">How long a request waits for your Y/N before it expires (the texter then gets the Not-on-Whitelist reply). 0 = never expire.</p>
-
-                            <label style="margin-top:6px; display:block;">Text to Admin (approval prompt):</label>
-                            <textarea id="admin_approval_prompt" rows="2" style="width:100%;">{{ config.get('admin_approval_prompt', "New name request: '{name}'. Reply Y to add and show it, or N to deny.") }}</textarea>
-                            <p class="help-text" style="margin:3px 0 2px;">Use <code>{name}</code> where the requested name should appear.</p>
-                            <button type="button" class="reset-default-btn" style="opacity:1; pointer-events:auto;" onclick="resetAdminField('admin_approval_prompt')">↩️ Reset to default</button>
-
-                            <label style="margin-top:10px; display:block;">Reply to Texter (while waiting):</label>
-                            <textarea id="response_whitelist_pending" rows="2" style="width:100%;">{{ config.get('response_whitelist_pending', "Your name isn't on our whitelist, please wait a few moments while I get permission to display.") }}</textarea>
-                            <button type="button" class="reset-default-btn" style="opacity:1; pointer-events:auto;" onclick="resetAdminField('response_whitelist_pending')">↩️ Reset to default</button>
-
-                            <label style="margin-top:10px; display:block;">Reply to Texter (if denied):</label>
-                            <textarea id="response_admin_denied" rows="2" style="width:100%;">{{ config.get('response_admin_denied', 'Sorry, this name has not been added to our whitelist.') }}</textarea>
-                            <button type="button" class="reset-default-btn" style="opacity:1; pointer-events:auto;" onclick="resetAdminField('response_admin_denied')">↩️ Reset to default</button>
-
-                            <script>
-                                window._adminDefaults = {
-                                    admin_approval_prompt: "New name request: '{name}'. Reply Y to add and show it, or N to deny.",
-                                    response_whitelist_pending: "Your name isn't on our whitelist, please wait a few moments while I get permission to display.",
-                                    response_admin_denied: "Sorry, this name has not been added to our whitelist."
-                                };
-                                function resetAdminField(id) {
-                                    var el = document.getElementById(id);
-                                    if (!el || !window._adminDefaults[id]) return;
-                                    el.value = window._adminDefaults[id];
-                                    if (window.saveConfig) saveConfig();
-                                }
-                                (function() {
-                                    // Save admin fields on change/blur.
-                                    ['admin_phone','admin_approval_timeout_mins','admin_approval_prompt','response_whitelist_pending','response_admin_denied'].forEach(function(id) {
-                                        var el = document.getElementById(id);
-                                        if (!el) return;
-                                        el.addEventListener('change', function(){ if (window.saveConfig) saveConfig(); });
-                                        el.addEventListener('blur', function(){ if (window.saveConfig) saveConfig(); });
-                                    });
-                                    // Poll the seeded status so the bootstrap banner clears live once the
-                                    // admin texts in (and reappears if the number changes to an unseeded one).
-                                    function pollAdminStatus() {
-                                        var phoneEl = document.getElementById('admin_phone');
-                                        var banner = document.getElementById('admin_bootstrap_banner');
-                                        var connected = document.getElementById('admin_connected_note');
-                                        if (!phoneEl || !banner || !connected) return;
-                                        var phone = (phoneEl.value || '').trim();
-                                        if (!phone) { banner.style.display = 'none'; connected.style.display = 'none'; return; }
-                                        fetch('/api/plugin/admin-approval-status')
-                                            .then(function(r){ return r.json(); })
-                                            .then(function(d){
-                                                if (d && d.seeded) { banner.style.display = 'none'; connected.style.display = 'block'; }
-                                                else { banner.style.display = 'block'; connected.style.display = 'none'; }
-                                            })
-                                            .catch(function(){});
-                                    }
-                                    setInterval(pollAdminStatus, 5000);
-                                })();
-                            </script>
-                        </div>
-                        {% endif %}
                     </div>
 
                     <!-- Sub-col 2: Name Format Rules -->
@@ -6330,6 +6344,92 @@ def index():
                     <p id="not_whitelisted_disabled_warning" class="resp-locked-note" style="{{ '' if not config.get('use_whitelist', False) else 'display:none;' }}">⚠️ <strong>Name Whitelist is disabled</strong> - This response is disabled.</p>
                     <textarea id="response_not_whitelisted" rows="2">{{ config.get('response_not_whitelisted', 'Sorry, that name is not on our approved list.') }}</textarea>
                 </div>
+
+                <!-- Live Name Approval messages - only shown when an Admin Phone Number is
+                     set (configured on the Message Source tab) and Google Voice is the source. -->
+                <div id="admin_approval_responses" class="resp-row enabled" style="{{ '' if (config.get('message_source','twilio')=='google_voice' and config.get('admin_phone','')) else 'display:none;' }}">
+                    <div class="resp-toggle" style="font-weight:bold;">🙋 Live Name Approval (Google Voice)</div>
+                    <p class="help-text" style="margin:2px 0 12px;">Used when a texter sends a name that is not on the whitelist and you have an <strong>Admin Phone Number</strong> set (Message Source tab). You get the Y/N prompt; the texter gets the waiting message, then the Success response (Y) or the denied message (N).</p>
+
+                    <label>Approval Timeout (minutes):</label>
+                    <input type="number" id="admin_approval_timeout_mins" min="0" max="1440" value="{{ config.get('admin_approval_timeout_mins', 10) }}" style="width:90px;">
+                    <p class="help-text" style="margin:3px 0 14px;">How long a request waits for your Y/N before it expires (the texter then gets the Not-on-Whitelist reply). 0 = never expire.</p>
+
+                    <label>Text to Admin (approval prompt):</label>
+                    <textarea id="admin_approval_prompt" rows="2">{{ config.get('admin_approval_prompt', "New name request: '{name}'. Reply Y to add and show it, or N to deny.") }}</textarea>
+                    <p class="help-text" style="margin:3px 0 2px;">Use <code>{name}</code> where the requested name should appear.</p>
+                    <button type="button" class="reset-default-btn" style="opacity:1; pointer-events:auto;" onclick="resetAdminField('admin_approval_prompt')">↩️ Reset to default</button>
+
+                    <label style="margin-top:14px; display:block;">Reply to Texter (while waiting):</label>
+                    <textarea id="response_whitelist_pending" rows="2">{{ config.get('response_whitelist_pending', "Your name isn't on our whitelist, please wait a few moments while I get permission to display.") }}</textarea>
+                    <button type="button" class="reset-default-btn" style="opacity:1; pointer-events:auto;" onclick="resetAdminField('response_whitelist_pending')">↩️ Reset to default</button>
+
+                    <label style="margin-top:14px; display:block;">Reply to Texter (if denied):</label>
+                    <textarea id="response_admin_denied" rows="2">{{ config.get('response_admin_denied', 'Sorry, this name has not been added to our whitelist.') }}</textarea>
+                    <button type="button" class="reset-default-btn" style="opacity:1; pointer-events:auto;" onclick="resetAdminField('response_admin_denied')">↩️ Reset to default</button>
+                </div>
+
+                <script>
+                    // Live Name Approval wiring. The Admin Phone field lives on the Message
+                    // Source tab; these message fields live here. Wire everything after the
+                    // DOM is parsed so elements in both tabs exist.
+                    window._adminDefaults = {
+                        admin_approval_prompt: "New name request: '{name}'. Reply Y to add and show it, or N to deny.",
+                        response_whitelist_pending: "Your name isn't on our whitelist, please wait a few moments while I get permission to display.",
+                        response_admin_denied: "Sorry, this name has not been added to our whitelist."
+                    };
+                    function resetAdminField(id) {
+                        var el = document.getElementById(id);
+                        if (!el || !window._adminDefaults[id]) return;
+                        el.value = window._adminDefaults[id];
+                        if (window.saveConfig) saveConfig();
+                    }
+                    // Show the approval messages only when Google Voice is the source AND an
+                    // admin phone is set; keep the banner's shown number in sync live.
+                    function updateAdminApprovalUI() {
+                        var isGV = ((document.getElementById('message_source')||{}).value) === 'google_voice';
+                        var phone = (((document.getElementById('admin_phone')||{}).value) || '').trim();
+                        var sec = document.getElementById('admin_approval_responses');
+                        if (sec) sec.style.display = (isGV && phone) ? '' : 'none';
+                        var num = document.getElementById('admin_banner_num');
+                        if (num) num.textContent = phone;
+                    }
+                    window.updateAdminApprovalUI = updateAdminApprovalUI;
+                    document.addEventListener('DOMContentLoaded', function() {
+                        var ap = document.getElementById('admin_phone');
+                        if (ap) {
+                            ap.addEventListener('input', updateAdminApprovalUI);
+                            ap.addEventListener('change', function(){ updateAdminApprovalUI(); if (window.saveConfig) saveConfig(); });
+                            ap.addEventListener('blur', function(){ if (window.saveConfig) saveConfig(); });
+                        }
+                        ['admin_approval_timeout_mins','admin_approval_prompt','response_whitelist_pending','response_admin_denied'].forEach(function(id) {
+                            var el = document.getElementById(id);
+                            if (!el) return;
+                            el.addEventListener('change', function(){ if (window.saveConfig) saveConfig(); });
+                            el.addEventListener('blur', function(){ if (window.saveConfig) saveConfig(); });
+                        });
+                        // Poll the seeded status so the bootstrap banner clears live once a text
+                        // from the admin number is found (new, or from existing Gmail history).
+                        function pollAdminStatus() {
+                            var banner = document.getElementById('admin_bootstrap_banner');
+                            var connected = document.getElementById('admin_connected_note');
+                            if (!banner || !connected) return;
+                            var isGV = ((document.getElementById('message_source')||{}).value) === 'google_voice';
+                            var phone = (((document.getElementById('admin_phone')||{}).value) || '').trim();
+                            if (!isGV || !phone) { banner.style.display = 'none'; connected.style.display = 'none'; return; }
+                            fetch('/api/plugin/admin-approval-status')
+                                .then(function(r){ return r.json(); })
+                                .then(function(d){
+                                    if (d && d.seeded) { banner.style.display = 'none'; connected.style.display = 'block'; }
+                                    else { banner.style.display = 'block'; connected.style.display = 'none'; }
+                                })
+                                .catch(function(){});
+                        }
+                        setInterval(pollAdminStatus, 5000);
+                        pollAdminStatus();
+                        updateAdminApprovalUI();
+                    });
+                </script>
 
             </div>
         </div>
@@ -8572,6 +8672,7 @@ var _saveTimer = null;
                     checkDuplicateState();          // grey the duplicate response accordingly
                     checkRateLimitResponseState();  // grey the rate-limited response accordingly
                     if (isGV) enableGvResponses();  // Google Voice: turn on the usable responses
+                    if (window.updateAdminApprovalUI) updateAdminApprovalUI();  // show/hide Live Name Approval
                     saveConfig();
                 });
                 // Google Voice credential fields - save on blur (like Twilio creds)
@@ -8987,9 +9088,14 @@ def api_admin_approval_status():
     """Tiny status signal for the config page's bootstrap banner: whether the admin
     phone has texted the Google Voice number yet (so there is a reply context to
     text them). Polled only while the banner is showing."""
+    seeded = admin_ctx_is_seeded()
+    # Self-heal from existing texting history: if not seeded yet, scan the Gmail inbox
+    # for a prior Google Voice message from the admin number (throttled internally).
+    if not seeded and config.get('admin_phone', '').strip():
+        seeded = seed_admin_ctx_from_inbox()
     return jsonify({
         "admin_phone": config.get('admin_phone', ''),
-        "seeded": admin_ctx_is_seeded(),
+        "seeded": seeded,
     })
 
 # ============================================================================

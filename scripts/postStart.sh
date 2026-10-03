@@ -10,8 +10,10 @@ PLUGIN_DIR="/home/fpp/media/plugins/fpp-plugin-textmylights"
 pkill -f sms_plugin.py 2>/dev/null || true
 sleep 1
 
-# Grant fpp user write access to FPP shared memory files (created by root on FPPD start)
-chmod 666 /dev/shm/FPP-Model-Data-* 2>/dev/null || true
+# NOTE: shared-memory permissions are fixed at RUNTIME (per overlay model, scoped to the
+# fpp user/group) by the root helper tml-fix-shm-perms - see render_to_shm() in sms_plugin.py.
+# FPP creates /dev/shm/FPP-Model-Data-* as root AFTER this script runs, so there is nothing
+# to chmod here anyway.
 
 # Start the service as fpp user
 cd "$PLUGIN_DIR"

@@ -1914,6 +1914,13 @@ def get_fpp_playlists():
 # FSEQ preview helpers
 # ---------------------------------------------------------------------------
 
+# ----------------------------------------------------------------------------
+# FSEQ preview (NOT video capture): these functions read a single frame of pixel
+# data out of an FPP .fseq sequence file so the config page can show a static
+# background still behind the text layout editor. There is no camera, capture
+# device, or continuous video decoding - it is one on-demand read of bytes from a
+# local file, decompressed (zstd/zlib) only for the one frame being previewed.
+# ----------------------------------------------------------------------------
 def parse_fseq_header(filepath):
     """Parse an FSEQ v2 file header. Returns a metadata dict or raises ValueError."""
     with open(filepath, 'rb') as f:
@@ -10881,4 +10888,9 @@ if __name__ == '__main__':
         logging.warning("⚠️  AUTH DISABLED at startup (.disable_auth present) - access "
                         "control is OFF for everyone on the network. This is for debugging "
                         f"only; delete {AUTH_DISABLE_FILE} before normal use.")
+    # Bind 0.0.0.0 ON PURPOSE: the Master/Remote feature needs other FPP instances on the LAN
+    # to reach this one (the master POSTs name/stop events to each remote's :5000, and remotes
+    # fetch the master's content list), so 127.0.0.1 would break multi-instance. Access is still
+    # gated: browser endpoints require the per-instance token, /api/tml/* only accept FPP
+    # MultiSync peers, and the scheduler hooks are loopback-only.
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)

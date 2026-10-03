@@ -2882,8 +2882,6 @@ def _maybe_handle_admin_message(from_number, body):
     if decision is None:
         return False  # admin texted a real name - let normal processing handle it
 
-    admin_ctx = load_admin_ctx()
-
     # A name-targeted reply ('Y Grandma') resolves that request; otherwise FIFO
     # (oldest first). Shared by the active and the expired lists.
     def _pick(items):
@@ -2895,34 +2893,50 @@ def _maybe_handle_admin_message(from_number, body):
                     return items.pop(i)
         return items.pop(0)
 
-    pending = prune_pending_approvals()
+    # Pull the admin's target out of the RAW pending list first - BEFORE pruning - so
+    # a late Y/N on a request that has passed its timeout is handled here (silently),
+    # not swept up by prune_pending_approvals() which would fire the Not-on-Whitelist
+    # timeout reply at the texter.
+    pending = load_pending_approvals()
     record = _pick(pending)
 
     if record is not None:
-        # Normal, in-window resolution.
         save_pending_approvals(pending)
         name = record.get('name', '')
         texter_ctx = record.get('texter_ctx')
         texter_phone = record.get('texter_phone', '')
+        # Is this request already past its approval timeout? A late decision NEVER
+        # replies to the texter: a late Y whitelists for next time (no show), a late N
+        # does nothing.
+        timeout = int(config.get('admin_approval_timeout_mins', 10) or 0)
+        is_late = timeout > 0 and (float(record.get('created_ts', 0) or 0) < time.time() - timeout * 60)
         if decision == 'approve':
             add_name_to_whitelist(name)
-            add_to_queue(name, texter_phone, record.get('body', name))
-            log_message(texter_phone, record.get('body', ''), name, "admin_approved")
-            _send_feature_reply(texter_ctx, config.get('response_success', ''), 'success')
-            _send_feature_reply(admin_ctx, f"Added and showing '{name}'.", 'admin_ack')
-            logging.info(f"✅ Admin approved '{name}' - added to whitelist and queued")
+            if is_late:
+                log_message(texter_phone, record.get('body', ''), name, "admin_approved_late")
+                logging.info(f"✅ Admin approved '{name}' after timeout - whitelisted only, not shown")
+            else:
+                add_to_queue(name, texter_phone, record.get('body', name))
+                log_message(texter_phone, record.get('body', ''), name, "admin_approved")
+                _send_feature_reply(texter_ctx, config.get('response_success', ''), 'success')
+                logging.info(f"✅ Admin approved '{name}' - added to whitelist and queued")
         else:  # deny
-            log_message(texter_phone, record.get('body', ''), name, "admin_denied")
-            # A denial just sends the standard Not-on-Whitelist response - no separate
-            # "denied" message. Same outcome (and same reply) as a timed-out request.
-            _send_feature_reply(texter_ctx, config.get('response_not_whitelisted', ''), 'not_whitelisted')
-            _send_feature_reply(admin_ctx, f"Denied '{name}'.", 'admin_ack')
-            logging.info(f"🚫 Admin denied '{name}'")
+            if is_late:
+                log_message(texter_phone, record.get('body', ''), name, "admin_denied_late")
+                logging.info(f"🚫 Admin denied '{name}' after timeout - no action")
+            else:
+                log_message(texter_phone, record.get('body', ''), name, "admin_denied")
+                # A denial just sends the standard Not-on-Whitelist response.
+                _send_feature_reply(texter_ctx, config.get('response_not_whitelisted', ''), 'not_whitelisted')
+                logging.info(f"🚫 Admin denied '{name}'")
+        # Now sweep any OTHER genuinely-expired-and-unanswered requests (sends their
+        # timeout reply); safe, since the one we just handled is already removed.
+        prune_pending_approvals()
         return True
 
-    # Nothing active matched - a LATE reply to an already-expired request. A late 'Y'
-    # still adds the name to the whitelist (for next time) but does NOT show it now;
-    # a late 'N' needs no action (the texter was already told on expiry).
+    # No active pending (all already pruned) - the request may be in the expired store.
+    # A late Y whitelists for next time (no show); a late N does nothing. Either way,
+    # the texter is never contacted here.
     expired = load_expired_approvals()
     exp_rec = _pick(expired)
     if exp_rec is not None:
@@ -2931,10 +2945,8 @@ def _maybe_handle_admin_message(from_number, body):
         if decision == 'approve':
             add_name_to_whitelist(name)
             log_message(exp_rec.get('texter_phone', ''), exp_rec.get('body', ''), name, "admin_approved_late")
-            _send_feature_reply(admin_ctx, f"Too late to show '{name}', but added it to the whitelist for next time.", 'admin_ack')
             logging.info(f"✅ Admin approved '{name}' after timeout - whitelisted only, not shown")
         else:  # late deny
-            _send_feature_reply(admin_ctx, f"'{name}' already expired - no action taken.", 'admin_ack')
             logging.info(f"🚫 Admin denied '{name}' after timeout - no action")
         return True
 
@@ -5242,10 +5254,10 @@ def index():
                         <div id="gv_approval" style="display:none;">
                             <hr style="border:none; border-top:1px solid #444; margin:16px 0;">
                             <h3 style="margin:14px 0 6px;">🙋 Live Name Approval (optional) <span id="live_approval_wl_state" style="font-size:13px; font-weight:normal; margin-left:6px; padding:2px 8px; border-radius:10px;"></span></h3>
-                            <p class="help-text" style="margin:4px 0 8px;">When the whitelist is on and the show is live, a texter who sends a name that is not on the list can be approved by you over text - reply <strong>Y</strong> to add and show it, or <strong>N</strong> to deny. Leave the number blank to turn this off. The messages are configured on the <strong>SMS Responses</strong> tab.</p>
+                            <p class="help-text" style="margin:4px 0 8px;">When the whitelist is on and the show is live, a texter who sends a name that is not on the list can be approved by you over text - reply <strong>Y</strong> to add and show it, or <strong>N</strong> to deny. Leave the number blank to turn this off. </p>
 
                             <div id="admin_bootstrap_banner" style="{{ '' if (config.get('admin_phone','') and not admin_ctx_seeded) else 'display:none;' }} background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:6px; padding:10px 14px; margin-bottom:10px; font-size:13px;">
-                                ⚠️ <strong>Action needed:</strong> from the admin phone (<span id="admin_banner_num">{{ config.get('admin_phone','') }}</span>), text the word <strong>admin</strong> to your Google Voice number to connect. You will not receive approval requests until you do. The word "admin" is never shown on the display. This clears automatically once your text is found (we also check your existing Google Voice history in Gmail).
+                                ⚠️ <strong>Action needed:</strong> from the admin phone (<span id="admin_banner_num">{{ config.get('admin_phone','') }}</span>), text the word <strong>admin</strong> to your Google Voice number to connect. You will not receive approval requests until you do. The word "admin" is never shown on the display.
                             </div>
                             <div id="admin_connected_note" style="{{ '' if (config.get('admin_phone','') and admin_ctx_seeded) else 'display:none;' }} background:#e8f5e9; border:1px solid #66bb6a; color:#2e7d32; border-radius:6px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
                                 ✅ Admin phone connected - live approvals are active.
@@ -5256,7 +5268,6 @@ def index():
 
                             <label>Admin Phone Number:</label>
                             <input type="text" id="admin_phone" value="{{ config.get('admin_phone','') }}" placeholder="e.g. 5551234567" style="width:100%; max-width:260px;">
-                            <p class="help-text" style="margin:3px 0 0;">The phone that approves names. From it, text the word <strong>admin</strong> to your Google Voice number once so replies can reach it.</p>
                         </div>
                     </div>
 
@@ -6517,7 +6528,7 @@ def index():
                     <label style="margin-top:14px; display:block;">Reply to Texter (while waiting):</label>
                     <textarea id="response_whitelist_pending" rows="2">{{ config.get('response_whitelist_pending', "Your name isn't on our whitelist, please wait a few moments while I get approval to display.") }}</textarea>
                     <button type="button" class="reset-default-btn" style="opacity:1; pointer-events:auto;" onclick="resetAdminField('response_whitelist_pending')">↩️ Reset to default</button>
-                    <p class="help-text" style="margin:10px 0 2px;">If you deny the request (or it times out), the texter is sent the <strong>Not on Whitelist</strong> response above - there is no separate "denied" message.</p>
+                    <p class="help-text" style="margin:10px 0 2px;">If you deny the request (or it times out), the texter is sent the <strong>Not on Whitelist</strong> response above.</p>
                 </div>
 
                 <script>

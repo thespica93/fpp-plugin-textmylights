@@ -69,7 +69,7 @@
 		"systemChanges": [
 			{
 				"kind": "privilege",
-				"what": "Adds an /etc/sudoers.d rule allowing chmod of the overlay model's shared-memory file for pixel rendering"
+				"what": "Adds an /etc/sudoers.d rule allowing a validated root helper to give the overlay model's shared-memory file to the fpp user/group (group-writable, not world) for pixel rendering"
 			}
 		],
 		"closedCode": false,

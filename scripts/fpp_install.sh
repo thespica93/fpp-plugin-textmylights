@@ -178,10 +178,11 @@ chmod 664 "$PLUGIN_DIR/whitelist.txt" "$PLUGIN_DIR/blacklist.txt" 2>/dev/null
 # rendering. FPP creates /dev/shm/FPP-Model-Data-* as root AFTER postStart.sh runs, so the
 # plugin needs to fix permissions at runtime without a FPPD restart.
 #
-# SECURITY: instead of granting a broad `chmod 666 /dev/shm/FPP-Model-Data-*` (whose sudo
-# wildcard can match a slash, letting a crafted model name traverse to arbitrary files),
-# we install a small ROOT-OWNED wrapper that validates its argument and only ever touches
-# a single file inside /dev/shm, and grant sudo to that wrapper alone.
+# SECURITY: instead of granting a broad world-writable rule over all FPP-Model-Data files
+# (whose sudo wildcard could also match a slash, letting a crafted model name traverse to
+# arbitrary files), we install a small ROOT-OWNED wrapper that validates its argument and
+# only ever touches a single file inside /dev/shm (giving it to the fpp user/group,
+# group-writable only), and grant sudo to that wrapper alone.
 SHM_HELPER="/usr/local/bin/tml-fix-shm-perms"
 install -o root -g root -m 0755 "$PLUGIN_DIR/scripts/tml-fix-shm-perms" "$SHM_HELPER" 2>/dev/null \
     || { cp "$PLUGIN_DIR/scripts/tml-fix-shm-perms" "$SHM_HELPER"; chown root:root "$SHM_HELPER"; chmod 0755 "$SHM_HELPER"; }

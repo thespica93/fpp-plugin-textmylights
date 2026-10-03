@@ -1430,10 +1430,11 @@ def _render_oriented_text_strip(text, font_name, box_w, box_h, color_rgb, orient
 
 def _sudo_fix_shm_perms(model_name):
     """Make /dev/shm/FPP-Model-Data-<model_name> writable by the fpp user via the root
-    helper. The model name is validated here (no path separators) AND again inside the
-    helper, so it can never be used to chmod a file outside /dev/shm - this is the guard
-    against the old broad `sudo chmod 666 /dev/shm/FPP-Model-Data-*` sudoers rule that a
-    crafted model name could abuse for path traversal. Returns True on success."""
+    helper (which gives the file to the fpp user/group, group-writable only - never world).
+    The model name is validated here (no path separators) AND again inside the helper, so it
+    can never touch a file outside /dev/shm - this is the guard against an earlier broad
+    world-writable sudoers rule that a crafted model name could abuse for path traversal.
+    Returns True on success."""
     if not model_name or '/' in model_name or '\x00' in model_name or '\n' in model_name:
         logging.error(f"Refusing shm permission fix for unsafe model name: {model_name!r}")
         return False
@@ -1494,14 +1495,15 @@ def render_to_shm(line_items, model_name, width, height):
         try:
             _write()
         except PermissionError:
-            # FPP creates shm files as root after postStart.sh runs.
-            # Use the sudoers rule added by fpp_install.sh to fix permissions once.
+            # FPP creates shm files owned by root. Use the root helper (installed by
+            # fpp_install.sh, allowed via the narrow sudoers rule) to hand this one file to
+            # the fpp user/group so the plugin can write it.
             logging.warning(f"render_to_shm: permission denied on {shm_path} - fixing via helper")
             if _sudo_fix_shm_perms(model_name):
                 _write()
             else:
-                logging.error("render_to_shm: shm permission fix failed")
-                logging.error("render_to_shm: restart FPPD to apply shm permissions from postStart.sh")
+                logging.error("render_to_shm: shm permission fix failed - is the sudoers "
+                              "rule installed? (re-run the plugin install)")
                 return False
 
         logging.info(f"render_to_shm: wrote {len(raw)} bytes to {shm_path} ({len(line_items)} lines)")

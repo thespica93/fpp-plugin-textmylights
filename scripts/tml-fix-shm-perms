@@ -3,9 +3,12 @@
 # Text My Lights - shared-memory permission helper (runs as root via sudo)
 #
 # Makes ONE FPP overlay-model shared-memory file writable by the fpp user so the
-# plugin can draw text/images into it. This is the ONLY chmod the plugin is
-# allowed to run as root (see /etc/sudoers.d/90-fpp-sms-shm), replacing the old
-# broad `chmod 666 /dev/shm/FPP-Model-Data-*` rule.
+# plugin can draw text/images into it. This is the ONLY privileged action the
+# plugin is allowed to run as root (see /etc/sudoers.d/90-fpp-sms-shm), replacing
+# an earlier broad world-writable rule over all FPP-Model-Data files.
+#
+# The file is given to the fpp user/group (group-writable, NOT world) so only the
+# plugin - not every local account - can write into the overlay buffer.
 #
 # It accepts a single model NAME and only ever touches
 #   /dev/shm/FPP-Model-Data-<name>
@@ -33,4 +36,8 @@ if [ ! -f "$target" ]; then
     exit 1
 fi
 
-exec /usr/bin/chmod 666 "$target"
+# Hand the file to the fpp user/group and make it group-writable only (660, no
+# world access). chown is needed because FPP creates the file owned by root:root,
+# so group perms alone would not let the fpp user write.
+/usr/bin/chown fpp:fpp "$target"
+exec /usr/bin/chmod 660 "$target"

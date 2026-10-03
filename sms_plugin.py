@@ -3700,10 +3700,15 @@ def _stop_show_playback_locked():
         # Stop the plugin's own background FSEQ effects: the single waiting content, every
         # seq: item in the WAITING rotation list, the flat name content, and every seq: item
         # in the names list (any could be the one currently looping). FSEQ Effect Stop on a
-        # non-running seq is harmless.
+        # non-running seq is harmless. ALSO stop whatever is ACTUALLY running right now
+        # (_active_waiting_content / _active_name_content) - on a REMOTE these are pushed by
+        # the master and are NOT in this instance's own config lists, so without them the
+        # remote's waiting seq would keep looping after a Stop.
         _wait_seq = [it.get('content', '') for it in (config.get('default_content_list', []) or [])]
         _names_seq = [it.get('content', '') for it in (config.get('names_content_list', []) or [])]
-        for content in [config.get('default_playlist', ''), config.get('name_display_playlist', ''), *_wait_seq, *_names_seq]:
+        for content in [config.get('default_playlist', ''), config.get('name_display_playlist', ''),
+                        _active_waiting_content or '', _active_name_content or '',
+                        *_wait_seq, *_names_seq]:
             if content.startswith('seq:'):
                 seq_name = content[4:].removesuffix('.fseq')
                 r = requests.get(f"{FPP_HOST}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(seq_name)}", timeout=3)

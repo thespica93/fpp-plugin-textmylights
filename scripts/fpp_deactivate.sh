@@ -5,7 +5,7 @@
 
 PLUGIN_URL="http://127.0.0.1:5000/api/deactivate"
 
-RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$PLUGIN_URL" 2>&1)
+RESPONSE=$(curl -s --connect-timeout 5 --max-time 15 -w "\n%{http_code}" -X POST "$PLUGIN_URL" 2>&1)
 HTTP_CODE=$(echo "$RESPONSE" | tail -1)
 BODY=$(echo "$RESPONSE" | head -1)
 

@@ -2,6 +2,12 @@
 ###############################################################################
 # Text My Lights Plugin - Installation Script
 ###############################################################################
+# Stop on the first unhandled failure so a broken dependency install can't leave
+# the plugin half-installed with no visible error. (Plain `set -e` only - `-u`
+# would break references like $SUDO before sourcing common, and pipefail breaks
+# the `cmd | ...` idioms below. Steps that may legitimately fail are guarded with
+# `|| true` or wrapped in `if`.)
+set -e
 
 # Source FPP common functions and set FPPDIR environment
 . ${FPPDIR}/scripts/common
@@ -25,7 +31,9 @@ APT_UPDATED=0
 apt_update_once() {
     if [ "$APT_UPDATED" = "0" ]; then
         log_and_show "Updating package lists... please wait"
-        apt-get update -qq >> "$LOG" 2>&1
+        # Soft-fail: a transient update blip shouldn't abort; a real missing-package
+        # install failure below still aborts under set -e.
+        apt-get update -qq >> "$LOG" 2>&1 || true
         APT_UPDATED=1
     fi
 }
@@ -84,9 +92,9 @@ else
     # and _enumerate_fonts() then miscategorizes it as a "System" font since its
     # name no longer matches anything under fonts/<category>/. This directory is
     # exclusively managed by this plugin, so it's safe to clear.
-    find /usr/local/share/fonts -maxdepth 1 -type f \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.pfb' \) -delete 2>> "$LOG"
+    find /usr/local/share/fonts -maxdepth 1 -type f \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.pfb' \) -delete 2>> "$LOG" || true
     find "$PLUGIN_DIR/fonts" -type f \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.pfb' \) \
-        -exec cp {} /usr/local/share/fonts/ \; 2>> "$LOG"
+        -exec cp {} /usr/local/share/fonts/ \; 2>> "$LOG" || true
     fc-cache -f /usr/local/share/fonts >> "$LOG" 2>&1
     echo "$FONT_HASH" > "$FONT_MARKER"
     log_and_show "[2/7] Theme fonts complete"
@@ -147,22 +155,26 @@ else
 fi
 
 # Create config files if they don't exist
-[ ! -f "/home/fpp/media/config/blocked_phones.json" ] && echo "[]" > /home/fpp/media/config/blocked_phones.json
+if [ ! -f "/home/fpp/media/config/blocked_phones.json" ]; then
+    echo "[]" > /home/fpp/media/config/blocked_phones.json
+fi
 
 # Create the plugin data dir and an OWNER-ONLY secrets folder for credentials
 # (Twilio auth token, Gmail app password). Kept out of plugin.json/logs/backups;
 # 0700 so only the fpp user can read it. The plugin also ensures this at startup.
 PLUGIN_DATA_DIR="/home/fpp/media/plugin.fpp-textmylights"
 mkdir -p "$PLUGIN_DATA_DIR/secrets"
-chown -R fpp:fpp "$PLUGIN_DATA_DIR" 2>/dev/null
-chmod 700 "$PLUGIN_DATA_DIR/secrets" 2>/dev/null
-[ -f "$PLUGIN_DATA_DIR/secrets/credentials.json" ] && chmod 600 "$PLUGIN_DATA_DIR/secrets/credentials.json" 2>/dev/null
+chown -R fpp:fpp "$PLUGIN_DATA_DIR" 2>/dev/null || true
+chmod 700 "$PLUGIN_DATA_DIR/secrets" 2>/dev/null || true
+if [ -f "$PLUGIN_DATA_DIR/secrets/credentials.json" ]; then
+    chmod 600 "$PLUGIN_DATA_DIR/secrets/credentials.json" 2>/dev/null || true
+fi
 # Log only (not shown in the installer UI) — don't advertise the credentials path.
 echo "Secrets folder ready: $PLUGIN_DATA_DIR/secrets (owner-only)" >> "$LOG"
 
 # whitelist.txt and blacklist.txt ship with the plugin via git.
 # Force git checkout to ensure they are present (FPP update may not pull all files).
-cd "$PLUGIN_DIR" && git checkout -- whitelist.txt blacklist.txt >> "$LOG" 2>&1
+cd "$PLUGIN_DIR" && git checkout -- whitelist.txt blacklist.txt >> "$LOG" 2>&1 || true
 if [ ! -f "$PLUGIN_DIR/whitelist.txt" ]; then
     log_and_show "WARNING: whitelist.txt still missing after git checkout - creating empty file"
     touch "$PLUGIN_DIR/whitelist.txt"
@@ -171,8 +183,8 @@ if [ ! -f "$PLUGIN_DIR/blacklist.txt" ]; then
     log_and_show "WARNING: blacklist.txt still missing after git checkout - creating empty file"
     touch "$PLUGIN_DIR/blacklist.txt"
 fi
-chown fpp:fpp "$PLUGIN_DIR/whitelist.txt" "$PLUGIN_DIR/blacklist.txt" 2>/dev/null
-chmod 664 "$PLUGIN_DIR/whitelist.txt" "$PLUGIN_DIR/blacklist.txt" 2>/dev/null
+chown fpp:fpp "$PLUGIN_DIR/whitelist.txt" "$PLUGIN_DIR/blacklist.txt" 2>/dev/null || true
+chmod 664 "$PLUGIN_DIR/whitelist.txt" "$PLUGIN_DIR/blacklist.txt" 2>/dev/null || true
 
 # Allow the fpp user to make FPP shared-memory files writable for pixel-accurate text
 # rendering. FPP creates /dev/shm/FPP-Model-Data-* as root AFTER postStart.sh runs, so the
@@ -199,13 +211,15 @@ else
 fi
 
 # Set permissions on config/logs directories
-chown -R fpp:fpp /home/fpp/media/config /home/fpp/media/logs 2>/dev/null
-touch /home/fpp/media/logs/sms_plugin.log
-# 0644, not 0666: the plugin (fpp) writes it and FPP's log viewer reads it, but no other
-# local user should be able to tamper with it. Contains texter phone numbers, so not group/
-# world writable.
-chmod 644 /home/fpp/media/logs/sms_plugin.log
-chown fpp:fpp /home/fpp/media/logs/sms_plugin.log
+chown -R fpp:fpp /home/fpp/media/config /home/fpp/media/logs 2>/dev/null || true
+# FPP log viewer recognizes logs named plugin-<pluginname>.log in logDirectory.
+# Remove the old pre-convention name so it stops lingering after an update.
+rm -f /home/fpp/media/logs/sms_plugin.log
+touch /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log
+# 0644, not world-writable: the plugin (fpp) writes it and FPP's log viewer reads it, but no
+# other local user should be able to tamper with it. Contains texter phone numbers.
+chmod 644 /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log
+chown fpp:fpp /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log || true
 
 # Install scheduler scripts into FPP's scripts directory so they appear in
 # the scheduler under: Command → Run Script → TextMyLightsStart / TextMyLightsStop
@@ -219,7 +233,7 @@ rm -f /home/fpp/media/scripts/TwilioStart.sh /home/fpp/media/scripts/TwilioStop.
 cp "$PLUGIN_DIR/scripts/fpp_activate.sh"   /home/fpp/media/scripts/TextMyLightsStart.sh
 cp "$PLUGIN_DIR/scripts/fpp_deactivate.sh" /home/fpp/media/scripts/TextMyLightsStop.sh
 chmod +x /home/fpp/media/scripts/TextMyLightsStart.sh /home/fpp/media/scripts/TextMyLightsStop.sh
-chown fpp:fpp /home/fpp/media/scripts/TextMyLightsStart.sh /home/fpp/media/scripts/TextMyLightsStop.sh
+chown fpp:fpp /home/fpp/media/scripts/TextMyLightsStart.sh /home/fpp/media/scripts/TextMyLightsStop.sh || true
 log_and_show "Scheduler scripts installed: TextMyLightsStart.sh / TextMyLightsStop.sh"
 
 log_and_show "========================================"
@@ -231,13 +245,14 @@ log_and_show "========================================"
 if pgrep -f sms_plugin.py > /dev/null 2>&1; then
     log_and_show "Restarting SMS plugin service..."
     pkill -f sms_plugin.py 2>/dev/null || true
-    sleep 1
-    setsid su fpp -c "cd '$PLUGIN_DIR' && nohup python3 sms_plugin.py > /dev/null 2>/home/fpp/media/logs/sms_plugin.log &" < /dev/null > /dev/null 2>&1
+    # Bounded wait for the old process to exit (instead of a flat sleep).
+    for _i in $(seq 1 20); do pgrep -f sms_plugin.py >/dev/null 2>&1 || break; sleep 0.1; done
+    setsid su fpp -c "cd '$PLUGIN_DIR' && nohup python3 sms_plugin.py > /dev/null 2>/home/fpp/media/logs/plugin-fpp-plugin-textmylights.log &" < /dev/null > /dev/null 2>&1 || true
     log_and_show "SMS plugin service restarted"
 fi
 
 # Trigger the "FPPD Restart Required" banner in FPP's UI
-setSetting "restartFlag" "1"
+setSetting "restartFlag" "1" || true
 
 # No errors — remove the install log, it's only useful for debugging failures
 rm -f "$LOG"

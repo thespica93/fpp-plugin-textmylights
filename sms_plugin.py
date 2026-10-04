@@ -336,7 +336,7 @@ DEFAULT_CONFIG = {
     # Empty = auto (follow the first master found, accept pushes from any trusted peer).
     "selected_master": "",
     # Which inbound message source feeds the pipeline: "twilio" | "google_voice"
-    "message_source": "twilio",
+    "message_source": "google_voice",
     "twilio_account_sid": "",
     "twilio_auth_token": "",
     "twilio_phone_number": "",
@@ -5685,7 +5685,12 @@ def index():
                     showIf('waiting_config_col', !remote);
                     showIf('names_config_col', !remote);
                     showIf('btn_sync_pos_master', remote);   // remote-only: copy master's layout
-                    showIf('tabbtn-sms', !remote);
+                    // SMS Responses are Google-Voice-only, so for a non-remote the source
+                    // (not just the role) decides whether the tab shows. Without this check
+                    // this 5s-interval role sync would re-show the tab after updateSourceUI()
+                    // hid it for Twilio - the bug where SMS Responses kept coming back.
+                    var _srcGV = ((document.getElementById('message_source')||{}).value) === 'google_voice';
+                    showIf('tabbtn-sms', !remote && _srcGV);
                     showIf('tabbtn-testing', !remote);
                     showIf('btn_view_queue', !remote);
                     showIf('btn_plugin_toggle', !remote);

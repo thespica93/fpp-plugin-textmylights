@@ -352,7 +352,9 @@ DEFAULT_CONFIG = {
     "gv_smtp_port": 587,
     "poll_interval": 2,
     "display_duration": 10,
-    "max_messages_per_phone": 5,
+    # 0 = unlimited, matching the Google Voice default source (Twilio uses 5, applied
+    # by the source selector's change handler when you switch to Twilio).
+    "max_messages_per_phone": 0,
     "max_message_length": 30,
     "max_message_age_mins": 5,
     "one_word_only": False,
@@ -415,6 +417,8 @@ DEFAULT_CONFIG = {
     "sms_response_success": True,
     "sms_response_profanity": True,
     "sms_response_rate_limited": True,
+    # Duplicate names are blocked by default for both sources, so the Duplicate Name
+    # response stays live (row un-greyed) and actually sends on a repeat.
     "allow_duplicate_names": False,
     "sms_response_duplicate": True,
     "sms_response_invalid_format": True,
@@ -8875,12 +8879,12 @@ var _saveTimer = null;
                 var srcEl = document.getElementById('message_source');
                 if (srcEl) srcEl.addEventListener('change', function() {
                     var isGV = this.value === 'google_voice';
-                    // Google Voice: unlimited (0) + allow duplicate names.
-                    // Twilio: rate limit 5 + disallow duplicates.
+                    // Google Voice: unlimited (0). Twilio: rate limit 5.
+                    // Duplicate names stay BLOCKED for both sources (Duplicate Name
+                    // response stays live), so the source switch no longer touches it -
+                    // whatever the user set is preserved.
                     var mm = document.getElementById('max_messages');
                     if (mm) mm.value = isGV ? 0 : 5;
-                    var dup = document.getElementById('allow_duplicate_names');
-                    if (dup) dup.checked = isGV;
                     updateSourceUI();
                     checkDuplicateState();          // grey the duplicate response accordingly
                     checkRateLimitResponseState();  // grey the rate-limited response accordingly

@@ -5347,7 +5347,7 @@ def index():
                             </select>
                             <div id="waiting_content_list_box" style="border:1px solid #ddd; border-radius:5px; padding:10px; background:#fff;">
                                 <div id="waiting_content_items"></div>
-                                <button type="button" onclick="openManageWaitingModal()" style="margin-top:8px; font-size:13px; padding:6px 14px; cursor:pointer; background:#1976d2; color:#fff; border:none; border-radius:4px;">🗂️ Add / Arrange Waiting Content</button>
+                                <button type="button" onclick="openManageWaitingModal(this)" style="margin-top:8px; font-size:13px; padding:6px 14px; cursor:pointer; background:#1976d2; color:#fff; border:none; border-radius:4px;">🗂️ Add / Arrange Waiting Content</button>
                                 <div id="waiting_mode_row" style="display:none; margin-top:12px; padding-top:10px; border-top:1px solid #eee;">
                                     <span style="font-size:13px; color:#555; margin-right:10px;">When a sequence ends, play:</span>
                                     <label style="margin-right:14px; cursor:pointer; color:#333; font-size:13px;"><input type="radio" name="waiting_mode" value="roundrobin" onchange="onWaitingModeChange('roundrobin')" style="width:auto;margin:0 5px 0 0;vertical-align:middle;">Round Robin (in order)</label>
@@ -5365,7 +5365,7 @@ def index():
                             </div>
                             <div id="names_content_list_box" style="border:1px solid #ddd; border-radius:5px; padding:10px; background:#fff;">
                                 <div id="names_content_items"></div>
-                                <button type="button" id="btn_manage_names" onclick="openManageContentModal()" style="margin-top:8px; font-size:13px; padding:6px 14px; cursor:pointer; background:#1976d2; color:#fff; border:none; border-radius:4px;">🗂️ Add / Arrange Content</button>
+                                <button type="button" id="btn_manage_names" onclick="openManageContentModal(this)" style="margin-top:8px; font-size:13px; padding:6px 14px; cursor:pointer; background:#1976d2; color:#fff; border:none; border-radius:4px;">🗂️ Add / Arrange Content</button>
                                 <div id="names_mode_row" style="display:none; margin-top:12px; padding-top:10px; border-top:1px solid #eee;">
                                     <span style="font-size:13px; color:#555; margin-right:10px;">When a name arrives, pick:</span>
                                     <label style="margin-right:14px; cursor:pointer; color:#333; font-size:13px;"><input type="radio" name="names_mode" value="roundrobin" onchange="onNamesModeChange('roundrobin')" style="width:auto;margin:0 5px 0 0;vertical-align:middle;">Round Robin</label>
@@ -7947,13 +7947,43 @@ def index():
                     (window._namesContentList||[]).forEach(function(it,i){ sel.appendChild(new Option((i+1)+'. '+(it.content||'(none)'), i)); });
                     if (keepIdx!=null && keepIdx>=0 && keepIdx<sel.options.length) sel.options[keepIdx].selected=true;
                 }
-                function openManageContentModal() {
+                // Open a modal anchored to the CURRENT scroll position instead of scrolling the
+                // whole (cross-origin) iframe page to the top. The trigger button is already in the
+                // user's visible area, so we center the dialog on it - which reads as "centered in
+                // the current window" without the jarring jump-to-top. This never relies on knowing
+                // the parent FPP page's scroll offset (impossible cross-origin); only the button's
+                // own document position, which is correct whether the iframe or the parent scrolls.
+                function _openModalCentered(modalEl, btn) {
+                    if (!modalEl) return;
+                    var sy = window.scrollY || document.documentElement.scrollTop || 0;
+                    var btnY = sy;
+                    try { if (btn && btn.getBoundingClientRect) btnY = btn.getBoundingClientRect().top + sy; } catch(e) {}
+                    var docH = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight, 0);
+                    // Backdrop spans the whole document so the dim is uniform at any scroll position.
+                    modalEl.style.position = 'absolute';
+                    modalEl.style.inset = 'auto';
+                    modalEl.style.top = '0';
+                    modalEl.style.left = '0';
+                    modalEl.style.width = '100%';
+                    modalEl.style.height = docH + 'px';
+                    modalEl.style.paddingTop = '0';
+                    modalEl.style.display = 'block';
+                    // Center the dialog box vertically on the trigger button, horizontally on the page.
+                    var box = modalEl.firstElementChild;
+                    if (box) {
+                        box.style.position = 'absolute';
+                        box.style.left = '50%';
+                        box.style.transform = 'translateX(-50%)';
+                        box.style.top = btnY + 'px';                 // provisional, so offsetHeight is real
+                        var h = box.offsetHeight || 0;
+                        box.style.top = Math.max(8, btnY - Math.round(h / 2)) + 'px';
+                    }
+                }
+                function openManageContentModal(btn) {
                     flushEditorToSelected();          // don't lose current edits
                     _mngRenderAvailable();
                     _mngRenderSelected();
-                    // Scroll to top so the top-aligned fixed modal is in view inside the iframe.
-                    try { window.scrollTo(0,0); window.parent.postMessage({type:'scrollTop'},'*'); } catch(e) {}
-                    var m=document.getElementById('manage_content_modal'); if(m) m.style.display='flex';
+                    _openModalCentered(document.getElementById('manage_content_modal'), btn);
                 }
                 function closeManageContentModal() {
                     var m=document.getElementById('manage_content_modal'); if(m) m.style.display='none';
@@ -8238,11 +8268,10 @@ def index():
                     (window._waitingContentList||[]).forEach(function(it,i){ sel.appendChild(new Option((i+1)+'. '+(it.content||'(none)'), i)); });
                     if (keepIdx!=null && keepIdx>=0 && keepIdx<sel.options.length) sel.options[keepIdx].selected=true;
                 }
-                function openManageWaitingModal() {
+                function openManageWaitingModal(btn) {
                     _wmngRenderAvailable();
                     _wmngRenderSelected();
-                    try { window.scrollTo(0,0); window.parent.postMessage({type:'scrollTop'},'*'); } catch(e) {}
-                    var m=document.getElementById('manage_waiting_modal'); if(m) m.style.display='flex';
+                    _openModalCentered(document.getElementById('manage_waiting_modal'), btn);
                 }
                 function closeManageWaitingModal() {
                     var m=document.getElementById('manage_waiting_modal'); if(m) m.style.display='none';

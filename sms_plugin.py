@@ -556,6 +556,20 @@ def _default_plugin_role():
     return _fpp_mode_role() or 'master'
 
 
+def _fpp_mode_role_for_seed(attempts=5, delay=2):
+    """Like _fpp_mode_role() but retried a few times, for the one-time first-install role
+    seed. The plugin is launched by postStart.sh right as FPPD comes up, so FPP's API can
+    still be warming up for the first few seconds - a single read could miss 'remote'.
+    Returns 'remote'/'master', or None if FPP never answered in the window."""
+    for i in range(attempts):
+        role = _fpp_mode_role()
+        if role is not None:
+            return role
+        if i < attempts - 1:
+            time.sleep(delay)
+    return None
+
+
 def fpp_mode_watcher():
     """Track the FPP instance's own player/remote mode for diagnostics and as the AUTO default.
 
@@ -1212,6 +1226,15 @@ def load_config():
 
         logging.info("Configuration loaded successfully")
     except FileNotFoundError:
+        # FIRST INSTALL ONLY (no plugin.json yet). If THIS FPP box is already in Remote
+        # mode, open the plugin as a remote too - seed an EXPLICIT plugin_role='remote'.
+        # Seeding it explicitly (rather than leaving '' = auto) means later plugin updates
+        # never re-evaluate or flip it; the stored role wins from here on. A non-remote box
+        # is left on '' (auto -> master), unchanged, and if FPP can't be reached in time we
+        # also leave '' so the auto-follow watcher resolves it later.
+        if _fpp_mode_role_for_seed() == 'remote':
+            config['plugin_role'] = 'remote'
+            logging.info(f"First install on a Remote FPP: seeded plugin_role='remote' [{_fpp_mode_detail}]")
         save_config()
         logging.info("Created default configuration")
     except Exception as e:

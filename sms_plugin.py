@@ -5795,7 +5795,12 @@ def index():
                     fetch('/api/plugin/select-master', {
                         method: 'POST', headers: {'Content-Type':'application/json'},
                         body: JSON.stringify({address: address})
-                    }).then(function(){ loadMasters(false); }).catch(function(){});
+                    }).then(function(){
+                        loadMasters(false);
+                        // Refresh the background-preview hint now that the master pin changed
+                        // (content resyncs server-side); a short delay lets the re-mirror land.
+                        setTimeout(function(){ if (window.toggleFseqPreview) window.toggleFseqPreview(); }, 800);
+                    }).catch(function(){});
                 }
                 window.selectMaster = selectMaster;
                 function refreshMasters(btn) {
@@ -8313,8 +8318,29 @@ def index():
                     var loadEl = document.getElementById('fseq_load_status');
                     if (!ct) {
                         if (loadEl) {
-                            loadEl.textContent = '\u26a0 Select a .fseq, video, or image as Waiting or Names content for background preview.';
                             loadEl.style.color = '#ff9800';
+                            var isRemote = ((document.getElementById('plugin_role')||{}).value) === 'remote';
+                            if (!isRemote) {
+                                loadEl.textContent = '\u26a0 Select a .fseq, video, or image as Waiting or Names content for background preview.';
+                                return;
+                            }
+                            // On a remote there is no local content picker - content is pushed by
+                            // the chosen plugin master. Point the user at the missing step: either
+                            // pick a master, or (if one is picked) set content on that master.
+                            loadEl.textContent = '\u26a0 Checking master...';
+                            fetch('/api/plugin/masters').then(function(r){ return r.json(); }).then(function(d){
+                                if (((document.getElementById('plugin_role')||{}).value) !== 'remote') return;
+                                if (getConfiguredContent()) { loadBgPreview(); return; }
+                                loadEl.style.color = '#ff9800';
+                                if (!d || !d.selected) {
+                                    loadEl.textContent = '\u26a0 No Master selected. Select a Master above to configure content.';
+                                } else {
+                                    loadEl.textContent = '\u26a0 No content from the Master yet. Configure content on the Master.';
+                                }
+                            }).catch(function(){
+                                loadEl.style.color = '#ff9800';
+                                loadEl.textContent = '\u26a0 Select a Master above to configure content.';
+                            });
                         }
                         return;
                     }

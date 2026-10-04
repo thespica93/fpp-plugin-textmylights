@@ -521,13 +521,28 @@ def _fpp_mode_role():
     try:
         r = requests.get(f"{FPP_HOST}/api/settings/fppMode", timeout=3)
         if r.status_code == 200:
-            txt = (r.text or '').strip().strip('"').lower()   # "remote" / "player" / "master" / legacy int
+            # FPP versions differ: newer returns a JSON OBJECT describing the setting
+            # ({"value":"remote","options":{...},...}), older returns a bare JSON string
+            # ("remote") or legacy int (8). Pull the actual mode out of whichever shape,
+            # never match against the whole payload (the object contains the substring
+            # "remote" in its options and would false-positive, or here false-NEGATIVE
+            # against an exact compare and wrongly resolve to master).
+            val = (r.text or '').strip()
+            try:
+                parsed = r.json()
+                if isinstance(parsed, dict):
+                    val = str(parsed.get('value', ''))
+                elif isinstance(parsed, (str, int)):
+                    val = str(parsed)
+            except Exception:
+                pass
+            txt = val.strip().strip('"').lower()   # "remote" / "player" / "master" / legacy int
             if txt:
                 # Remote ONLY when it's exactly 'remote' or the legacy remote int (8) - never a
                 # loose substring match (which could trip on unexpected payloads). Everything
                 # else (player, master, bridge, numbers) is treated as master.
                 role = 'remote' if (txt == 'remote' or txt == '8') else 'master'
-                _fpp_mode_detail = f"settings/fppMode={txt!r} → {role}"
+                _fpp_mode_detail = f"settings/fppMode value={txt!r} → {role}"
                 return role
     except Exception as e:
         logging.debug(f"_fpp_mode_role: settings/fppMode unavailable ({e})")
@@ -554,6 +569,20 @@ def _default_plugin_role():
     """Suggested default role from FPP's mode; 'master' (the full-function role, correct for a
     lone box) when FPP can't be reached."""
     return _fpp_mode_role() or 'master'
+
+
+def _fpp_mode_role_for_seed(attempts=5, delay=2):
+    """Like _fpp_mode_role() but retried a few times, for the one-time first-install role
+    seed. The plugin is launched by postStart.sh right as FPPD comes up, so FPP's API can
+    still be warming up for the first few seconds - a single read could miss 'remote'.
+    Returns 'remote'/'master', or None if FPP never answered in the window."""
+    for i in range(attempts):
+        role = _fpp_mode_role()
+        if role is not None:
+            return role
+        if i < attempts - 1:
+            time.sleep(delay)
+    return None
 
 
 def fpp_mode_watcher():
@@ -1212,6 +1241,15 @@ def load_config():
 
         logging.info("Configuration loaded successfully")
     except FileNotFoundError:
+        # FIRST INSTALL ONLY (no plugin.json yet). If THIS FPP box is already in Remote
+        # mode, open the plugin as a remote too - seed an EXPLICIT plugin_role='remote'.
+        # Seeding it explicitly (rather than leaving '' = auto) means later plugin updates
+        # never re-evaluate or flip it; the stored role wins from here on. A non-remote box
+        # is left on '' (auto -> master), unchanged, and if FPP can't be reached in time we
+        # also leave '' so the auto-follow watcher resolves it later.
+        if _fpp_mode_role_for_seed() == 'remote':
+            config['plugin_role'] = 'remote'
+            logging.info(f"First install on a Remote FPP: seeded plugin_role='remote' [{_fpp_mode_detail}]")
         save_config()
         logging.info("Created default configuration")
     except Exception as e:
@@ -5157,7 +5195,7 @@ def index():
 
         <!-- SMS cost disclaimer - shown on every role (master and remote) -->
         <div style="background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:6px; padding:10px 14px; margin:14px 0 0 0; font-size:13px; line-height:1.5;">
-            <strong>DISCLAIMER:</strong> The author of this plugin is NOT responsible for SMS charges that may be incurred by using this plugin.
+            <strong>DISCLAIMER:</strong> The author of this plugin is NOT responsible for SMS charges that may be incurred by using this plugin, or any inappropriate content that may be displayed from incorrectly configured settings.
         </div>
 
         <!-- Tab navigation -->
@@ -5780,7 +5818,13 @@ def index():
                     var remote = sel && sel.value === 'remote';
                     window._roleManualUntil = Date.now() + 4000;  // let the save land before reconcileRole re-reads
                     applyRoleVisibility(remote);
-                    if (typeof saveConfig === 'function') saveConfig();
+                    // Persist the role EXPLICITLY and ONLY from this user action, so editing
+                    // other settings can never convert auto ('') into an explicit role.
+                    fetch('/api/config', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ plugin_role: (sel && sel.value) || '' })
+                    }).catch(function(){});
                 }
                 window.onRoleChange = onRoleChange;
                 // Apply role visibility on first paint (reconcileRole() below keeps it live).
@@ -8761,7 +8805,10 @@ var _saveTimer = null;
                 if (typeof window.flushEditorToSelected === 'function') window.flushEditorToSelected();
 
                 const data = {
-                    plugin_role: (document.getElementById('plugin_role')||{}).value || '',
+                    // NOTE: plugin_role is deliberately NOT sent here. The select shows the
+                    // RESOLVED role (e.g. 'master' on a lone box), so sending it on every
+                    // settings save would convert auto ('') into an explicit role and defeat
+                    // auto-follow. Only onRoleChange() - an explicit user action - writes it.
                     message_source: document.getElementById('message_source').value,
                     twilio_account_sid: document.getElementById('account_sid').value,
                     twilio_auth_token: document.getElementById('auth_token').value,

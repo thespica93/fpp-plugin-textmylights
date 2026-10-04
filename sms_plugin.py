@@ -5473,11 +5473,11 @@ def index():
                                 ⚠️ Name format rules are disabled when the whitelist is active.
                             </div>
                             <div id="format_rules_inputs">
-                                <label class="toggle-switch"><input type="checkbox" id="one_word_only" {{ 'checked' if config.get('one_word_only', False) and not config.get('use_whitelist', False) else '' }}
+                                <label class="toggle-switch"><input type="checkbox" id="one_word_only" {{ 'checked' if config.get('one_word_only', False) else '' }}
                                        onchange="if(this.checked) document.getElementById('two_words_max').checked = false; checkFormatWarning(); updateWordsPreview(); saveConfig();"><span class="toggle-slider"></span></label>
                                 <label class="checkbox-label">One Word Only (e.g., "John" ✓, "John Smith" ✗)</label><br>
 
-                                <label class="toggle-switch"><input type="checkbox" id="two_words_max" {{ 'checked' if config.get('two_words_max', True) and not config.get('use_whitelist', False) else '' }}
+                                <label class="toggle-switch"><input type="checkbox" id="two_words_max" {{ 'checked' if config.get('two_words_max', True) else '' }}
                                        onchange="if(this.checked) document.getElementById('one_word_only').checked = false; checkFormatWarning(); updateWordsPreview(); saveConfig();"><span class="toggle-slider"></span></label>
                                 <label class="checkbox-label">Two Words Maximum (e.g., "John Smith" ✓, sentences ✗)</label><br>
 
@@ -5525,38 +5525,18 @@ def index():
                 </div>
             </div>
             <script>
-                // Remember the last active format-rule choice so enabling the
-                // whitelist (which clears the rules) and then disabling it restores
-                // exactly what was set before - rather than forcing "Two Words Max".
-                var _savedFormatState = {
-                    one_word_only: {{ 'true' if config.get('one_word_only', False) else 'false' }},
-                    two_words_max: {{ 'true' if config.get('two_words_max', True) else 'false' }}
-                };
-                var _prevWhitelistOn = null;
                 function updateFormatRules() {
+                    // While the whitelist is on the backend ignores the word-format rules
+                    // (see is_valid_name callers), so GREY the toggles but NEVER change
+                    // their checked state. The old code unchecked them and relied on a
+                    // snapshot to restore; that let saveConfig persist the unchecked
+                    // state and permanently lose the choice. Grey-only preserves it.
                     var whitelistOn = document.getElementById('use_whitelist').checked;
-                    var one = document.getElementById('one_word_only');
-                    var two = document.getElementById('two_words_max');
                     var inputs = document.getElementById('format_rules_inputs');
                     var note = document.getElementById('format_rules_disabled_note');
                     inputs.style.opacity = whitelistOn ? '0.4' : '1';
                     inputs.style.pointerEvents = whitelistOn ? 'none' : '';
                     note.style.display = whitelistOn ? 'block' : 'none';
-                    if (whitelistOn) {
-                        // Snapshot the current choice only when coming from the
-                        // non-whitelist state (when already whitelisted the boxes are
-                        // cleared and no longer reflect a real choice).
-                        if (_prevWhitelistOn === false) {
-                            _savedFormatState.one_word_only = one.checked;
-                            _savedFormatState.two_words_max = two.checked;
-                        }
-                        one.checked = false;
-                        two.checked = false;
-                    } else {
-                        one.checked = _savedFormatState.one_word_only;
-                        two.checked = _savedFormatState.two_words_max;
-                    }
-                    _prevWhitelistOn = whitelistOn;
                     checkFormatWarning();
                 }
                 function checkFormatWarning() {

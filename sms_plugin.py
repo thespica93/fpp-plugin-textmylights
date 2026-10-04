@@ -5271,13 +5271,16 @@ def index():
                             <h3 style="margin:14px 0 6px;">🙋 Live Name Approval (optional) <span id="live_approval_wl_state" style="font-size:13px; font-weight:normal; margin-left:6px; padding:2px 8px; border-radius:10px;"></span></h3>
                             <p class="help-text" style="margin:4px 0 8px;">When the whitelist is on and the show is live, a texter who sends a name that is not on the list can be approved by you over text. Leave the number blank to turn this off. </p>
 
-                            <div id="admin_bootstrap_banner" style="{{ '' if (config.get('admin_phone','') and not admin_ctx_seeded) else 'display:none;' }} background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:6px; padding:10px 14px; margin-bottom:10px; font-size:13px;">
+                            <div id="admin_no_gv_warning" style="{{ '' if (config.get('admin_phone','') and not admin_gv_linked) else 'display:none;' }} background:#fdecea; border:1px solid #f44336; color:#b71c1c; border-radius:6px; padding:10px 14px; margin-bottom:10px; font-size:13px;">
+                                🔴 <strong>No Google Voice account linked.</strong> Enter and test your Gmail address and App Password above first. Until a Google Voice account is connected there is no number to text, so live approvals cannot be set up.
+                            </div>
+                            <div id="admin_bootstrap_banner" style="{{ '' if (config.get('admin_phone','') and not admin_ctx_seeded and admin_gv_linked) else 'display:none;' }} background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:6px; padding:10px 14px; margin-bottom:10px; font-size:13px;">
                                 ⚠️ <strong>Action needed:</strong> from the admin phone (<span id="admin_banner_num">{{ config.get('admin_phone','') }}</span>), text the word <strong>admin</strong> to your Google Voice number to connect. You will not receive approval requests until you do. The word "admin" is never shown on the display.
                             </div>
                             <div id="admin_connected_note" style="{{ '' if (config.get('admin_phone','') and admin_ctx_seeded) else 'display:none;' }} background:#e8f5e9; border:1px solid #66bb6a; color:#2e7d32; border-radius:6px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
                                 ✅ Admin phone connected - live approvals are active.
                             </div>
-                            <div id="admin_thread_warning" style="{{ '' if config.get('admin_phone','') else 'display:none;' }} background:#fdecea; border:1px solid #f44336; color:#b71c1c; border-radius:6px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
+                            <div id="admin_thread_warning" style="{{ '' if (config.get('admin_phone','') and admin_gv_linked) else 'display:none;' }} background:#fdecea; border:1px solid #f44336; color:#b71c1c; border-radius:6px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
                                 🔴 <strong>Keep the "admin" email:</strong> Google Voice does not have the ability to send outbound messages without an exisiting email thread. The "admin" email must remain in your Gmail inbox for approvals to work.
                             </div>
 
@@ -6620,11 +6623,13 @@ def index():
                             var banner = document.getElementById('admin_bootstrap_banner');
                             var connected = document.getElementById('admin_connected_note');
                             var threadWarn = document.getElementById('admin_thread_warning');
+                            var noGv = document.getElementById('admin_no_gv_warning');
                             if (!banner || !connected) return;
                             var isGV = ((document.getElementById('message_source')||{}).value) === 'google_voice';
                             if (!isGV) {
                                 banner.style.display = 'none'; connected.style.display = 'none';
                                 if (threadWarn) threadWarn.style.display = 'none';
+                                if (noGv) noGv.style.display = 'none';
                                 return;
                             }
                             fetch('/api/plugin/admin-approval-status')
@@ -6640,8 +6645,19 @@ def index():
                                     if (!savedPhone) {
                                         banner.style.display = 'none'; connected.style.display = 'none';
                                         if (threadWarn) threadWarn.style.display = 'none';
+                                        if (noGv) noGv.style.display = 'none';
                                         return;
                                     }
+                                    // No Google Voice account linked yet: show the link-account
+                                    // warning instead of the "text admin" banner - there is no
+                                    // number to text until credentials are connected.
+                                    if (d && !d.gv_linked) {
+                                        if (noGv) noGv.style.display = 'block';
+                                        banner.style.display = 'none'; connected.style.display = 'none';
+                                        if (threadWarn) threadWarn.style.display = 'none';
+                                        return;
+                                    }
+                                    if (noGv) noGv.style.display = 'none';
                                     // The "keep the thread" reminder stands once a number is saved.
                                     if (threadWarn) threadWarn.style.display = 'block';
                                     if (d && d.seeded) { banner.style.display = 'none'; connected.style.display = 'block'; }
@@ -9188,7 +9204,8 @@ var _saveTimer = null;
     _resp_defaults = {k: v for k, v in DEFAULT_CONFIG.items() if k.startswith('response_')}
     return render_template_string(html, config=config, secret_sentinel=SECRET_SENTINEL,
                                   effective_role=_eff_role, response_defaults=_resp_defaults,
-                                  admin_ctx_seeded=admin_ctx_is_seeded())
+                                  admin_ctx_seeded=admin_ctx_is_seeded(),
+                                  admin_gv_linked=bool(config.get('gv_email') and config.get('gv_app_password')))
 
 @app.route('/api/config', methods=['POST'])
 def update_config():
@@ -9333,6 +9350,10 @@ def api_admin_approval_status():
     return jsonify({
         "admin_phone": config.get('admin_phone', ''),
         "seeded": seeded,
+        # Whether a Google Voice account is linked (credentials entered). Without it
+        # there is no number to text "admin" to, so the UI shows a link-account
+        # warning instead of the "text admin to connect" bootstrap banner.
+        "gv_linked": bool(config.get('gv_email') and config.get('gv_app_password')),
     })
 
 # ============================================================================

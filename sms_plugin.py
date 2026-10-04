@@ -8317,6 +8317,9 @@ def index():
                     var ct = getConfiguredContent();
                     var loadEl = document.getElementById('fseq_load_status');
                     if (!ct) {
+                        // Drop any cached background so the canvas doesn't keep showing the last
+                        // sequence after content is removed (e.g. the master clears its content).
+                        _clearState();
                         if (loadEl) {
                             loadEl.style.color = '#ff9800';
                             var isRemote = ((document.getElementById('plugin_role')||{}).value) === 'remote';

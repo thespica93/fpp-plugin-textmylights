@@ -417,8 +417,9 @@ DEFAULT_CONFIG = {
     "sms_response_success": True,
     "sms_response_profanity": True,
     "sms_response_rate_limited": True,
-    # Duplicate names are blocked by default for both sources, so the Duplicate Name
-    # response stays live (row un-greyed) and actually sends on a repeat.
+    # Allow Duplicate Names toggle is OFF by default. The toggle itself is never
+    # greyed/locked - it stays fully usable; OFF just means the Duplicate Name
+    # response row stays live.
     "allow_duplicate_names": False,
     "sms_response_duplicate": True,
     "sms_response_invalid_format": True,

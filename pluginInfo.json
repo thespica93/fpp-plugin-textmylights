@@ -48,7 +48,7 @@
 				"what": "Sender phone numbers and texted names/messages",
 				"about": "visitors",
 				"keptDays": 7,
-				"canDelete": false,
+				"canDelete": true,
 				"where": "/home/fpp/media/plugin.fpp-textmylights/logs/messages/"
 			},
 			{

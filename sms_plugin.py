@@ -336,7 +336,7 @@ DEFAULT_CONFIG = {
     # Empty = auto (follow the first master found, accept pushes from any trusted peer).
     "selected_master": "",
     # Which inbound message source feeds the pipeline: "twilio" | "google_voice"
-    "message_source": "twilio",
+    "message_source": "google_voice",
     "twilio_account_sid": "",
     "twilio_auth_token": "",
     "twilio_phone_number": "",
@@ -352,7 +352,9 @@ DEFAULT_CONFIG = {
     "gv_smtp_port": 587,
     "poll_interval": 2,
     "display_duration": 10,
-    "max_messages_per_phone": 5,
+    # 0 = unlimited, matching the Google Voice default source (Twilio uses 5, applied
+    # by the source selector's change handler when you switch to Twilio).
+    "max_messages_per_phone": 0,
     "max_message_length": 30,
     "max_message_age_mins": 5,
     "one_word_only": False,
@@ -407,16 +409,23 @@ DEFAULT_CONFIG = {
     "scroll_speed": 5,
     "overlay_model_width": 0,
     "overlay_model_height": 0,
-    "sms_response_show_not_live": False,
-    "sms_response_success": False,
-    "sms_response_profanity": False,
-    "sms_response_rate_limited": False,
-    "allow_duplicate_names": False,
-    "sms_response_duplicate": False,
-    "sms_response_invalid_format": False,
-    "sms_response_too_long": False,
-    "sms_response_not_whitelisted": False,
-    "sms_response_blocked": False,
+    # All SMS responses default ON at install. When a row greys out (e.g. rate_limited
+    # while GV is unlimited, or duplicate while duplicates are allowed), the stored
+    # toggle stays ON - _response_is_muted() just suppresses the send - so the last
+    # state is preserved and the response resumes if the row un-greys.
+    "sms_response_show_not_live": True,
+    "sms_response_success": True,
+    "sms_response_profanity": True,
+    "sms_response_rate_limited": True,
+    # ON for the Google Voice default source, OFF for Twilio (the source selector's
+    # change handler flips this when you switch). While ON, the Duplicate Name
+    # response row greys out but its stored toggle stays ON (just muted).
+    "allow_duplicate_names": True,
+    "sms_response_duplicate": True,
+    "sms_response_invalid_format": True,
+    "sms_response_too_long": True,
+    "sms_response_not_whitelisted": True,
+    "sms_response_blocked": True,
     "response_show_not_live": "Ho, Ho, Ho, It looks like our show isn't running now. Try again later.",
     "response_success": "Merry Christmas! Your name will appear on our display soon! 🎄",
     "response_profanity": "Ho Ho Ho! That one didn't make the nice list. More texts with profanity may block your phone 🎅",
@@ -442,7 +451,7 @@ DEFAULT_CONFIG = {
     "admin_approval_prompt": "New name request: '{name}'. Reply Y to add to whitelist, or N to deny.",
     # Minutes a pending request waits for an admin Y/N before it expires (0 = never).
     # On expiry the texter gets the standard not-whitelisted reply so they aren't left waiting.
-    "admin_approval_timeout_mins": 10,
+    "admin_approval_timeout_mins": 5,
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -2767,7 +2776,7 @@ def prune_pending_approvals(items=None):
     forever. Returns the surviving list (persisted only if something changed)."""
     if items is None:
         items = load_pending_approvals()
-    timeout = int(config.get('admin_approval_timeout_mins', 10) or 0)
+    timeout = int(config.get('admin_approval_timeout_mins', 5) or 0)
     if timeout <= 0:
         return items
     cutoff = time.time() - timeout * 60
@@ -2908,7 +2917,7 @@ def _maybe_handle_admin_message(from_number, body):
         # Is this request already past its approval timeout? A late decision NEVER
         # replies to the texter: a late Y whitelists for next time (no show), a late N
         # does nothing.
-        timeout = int(config.get('admin_approval_timeout_mins', 10) or 0)
+        timeout = int(config.get('admin_approval_timeout_mins', 5) or 0)
         is_late = timeout > 0 and (float(record.get('created_ts', 0) or 0) < time.time() - timeout * 60)
         if decision == 'approve':
             add_name_to_whitelist(name)
@@ -5217,6 +5226,12 @@ def index():
                         <!-- Twilio credentials - shown when Message Source = Twilio -->
                         <div id="twilio_creds">
                             <h3 style="margin:14px 0 6px;">Twilio Settings</h3>
+                            <div style="background:#f8d7da; border:2px solid #f5c6cb; color:#721c24; border-radius:6px; padding:12px 16px; margin:4px 0 12px; font-size:13px;">
+                                &#9940; <strong>Twilio SMS auto-responses are not enabled.</strong>
+                                <span style="font-weight:normal; display:block; margin-top:6px;">
+                                    Sending reply texts from a Twilio number requires A2P 10DLC brand &amp; campaign registration (or toll-free verification), which is not set up for this plugin. Receiving texted names still works and they will appear on your display, but no SMS replies are sent. Use Google Voice if you need auto-responses.
+                                </span>
+                            </div>
                             <label>Twilio Account SID:</label>
                             <input type="text" id="account_sid" value="{{ config.twilio_account_sid }}" placeholder="Starts with AC...">
 
@@ -5256,13 +5271,16 @@ def index():
                             <h3 style="margin:14px 0 6px;">🙋 Live Name Approval (optional) <span id="live_approval_wl_state" style="font-size:13px; font-weight:normal; margin-left:6px; padding:2px 8px; border-radius:10px;"></span></h3>
                             <p class="help-text" style="margin:4px 0 8px;">When the whitelist is on and the show is live, a texter who sends a name that is not on the list can be approved by you over text. Leave the number blank to turn this off. </p>
 
-                            <div id="admin_bootstrap_banner" style="{{ '' if (config.get('admin_phone','') and not admin_ctx_seeded) else 'display:none;' }} background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:6px; padding:10px 14px; margin-bottom:10px; font-size:13px;">
+                            <div id="admin_no_gv_warning" style="{{ '' if (config.get('admin_phone','') and not admin_gv_linked) else 'display:none;' }} background:#fdecea; border:1px solid #f44336; color:#b71c1c; border-radius:6px; padding:10px 14px; margin-bottom:10px; font-size:13px;">
+                                🔴 <strong>No Google Voice account linked.</strong> Enter and test your Gmail address and App Password above first. Until a Google Voice account is connected there is no number to text, so live approvals cannot be set up.
+                            </div>
+                            <div id="admin_bootstrap_banner" style="{{ '' if (config.get('admin_phone','') and not admin_ctx_seeded and admin_gv_linked) else 'display:none;' }} background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:6px; padding:10px 14px; margin-bottom:10px; font-size:13px;">
                                 ⚠️ <strong>Action needed:</strong> from the admin phone (<span id="admin_banner_num">{{ config.get('admin_phone','') }}</span>), text the word <strong>admin</strong> to your Google Voice number to connect. You will not receive approval requests until you do. The word "admin" is never shown on the display.
                             </div>
                             <div id="admin_connected_note" style="{{ '' if (config.get('admin_phone','') and admin_ctx_seeded) else 'display:none;' }} background:#e8f5e9; border:1px solid #66bb6a; color:#2e7d32; border-radius:6px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
                                 ✅ Admin phone connected - live approvals are active.
                             </div>
-                            <div id="admin_thread_warning" style="{{ '' if config.get('admin_phone','') else 'display:none;' }} background:#fdecea; border:1px solid #f44336; color:#b71c1c; border-radius:6px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
+                            <div id="admin_thread_warning" style="{{ '' if (config.get('admin_phone','') and admin_gv_linked) else 'display:none;' }} background:#fdecea; border:1px solid #f44336; color:#b71c1c; border-radius:6px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
                                 🔴 <strong>Keep the "admin" email:</strong> Google Voice does not have the ability to send outbound messages without an exisiting email thread. The "admin" email must remain in your Gmail inbox for approvals to work.
                             </div>
 
@@ -5442,7 +5460,7 @@ def index():
 
                         <hr style="border:none; border-top:1px solid #444; margin:15px 0;">
 
-                        <label class="toggle-switch"><input type="checkbox" id="use_whitelist" {{ 'checked' if config.get('use_whitelist', False) else '' }} onchange="updateFormatRules(); checkFiltersState(); checkWhitelistResponseState(); updateLiveApprovalWlState(); saveConfig();"><span class="toggle-slider"></span></label>
+                        <label class="toggle-switch"><input type="checkbox" id="use_whitelist" {{ 'checked' if config.get('use_whitelist', False) else '' }} onchange="updateFormatRules(); checkFiltersState(); checkWhitelistResponseState(); updateLiveApprovalWlState(); updateAdminApprovalUI(); saveConfig();"><span class="toggle-slider"></span></label>
                         <label class="checkbox-label">Enable Name Whitelist - only allow approved names</label><br>
                         <button class="view-btn" onclick="location.href='/whitelist'" style="margin-top:6px;">📋 Manage Whitelist</button>
                     </div>
@@ -5455,11 +5473,11 @@ def index():
                                 ⚠️ Name format rules are disabled when the whitelist is active.
                             </div>
                             <div id="format_rules_inputs">
-                                <label class="toggle-switch"><input type="checkbox" id="one_word_only" {{ 'checked' if config.get('one_word_only', False) and not config.get('use_whitelist', False) else '' }}
+                                <label class="toggle-switch"><input type="checkbox" id="one_word_only" {{ 'checked' if config.get('one_word_only', False) else '' }}
                                        onchange="if(this.checked) document.getElementById('two_words_max').checked = false; checkFormatWarning(); updateWordsPreview(); saveConfig();"><span class="toggle-slider"></span></label>
                                 <label class="checkbox-label">One Word Only (e.g., "John" ✓, "John Smith" ✗)</label><br>
 
-                                <label class="toggle-switch"><input type="checkbox" id="two_words_max" {{ 'checked' if config.get('two_words_max', True) and not config.get('use_whitelist', False) else '' }}
+                                <label class="toggle-switch"><input type="checkbox" id="two_words_max" {{ 'checked' if config.get('two_words_max', True) else '' }}
                                        onchange="if(this.checked) document.getElementById('one_word_only').checked = false; checkFormatWarning(); updateWordsPreview(); saveConfig();"><span class="toggle-slider"></span></label>
                                 <label class="checkbox-label">Two Words Maximum (e.g., "John Smith" ✓, sentences ✗)</label><br>
 
@@ -5507,38 +5525,18 @@ def index():
                 </div>
             </div>
             <script>
-                // Remember the last active format-rule choice so enabling the
-                // whitelist (which clears the rules) and then disabling it restores
-                // exactly what was set before - rather than forcing "Two Words Max".
-                var _savedFormatState = {
-                    one_word_only: {{ 'true' if config.get('one_word_only', False) else 'false' }},
-                    two_words_max: {{ 'true' if config.get('two_words_max', True) else 'false' }}
-                };
-                var _prevWhitelistOn = null;
                 function updateFormatRules() {
+                    // While the whitelist is on the backend ignores the word-format rules
+                    // (see is_valid_name callers), so GREY the toggles but NEVER change
+                    // their checked state. The old code unchecked them and relied on a
+                    // snapshot to restore; that let saveConfig persist the unchecked
+                    // state and permanently lose the choice. Grey-only preserves it.
                     var whitelistOn = document.getElementById('use_whitelist').checked;
-                    var one = document.getElementById('one_word_only');
-                    var two = document.getElementById('two_words_max');
                     var inputs = document.getElementById('format_rules_inputs');
                     var note = document.getElementById('format_rules_disabled_note');
                     inputs.style.opacity = whitelistOn ? '0.4' : '1';
                     inputs.style.pointerEvents = whitelistOn ? 'none' : '';
                     note.style.display = whitelistOn ? 'block' : 'none';
-                    if (whitelistOn) {
-                        // Snapshot the current choice only when coming from the
-                        // non-whitelist state (when already whitelisted the boxes are
-                        // cleared and no longer reflect a real choice).
-                        if (_prevWhitelistOn === false) {
-                            _savedFormatState.one_word_only = one.checked;
-                            _savedFormatState.two_words_max = two.checked;
-                        }
-                        one.checked = false;
-                        two.checked = false;
-                    } else {
-                        one.checked = _savedFormatState.one_word_only;
-                        two.checked = _savedFormatState.two_words_max;
-                    }
-                    _prevWhitelistOn = whitelistOn;
                     checkFormatWarning();
                 }
                 function checkFormatWarning() {
@@ -5685,7 +5683,12 @@ def index():
                     showIf('waiting_config_col', !remote);
                     showIf('names_config_col', !remote);
                     showIf('btn_sync_pos_master', remote);   // remote-only: copy master's layout
-                    showIf('tabbtn-sms', !remote);
+                    // SMS Responses are Google-Voice-only, so for a non-remote the source
+                    // (not just the role) decides whether the tab shows. Without this check
+                    // this 5s-interval role sync would re-show the tab after updateSourceUI()
+                    // hid it for Twilio - the bug where SMS Responses kept coming back.
+                    var _srcGV = ((document.getElementById('message_source')||{}).value) === 'google_voice';
+                    showIf('tabbtn-sms', !remote && _srcGV);
                     showIf('tabbtn-testing', !remote);
                     showIf('btn_view_queue', !remote);
                     showIf('btn_plugin_toggle', !remote);
@@ -6514,10 +6517,12 @@ def index():
                      set (configured on the Message Source tab) and Google Voice is the source. -->
                 <div id="admin_approval_responses" class="resp-row enabled" style="{{ '' if (config.get('message_source','twilio')=='google_voice' and config.get('admin_phone','')) else 'display:none;' }} margin-left:22px; border-left:3px solid #90caf9;">
                     <div class="resp-toggle" style="font-weight:bold;">🙋 Live Name Approval (Google Voice)</div>
+                    <p id="admin_approval_wl_note" class="resp-locked-note" style="{{ '' if not config.get('use_whitelist', False) else 'display:none;' }}">⚠️ <strong>Name Whitelist is disabled</strong> - Live Name Approval only applies when the whitelist is on.</p>
+                    <div id="admin_approval_inner">
                     <p class="help-text" style="margin:2px 0 12px;">An extension of the <strong>Not on Whitelist</strong> response above: when a texter sends a name that is not on the whitelist and you have an <strong>Admin Phone Number</strong> set (Message Source tab), you get the Y/N prompt; the texter gets the waiting message, then the Success response (Y). A denial (N) sends the <strong>Not on Whitelist</strong> response above.</p>
 
                     <label>Approval Timeout (minutes):</label>
-                    <input type="number" id="admin_approval_timeout_mins" min="0" max="1440" value="{{ config.get('admin_approval_timeout_mins', 10) }}" style="width:90px;">
+                    <input type="number" id="admin_approval_timeout_mins" min="0" max="1440" value="{{ config.get('admin_approval_timeout_mins', 5) }}" style="width:90px;">
                     <p class="help-text" style="margin:3px 0 14px;">How long a request waits for your Y/N before it expires. 0 = never expire.</p>
 
                     <label>Text to Admin (approval prompt):</label>
@@ -6528,6 +6533,7 @@ def index():
                     <label style="margin-top:14px; display:block;">Reply to Texter (while waiting):</label>
                     <textarea id="response_whitelist_pending" rows="2">{{ config.get('response_whitelist_pending', "Your name isn't on our whitelist, please wait a few moments while I get approval to display.") }}</textarea>
                     <button type="button" class="reset-default-btn" style="opacity:1; pointer-events:auto;" onclick="resetAdminField('response_whitelist_pending')">↩️ Reset to default</button>
+                    </div>
                 </div>
 
                 <script>
@@ -6554,6 +6560,13 @@ def index():
                         var phone = (((document.getElementById('admin_phone')||{}).value) || '').trim();
                         var sec = document.getElementById('admin_approval_responses');
                         if (sec) sec.style.display = (isGV && phone) ? '' : 'none';
+                        // Live Name Approval only applies to names not on the whitelist, so grey
+                        // it out (but keep the fields' values) when the whitelist is off.
+                        var wlOn = !!((document.getElementById('use_whitelist')||{}).checked);
+                        var inner = document.getElementById('admin_approval_inner');
+                        var note = document.getElementById('admin_approval_wl_note');
+                        if (inner) { inner.style.opacity = wlOn ? '1' : '0.4'; inner.style.pointerEvents = wlOn ? '' : 'none'; }
+                        if (note) note.style.display = wlOn ? 'none' : 'block';
                     }
                     window.updateAdminApprovalUI = updateAdminApprovalUI;
                     // Reflect the live whitelist on/off state next to the Live Name Approval
@@ -6600,11 +6613,13 @@ def index():
                             var banner = document.getElementById('admin_bootstrap_banner');
                             var connected = document.getElementById('admin_connected_note');
                             var threadWarn = document.getElementById('admin_thread_warning');
+                            var noGv = document.getElementById('admin_no_gv_warning');
                             if (!banner || !connected) return;
                             var isGV = ((document.getElementById('message_source')||{}).value) === 'google_voice';
                             if (!isGV) {
                                 banner.style.display = 'none'; connected.style.display = 'none';
                                 if (threadWarn) threadWarn.style.display = 'none';
+                                if (noGv) noGv.style.display = 'none';
                                 return;
                             }
                             fetch('/api/plugin/admin-approval-status')
@@ -6620,8 +6635,19 @@ def index():
                                     if (!savedPhone) {
                                         banner.style.display = 'none'; connected.style.display = 'none';
                                         if (threadWarn) threadWarn.style.display = 'none';
+                                        if (noGv) noGv.style.display = 'none';
                                         return;
                                     }
+                                    // No Google Voice account linked yet: show the link-account
+                                    // warning instead of the "text admin" banner - there is no
+                                    // number to text until credentials are connected.
+                                    if (d && !d.gv_linked) {
+                                        if (noGv) noGv.style.display = 'block';
+                                        banner.style.display = 'none'; connected.style.display = 'none';
+                                        if (threadWarn) threadWarn.style.display = 'none';
+                                        return;
+                                    }
+                                    if (noGv) noGv.style.display = 'none';
                                     // The "keep the thread" reminder stands once a number is saved.
                                     if (threadWarn) threadWarn.style.display = 'block';
                                     if (d && d.seeded) { banner.style.display = 'none'; connected.style.display = 'block'; }
@@ -9168,7 +9194,8 @@ var _saveTimer = null;
     _resp_defaults = {k: v for k, v in DEFAULT_CONFIG.items() if k.startswith('response_')}
     return render_template_string(html, config=config, secret_sentinel=SECRET_SENTINEL,
                                   effective_role=_eff_role, response_defaults=_resp_defaults,
-                                  admin_ctx_seeded=admin_ctx_is_seeded())
+                                  admin_ctx_seeded=admin_ctx_is_seeded(),
+                                  admin_gv_linked=bool(config.get('gv_email') and config.get('gv_app_password')))
 
 @app.route('/api/config', methods=['POST'])
 def update_config():
@@ -9271,9 +9298,9 @@ def update_config():
             _last_admin_verify_scan = 0.0
         if 'admin_approval_timeout_mins' in new_config:
             try:
-                _to = int(new_config.get('admin_approval_timeout_mins', 10) or 0)
+                _to = int(new_config.get('admin_approval_timeout_mins', 5) or 0)
             except (TypeError, ValueError):
-                _to = 10
+                _to = 5
             config['admin_approval_timeout_mins'] = max(0, min(_to, 1440))
 
         save_config()
@@ -9313,6 +9340,10 @@ def api_admin_approval_status():
     return jsonify({
         "admin_phone": config.get('admin_phone', ''),
         "seeded": seeded,
+        # Whether a Google Voice account is linked (credentials entered). Without it
+        # there is no number to text "admin" to, so the UI shows a link-account
+        # warning instead of the "text admin to connect" bootstrap banner.
+        "gv_linked": bool(config.get('gv_email') and config.get('gv_app_password')),
     })
 
 # ============================================================================

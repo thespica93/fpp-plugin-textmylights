@@ -1,14 +1,14 @@
 <?php
 // Plugin Name: Text My Lights
 // Plugin Description: Viewers text a name that appears on your display (Twilio or Google Voice)
-// Plugin Version: 3.1
+// Plugin Version: 3.2
 // Plugin Author: Nick
 // Plugin URL: https://github.com/thespica93/fpp-plugin-textmylights
 
 // This file is required by FPP to recognize and install the plugin
 
 $pluginName = "fpp-plugin-textmylights";
-$pluginVersion = "3.1";
+$pluginVersion = "3.2";
 $pluginDescription = "Text My Lights - Viewers text a name that appears on your display (Twilio or Google Voice)";
 $pluginAuthor = "Nick";
 
@@ -84,6 +84,25 @@ function installDependencies() {
     return false;
 }
 
+// Run the comprehensive uninstall script. This removes the plugin DATA dir
+// (plugin.json, stored credentials, phone-number PII), the sudoers rule, the
+// privileged shm helper, and log files - none of which FPP removes on its own
+// when it deletes the plugin source directory. Without this, a later reinstall
+// keeps the OLD plugin.json and never picks up new install defaults.
+function runUninstallScript() {
+    global $pluginDirectory;
+
+    $uninstallScript = $pluginDirectory . "/scripts/fpp_uninstall.sh";
+
+    if (file_exists($uninstallScript)) {
+        exec("bash " . escapeshellarg($uninstallScript) . " 2>&1", $output, $return);
+        error_log("Text My Lights Uninstall: " . implode("\n", $output));
+        return $return === 0;
+    }
+
+    return false;
+}
+
 // Create default configuration files if they don't exist
 function createDefaultFiles() {
     global $settings, $pluginConfigFile;
@@ -139,6 +158,7 @@ if (isset($_GET['install'])) {
 // Called when plugin is uninstalled
 if (isset($_GET['uninstall'])) {
     stopPlugin();
+    runUninstallScript();
     echo "Plugin uninstalled successfully!\n";
 }
 

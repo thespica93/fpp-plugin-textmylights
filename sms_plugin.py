@@ -5226,6 +5226,12 @@ def index():
                         <!-- Twilio credentials - shown when Message Source = Twilio -->
                         <div id="twilio_creds">
                             <h3 style="margin:14px 0 6px;">Twilio Settings</h3>
+                            <div style="background:#f8d7da; border:2px solid #f5c6cb; color:#721c24; border-radius:6px; padding:12px 16px; margin:4px 0 12px; font-size:13px;">
+                                &#9940; <strong>Twilio SMS auto-responses are not enabled.</strong>
+                                <span style="font-weight:normal; display:block; margin-top:6px;">
+                                    Sending reply texts from a Twilio number requires A2P 10DLC brand &amp; campaign registration (or toll-free verification), which is not set up for this plugin. Receiving texted names still works and they will appear on your display, but no SMS replies are sent. Use Google Voice if you need auto-responses.
+                                </span>
+                            </div>
                             <label>Twilio Account SID:</label>
                             <input type="text" id="account_sid" value="{{ config.twilio_account_sid }}" placeholder="Starts with AC...">
 

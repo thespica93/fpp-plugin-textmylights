@@ -451,7 +451,7 @@ DEFAULT_CONFIG = {
     "admin_approval_prompt": "New name request: '{name}'. Reply Y to add to whitelist, or N to deny.",
     # Minutes a pending request waits for an admin Y/N before it expires (0 = never).
     # On expiry the texter gets the standard not-whitelisted reply so they aren't left waiting.
-    "admin_approval_timeout_mins": 10,
+    "admin_approval_timeout_mins": 5,
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -2776,7 +2776,7 @@ def prune_pending_approvals(items=None):
     forever. Returns the surviving list (persisted only if something changed)."""
     if items is None:
         items = load_pending_approvals()
-    timeout = int(config.get('admin_approval_timeout_mins', 10) or 0)
+    timeout = int(config.get('admin_approval_timeout_mins', 5) or 0)
     if timeout <= 0:
         return items
     cutoff = time.time() - timeout * 60
@@ -2917,7 +2917,7 @@ def _maybe_handle_admin_message(from_number, body):
         # Is this request already past its approval timeout? A late decision NEVER
         # replies to the texter: a late Y whitelists for next time (no show), a late N
         # does nothing.
-        timeout = int(config.get('admin_approval_timeout_mins', 10) or 0)
+        timeout = int(config.get('admin_approval_timeout_mins', 5) or 0)
         is_late = timeout > 0 and (float(record.get('created_ts', 0) or 0) < time.time() - timeout * 60)
         if decision == 'approve':
             add_name_to_whitelist(name)
@@ -6531,7 +6531,7 @@ def index():
                     <p class="help-text" style="margin:2px 0 12px;">An extension of the <strong>Not on Whitelist</strong> response above: when a texter sends a name that is not on the whitelist and you have an <strong>Admin Phone Number</strong> set (Message Source tab), you get the Y/N prompt; the texter gets the waiting message, then the Success response (Y). A denial (N) sends the <strong>Not on Whitelist</strong> response above.</p>
 
                     <label>Approval Timeout (minutes):</label>
-                    <input type="number" id="admin_approval_timeout_mins" min="0" max="1440" value="{{ config.get('admin_approval_timeout_mins', 10) }}" style="width:90px;">
+                    <input type="number" id="admin_approval_timeout_mins" min="0" max="1440" value="{{ config.get('admin_approval_timeout_mins', 5) }}" style="width:90px;">
                     <p class="help-text" style="margin:3px 0 14px;">How long a request waits for your Y/N before it expires. 0 = never expire.</p>
 
                     <label>Text to Admin (approval prompt):</label>
@@ -9285,9 +9285,9 @@ def update_config():
             _last_admin_verify_scan = 0.0
         if 'admin_approval_timeout_mins' in new_config:
             try:
-                _to = int(new_config.get('admin_approval_timeout_mins', 10) or 0)
+                _to = int(new_config.get('admin_approval_timeout_mins', 5) or 0)
             except (TypeError, ValueError):
-                _to = 10
+                _to = 5
             config['admin_approval_timeout_mins'] = max(0, min(_to, 1440))
 
         save_config()

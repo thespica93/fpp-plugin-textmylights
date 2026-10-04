@@ -521,13 +521,28 @@ def _fpp_mode_role():
     try:
         r = requests.get(f"{FPP_HOST}/api/settings/fppMode", timeout=3)
         if r.status_code == 200:
-            txt = (r.text or '').strip().strip('"').lower()   # "remote" / "player" / "master" / legacy int
+            # FPP versions differ: newer returns a JSON OBJECT describing the setting
+            # ({"value":"remote","options":{...},...}), older returns a bare JSON string
+            # ("remote") or legacy int (8). Pull the actual mode out of whichever shape,
+            # never match against the whole payload (the object contains the substring
+            # "remote" in its options and would false-positive, or here false-NEGATIVE
+            # against an exact compare and wrongly resolve to master).
+            val = (r.text or '').strip()
+            try:
+                parsed = r.json()
+                if isinstance(parsed, dict):
+                    val = str(parsed.get('value', ''))
+                elif isinstance(parsed, (str, int)):
+                    val = str(parsed)
+            except Exception:
+                pass
+            txt = val.strip().strip('"').lower()   # "remote" / "player" / "master" / legacy int
             if txt:
                 # Remote ONLY when it's exactly 'remote' or the legacy remote int (8) - never a
                 # loose substring match (which could trip on unexpected payloads). Everything
                 # else (player, master, bridge, numbers) is treated as master.
                 role = 'remote' if (txt == 'remote' or txt == '8') else 'master'
-                _fpp_mode_detail = f"settings/fppMode={txt!r} → {role}"
+                _fpp_mode_detail = f"settings/fppMode value={txt!r} → {role}"
                 return role
     except Exception as e:
         logging.debug(f"_fpp_mode_role: settings/fppMode unavailable ({e})")

@@ -417,10 +417,10 @@ DEFAULT_CONFIG = {
     "sms_response_success": True,
     "sms_response_profanity": True,
     "sms_response_rate_limited": True,
-    # Allow Duplicate Names toggle is OFF by default. The toggle itself is never
-    # greyed/locked - it stays fully usable; OFF just means the Duplicate Name
-    # response row stays live.
-    "allow_duplicate_names": False,
+    # ON for the Google Voice default source, OFF for Twilio (the source selector's
+    # change handler flips this when you switch). While ON, the Duplicate Name
+    # response row greys out but its stored toggle stays ON (just muted).
+    "allow_duplicate_names": True,
     "sms_response_duplicate": True,
     "sms_response_invalid_format": True,
     "sms_response_too_long": True,
@@ -8880,12 +8880,12 @@ var _saveTimer = null;
                 var srcEl = document.getElementById('message_source');
                 if (srcEl) srcEl.addEventListener('change', function() {
                     var isGV = this.value === 'google_voice';
-                    // Google Voice: unlimited (0). Twilio: rate limit 5.
-                    // Duplicate names stay BLOCKED for both sources (Duplicate Name
-                    // response stays live), so the source switch no longer touches it -
-                    // whatever the user set is preserved.
+                    // Google Voice: unlimited (0) + allow duplicate names.
+                    // Twilio: rate limit 5 + disallow duplicates.
                     var mm = document.getElementById('max_messages');
                     if (mm) mm.value = isGV ? 0 : 5;
+                    var dup = document.getElementById('allow_duplicate_names');
+                    if (dup) dup.checked = isGV;
                     updateSourceUI();
                     checkDuplicateState();          // grey the duplicate response accordingly
                     checkRateLimitResponseState();  // grey the rate-limited response accordingly

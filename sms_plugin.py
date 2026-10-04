@@ -5460,7 +5460,7 @@ def index():
 
                         <hr style="border:none; border-top:1px solid #444; margin:15px 0;">
 
-                        <label class="toggle-switch"><input type="checkbox" id="use_whitelist" {{ 'checked' if config.get('use_whitelist', False) else '' }} onchange="updateFormatRules(); checkFiltersState(); checkWhitelistResponseState(); updateLiveApprovalWlState(); saveConfig();"><span class="toggle-slider"></span></label>
+                        <label class="toggle-switch"><input type="checkbox" id="use_whitelist" {{ 'checked' if config.get('use_whitelist', False) else '' }} onchange="updateFormatRules(); checkFiltersState(); checkWhitelistResponseState(); updateLiveApprovalWlState(); updateAdminApprovalUI(); saveConfig();"><span class="toggle-slider"></span></label>
                         <label class="checkbox-label">Enable Name Whitelist - only allow approved names</label><br>
                         <button class="view-btn" onclick="location.href='/whitelist'" style="margin-top:6px;">📋 Manage Whitelist</button>
                     </div>
@@ -6517,6 +6517,8 @@ def index():
                      set (configured on the Message Source tab) and Google Voice is the source. -->
                 <div id="admin_approval_responses" class="resp-row enabled" style="{{ '' if (config.get('message_source','twilio')=='google_voice' and config.get('admin_phone','')) else 'display:none;' }} margin-left:22px; border-left:3px solid #90caf9;">
                     <div class="resp-toggle" style="font-weight:bold;">🙋 Live Name Approval (Google Voice)</div>
+                    <p id="admin_approval_wl_note" class="resp-locked-note" style="{{ '' if not config.get('use_whitelist', False) else 'display:none;' }}">⚠️ <strong>Name Whitelist is disabled</strong> - Live Name Approval only applies when the whitelist is on.</p>
+                    <div id="admin_approval_inner">
                     <p class="help-text" style="margin:2px 0 12px;">An extension of the <strong>Not on Whitelist</strong> response above: when a texter sends a name that is not on the whitelist and you have an <strong>Admin Phone Number</strong> set (Message Source tab), you get the Y/N prompt; the texter gets the waiting message, then the Success response (Y). A denial (N) sends the <strong>Not on Whitelist</strong> response above.</p>
 
                     <label>Approval Timeout (minutes):</label>
@@ -6531,6 +6533,7 @@ def index():
                     <label style="margin-top:14px; display:block;">Reply to Texter (while waiting):</label>
                     <textarea id="response_whitelist_pending" rows="2">{{ config.get('response_whitelist_pending', "Your name isn't on our whitelist, please wait a few moments while I get approval to display.") }}</textarea>
                     <button type="button" class="reset-default-btn" style="opacity:1; pointer-events:auto;" onclick="resetAdminField('response_whitelist_pending')">↩️ Reset to default</button>
+                    </div>
                 </div>
 
                 <script>
@@ -6557,6 +6560,13 @@ def index():
                         var phone = (((document.getElementById('admin_phone')||{}).value) || '').trim();
                         var sec = document.getElementById('admin_approval_responses');
                         if (sec) sec.style.display = (isGV && phone) ? '' : 'none';
+                        // Live Name Approval only applies to names not on the whitelist, so grey
+                        // it out (but keep the fields' values) when the whitelist is off.
+                        var wlOn = !!((document.getElementById('use_whitelist')||{}).checked);
+                        var inner = document.getElementById('admin_approval_inner');
+                        var note = document.getElementById('admin_approval_wl_note');
+                        if (inner) { inner.style.opacity = wlOn ? '1' : '0.4'; inner.style.pointerEvents = wlOn ? '' : 'none'; }
+                        if (note) note.style.display = wlOn ? 'none' : 'block';
                     }
                     window.updateAdminApprovalUI = updateAdminApprovalUI;
                     // Reflect the live whitelist on/off state next to the Live Name Approval

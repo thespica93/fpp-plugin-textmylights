@@ -9613,7 +9613,12 @@ def export_config():
 
         # Write to a temp file (FSEQ can be large; avoid holding the whole zip in
         # RAM on a Pi). ZIP_STORED since FSEQ is already compressed.
-        fd, tmp = tempfile.mkstemp(suffix='.zip', prefix='tml_export_')
+        # Write the temp zip onto the media partition (SD card), NOT the default
+        # TMPDIR: on a Pi /tmp is commonly a small tmpfs (RAM), and copying a large
+        # FSEQ sequence into a /tmp zip can exhaust it and fail the export with a
+        # 500. PLUGIN_DATA_DIR lives on the same roomy filesystem as the sequences.
+        _tmp_dir = PLUGIN_DATA_DIR if os.path.isdir(PLUGIN_DATA_DIR) else None
+        fd, tmp = tempfile.mkstemp(suffix='.zip', prefix='tml_export_', dir=_tmp_dir)
         os.close(fd)
         seen = set()
         included = []
@@ -9625,8 +9630,13 @@ def export_config():
                 if arcname in seen:
                     continue
                 seen.add(arcname)
-                zf.write(path, arcname)
-                included.append(arcname)
+                # One unreadable/oversized file should not 500 the whole export -
+                # skip it with a warning in the manifest instead.
+                try:
+                    zf.write(path, arcname)
+                    included.append(arcname)
+                except Exception as fe:
+                    warnings.append(f"Could not add {arcname}: {fe}")
 
             # Single-model overlay payload (not a file on disk).
             if overlay_payload:
@@ -9671,7 +9681,8 @@ def export_config():
                 os.remove(tmp)
             except OSError:
                 pass
-        logging.error(f"export_config failed: {e}")
+        import traceback
+        logging.error(f"export_config failed: {e}\n{traceback.format_exc()}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 def _overlay_items(data):
@@ -10197,6 +10208,13 @@ def fseq_frame():
     if not seq:
         return jsonify({'error': 'No sequence specified'}), 400
     if width <= 0 or height <= 0:
+        # The page sends width/height from hidden inputs that are 0 when the model
+        # dims were resolved server-side but never written back to the form. Resolve
+        # the model's real pixel size (fetched live from FPP and cached) before 400ing.
+        rw, rh = _overlay_model_dims()
+        width  = width  if width  > 0 else rw
+        height = height if height > 0 else rh
+    if width <= 0 or height <= 0:
         return jsonify({'error': 'Overlay model dimensions unknown - select a model first'}), 400
 
     name = seq.removeprefix('seq:').removesuffix('.fseq')
@@ -10276,6 +10294,12 @@ def media_preview():
 
     if not filename or media_type not in ('img', 'vid'):
         return jsonify({'error': 'Requires ?type=img|vid&file=filename'}), 400
+    if width <= 0 or height <= 0:
+        # Fall back to the model's real size when the page's hidden inputs are 0
+        # (same reason as /api/fseq/frame).
+        rw, rh = _overlay_model_dims()
+        width  = width  if width  > 0 else rw
+        height = height if height > 0 else rh
     if width <= 0 or height <= 0:
         return jsonify({'error': 'Overlay model dimensions unknown - select a model first'}), 400
 

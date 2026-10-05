@@ -5299,7 +5299,7 @@ def index():
                 <!-- LEFT COLUMN: Twilio + FPP Display + Message Settings -->
                 <div class="column">
                     <div class="section">
-                        <h2>🖥️ Projector Role (Master / Remote)</h2>
+                        <h2>🖥️ Plugin Role (Master / Remote)</h2>
                         <p class="help-text">The <strong>Master</strong> is where the configuration lives and text messages are received. Each <strong>Remote</strong> only displays the names the Master pushes to it.</p>
                         <p class="help-text" style="margin-top:4px;"><em>Master/Remote here is this <strong>plugin's</strong> role - separate from FPP's own Player/Remote mode. The plugin master does not need to be the FPP master.</em></p>
                         <label>This instance is:</label>

@@ -2230,27 +2230,68 @@ def read_fseq_frame(header, frame_idx, start_ch, ch_count):
 
 
 def get_model_channel_info(model_name):
-    """Return (start_channel_1indexed, channel_count) for a named model from FPP's /api/models.
-    channel_count is 3*w*h for RGB, 4*w*h for RGBW, etc. Returns (None, None) on failure."""
-    try:
-        resp = requests.get(f"{FPP_HOST}/api/models", timeout=3)
-        if resp.status_code != 200:
+    """Return (start_channel_1indexed, channel_count) for a named overlay model.
+
+    The plugin targets a Pixel Overlay model, which FPP serves from the overlay
+    API - NOT /api/models (that lists channel-output models and usually omits
+    overlay models entirely, which is why this used to return None and the FSEQ
+    preview 400'd). Query the overlay-model detail endpoint first (authoritative:
+    toJson returns the full saved config incl. StartChannel/ChannelCount), then
+    fall back to the overlay list and finally /api/models.
+
+    Note: overlay models that render on top of a matrix (Type != "Channel")
+    report StartChannel 0 in FPP's config. We only return a start channel when
+    it's non-zero; channel_count is still returned so callers can size the frame,
+    and a 0/None start is left for the caller to handle (best-effort preview)."""
+    if not model_name:
+        return None, None
+
+    def _pick(m):
+        if not isinstance(m, dict):
             return None, None
-        data = resp.json()
-        models = data if isinstance(data, list) else data.get('models', [])
-        for m in models:
-            name = m.get('Name') or m.get('name') or ''
-            if name.lower() == model_name.lower():
-                sc = (m.get('StartChannel') or m.get('startChannel')
-                      or m.get('start_channel'))
-                cc = (m.get('ChannelCount') or m.get('channelCount')
-                      or m.get('channel_count'))
-                return (int(sc) if sc is not None else None,
-                        int(cc) if cc is not None else None)
-        return None, None
+        sc = m.get('StartChannel') or m.get('startChannel') or m.get('start_channel')
+        cc = m.get('ChannelCount') or m.get('channelCount') or m.get('channel_count')
+        return (int(sc) if sc is not None else None,
+                int(cc) if cc is not None else None)
+
+    import urllib.parse as _ulp
+    enc = _ulp.quote(model_name, safe='')
+    best_cc = None
+
+    # 1) Overlay model detail - most authoritative.
+    try:
+        resp = requests.get(f"{FPP_HOST}/api/overlays/model/{enc}", timeout=3)
+        if resp.status_code == 200:
+            sc, cc = _pick(resp.json())
+            if cc and best_cc is None:
+                best_cc = cc
+            if sc:
+                return sc, cc
     except Exception as e:
-        logging.warning(f"Could not get channel info for '{model_name}': {e}")
-        return None, None
+        logging.warning(f"Overlay model detail lookup failed for '{model_name}': {e}")
+
+    # 2) Scan the overlay list, then the channel-output model list.
+    for endpoint in ('/api/overlays/models', '/api/models'):
+        try:
+            resp = requests.get(f"{FPP_HOST}{endpoint}", timeout=3)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            models = data if isinstance(data, list) else data.get('models', [])
+            for m in models:
+                if not isinstance(m, dict):
+                    continue
+                name = m.get('Name') or m.get('name') or ''
+                if name.lower() == model_name.lower():
+                    sc, cc = _pick(m)
+                    if cc and best_cc is None:
+                        best_cc = cc
+                    if sc:
+                        return sc, cc
+        except Exception as e:
+            logging.warning(f"Channel info scan failed for '{model_name}' at {endpoint}: {e}")
+
+    return None, best_cc
 
 # Keep old name as alias so nothing else breaks
 def get_model_start_channel(model_name):
@@ -8726,8 +8767,13 @@ def index():
             // canvas silently falls back to generic sans-serif for every font, since
             // the browser never has any of these files installed as system fonts.
             window._loadedFonts = window._loadedFonts || {};
+            // Generic CSS families are already available in the browser - never try
+            // to @font-face them from /api/fonts/file (there's no such file, so it
+            // 404s and logs a scary-looking console warning for nothing).
+            var _GENERIC_FONTS = {'sans-serif':1,'serif':1,'monospace':1,'cursive':1,'fantasy':1,'system-ui':1};
             function ensureFontLoaded(name) {
-                if (!name || window._loadedFonts[name]) return window._loadedFonts[name] || Promise.resolve();
+                if (!name || _GENERIC_FONTS[name]) return Promise.resolve();
+                if (window._loadedFonts[name]) return window._loadedFonts[name];
                 var ff = new FontFace(name, 'url("/api/fonts/file/' + encodeURIComponent(name) + '")');
                 var p = ff.load().then(function(loaded) {
                     document.fonts.add(loaded);
@@ -10233,12 +10279,16 @@ def fseq_frame():
         ch_count = ch_count_fpp if ch_count_fpp else width * height * 3
 
     if not start_ch_1:
-        return jsonify({
-            'error': (
-                f'Could not find start channel for model "{model_name}". '
-                'Verify the overlay model name matches an FPP channel output model.'
-            )
-        }), 400
+        # Overlay models that render on top of a matrix report StartChannel 0, and
+        # some models can't be resolved at all. Rather than failing the preview with
+        # a 400, assume a model-specific / zero-based export and read from the first
+        # channel (frame byte 0). A full-layout export may be offset, but a
+        # best-effort preview beats a hard error.
+        start_ch_1 = 1
+        logging.info(
+            f"FSEQ preview: start channel for model '{model_name}' unknown/zero; "
+            "defaulting to channel 1 (frame byte 0)"
+        )
 
     try:
         hdr          = parse_fseq_header(filepath)

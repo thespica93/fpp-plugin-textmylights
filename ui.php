@@ -100,6 +100,19 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
     var TML_SVC   = <?php echo json_encode("http://$host:5000/"); ?>;
     var TML_TOKEN = <?php echo json_encode($token); ?>;
 
+    // Create the hidden download iframe ONCE, up front. Creating it and setting its
+    // src in the same click handler made the browser skip that first navigation (the
+    // export only started on a second click); a ready, already-attached iframe
+    // navigates reliably the first time.
+    (function() {
+        if (!document.getElementById('tml-export-dl')) {
+            var ifr = document.createElement('iframe');
+            ifr.id = 'tml-export-dl';
+            ifr.style.display = 'none';
+            document.body.appendChild(ifr);
+        }
+    })();
+
     /* ---------------- Export ---------------- */
     var _tmlExporting = false, _tmlExportTimer = null;
     function tmlResetExportBtn() {
@@ -133,11 +146,14 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
         // from the real Export click, keeps the user activation browsers require and
         // sidesteps the cross-origin-iframe download block. Auth via ?token; the
         // server's Content-Disposition names the file.
+        // Cache-buster (&_ts) guarantees the iframe sees a new URL and navigates
+        // every time, even for two identical back-to-back exports.
         var url = TML_SVC + 'api/config/export?settings=' + sel.s + '&lists=' + sel.l
                 + '&content=' + sel.c + '&overlay=' + sel.o
-                + (TML_TOKEN ? '&token=' + encodeURIComponent(TML_TOKEN) : '');
+                + (TML_TOKEN ? '&token=' + encodeURIComponent(TML_TOKEN) : '')
+                + '&_ts=' + Date.now();
         var dl = document.getElementById('tml-export-dl');
-        if (!dl) {
+        if (!dl) {   // defensive: init IIFE should have made it already
             dl = document.createElement('iframe');
             dl.id = 'tml-export-dl';
             dl.style.display = 'none';

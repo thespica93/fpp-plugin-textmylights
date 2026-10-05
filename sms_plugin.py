@@ -4672,16 +4672,43 @@ def process_incoming_message(from_number, body):
             log_message(from_number, body, name, resp)
             send_sms_response(from_number, resp)
 
-        elif not is_on_whitelist(name):
-            # If admin approval is active (GV + admin_phone + seeded), ask the admin
-            # to approve instead of rejecting outright; the texter gets the pending
-            # reply and later Success (Y) or admin-denied (N). Otherwise unchanged.
-            if not _maybe_request_admin_approval(name, from_number, body):
+        elif config.get('use_whitelist', False):
+            # ── Whitelist ON ──
+            if is_on_whitelist(name):
+                # Approved name → show it. The whitelist is the operator's trusted
+                # list, so an on-list name is not re-screened for profanity.
+                if add_to_queue(name, from_number, body):
+                    logging.info(f"✅ Queued: {name}")
+                    log_message(from_number, body, name, "queued")
+                    send_sms_response(from_number, "success")
+                else:
+                    logging.warning(f"❌ Queue error: {name}")
+                    log_message(from_number, body, name, "error")
+
+            elif config['profanity_filter'] and contains_profanity(body):
+                # Not on the list AND profane → Profanity reply + strike. This runs
+                # BEFORE admin approval so a blacklisted word is never forwarded to
+                # the admin, and it still counts toward the daily profanity threshold.
+                logging.info(f"❌ Profanity rejected (not on whitelist): {from_number[-4:]}")
+                log_message(from_number, body, name, "profanity")
+                send_sms_response(from_number, "profanity")
+                if register_profanity_strike(from_number, body):
+                    logging.info(f"🚫 Profanity threshold reached - auto-blocked {from_number[-4:]}")
+
+            elif _maybe_request_admin_approval(name, from_number, body):
+                # Clean + not on list → offered to the admin (GV + admin_phone +
+                # seeded); the texter is told to wait and later gets Success (Y) or
+                # admin-denied (N). Nothing more to send here.
+                pass
+
+            else:
+                # Admin approval not active → standard not-whitelisted reject.
                 logging.info(f"❌ Not on whitelist: {name}")
                 log_message(from_number, body, name, "not_on_whitelist")
                 send_sms_response(from_number, "not_whitelisted")
 
         elif config['profanity_filter'] and contains_profanity(body):
+            # ── Whitelist OFF → standard profanity gate ──
             logging.info(f"❌ Profanity rejected")
             log_message(from_number, body, name, "profanity")
             send_sms_response(from_number, "profanity")
@@ -5490,10 +5517,10 @@ def index():
                             <p class="help-text" style="margin-top:4px;">ℹ️ When a sender texts this many blacklisted words in one day, their number is added to the Phone Blocklist (only you can release it). The daily tally resets at midnight. Set to <strong>0</strong> to turn off auto-blocking.</p>
                         </div>
                         <div id="profanity_disabled_warning" style="display:none; background:#f8d7da; border:1px solid #f5c6cb; color:#721c24; border-radius:5px; padding:8px 12px; margin-top:8px; font-size:13px;">
-                            ⚠️ <strong>Profanity filter is disabled</strong> - this is not recommended. Re-enable it to filter names against the Blacklist, or enable the Whitelist instead.
+                            ⚠️ <strong>Profanity filter is disabled</strong> - this is not recommended. Re-enable it to filter names against the Blacklist.
                         </div>
-                        <div id="blacklist_disabled_warning" style="display:none; background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:5px; padding:8px 12px; margin-top:8px; font-size:13px;">
-                            ⚠️ <strong>Blacklist inactive</strong> - whitelist is enabled. All names are validated against the whitelist.
+                        <div id="whitelist_profanity_note" style="display:none; background:#d4edda; border:1px solid #c3e6cb; color:#155724; border-radius:5px; padding:8px 12px; margin-top:8px; font-size:13px;">
+                            ℹ️ With the whitelist on, the profanity filter screens names that are <strong>not</strong> on the list: a blacklisted word gets the Profanity response (and is never sent to the admin for approval) and still counts toward the sender's daily profanity threshold.
                         </div>
 
                         <hr style="border:none; border-top:1px solid #444; margin:15px 0;">
@@ -5607,14 +5634,18 @@ def index():
                 function checkFiltersState() {
                     var whitelistOn = document.getElementById('use_whitelist').checked;
                     var profanityOn = document.getElementById('profanity_filter').checked;
-                    var section = document.getElementById('blacklist_section');
-                    section.style.opacity = whitelistOn ? '0.4' : '1';
-                    section.style.pointerEvents = whitelistOn ? 'none' : '';
+                    // Max Message Length still doesn't apply when the whitelist is on
+                    // (names are matched against the list, not length).
                     var maxLenSection = document.getElementById('max_length_section');
                     maxLenSection.style.opacity = whitelistOn ? '0.4' : '1';
                     maxLenSection.style.pointerEvents = whitelistOn ? 'none' : '';
                     document.getElementById('max_length_disabled_warning').style.display = whitelistOn ? 'block' : 'none';
-                    document.getElementById('blacklist_disabled_warning').style.display = whitelistOn ? 'block' : 'none';
+                    // The profanity filter now works ALONGSIDE the whitelist: it screens
+                    // non-whitelisted names before admin approval, so it is never greyed
+                    // out. Show the explainer whenever both are on.
+                    var note = document.getElementById('whitelist_profanity_note');
+                    if (note) note.style.display = (whitelistOn && profanityOn) ? 'block' : 'none';
+                    // "No filtering at all" warning: only when BOTH filters are off.
                     document.getElementById('profanity_disabled_warning').style.display = (!whitelistOn && !profanityOn) ? 'block' : 'none';
                 }
                 // Invalid-Format response is meaningless when the whitelist is on

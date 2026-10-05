@@ -58,13 +58,13 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
 <div id="tml-export-modal" class="tml-modal" onclick="if(event.target===this)tmlHideExport()">
     <div class="tml-card">
         <h3>Export Config</h3>
-        <p class="tml-sub">Choose what to include. Only the content <strong>this plugin is set to use</strong> is exported &mdash; never all of FPP's files. <strong>Credentials are never included.</strong></p>
+        <p class="tml-sub">Choose what to include. Only the content <strong>this plugin is set to use</strong> is ever exported - never all of FPP's files. <strong>Credentials are never included.</strong></p>
         <label class="tml-opt"><input type="checkbox" id="tml-exp-settings" checked>
             <span><strong>Plugin settings</strong><br><span class="tml-desc">Display lines, message rules, response text, filters, poll interval, selected content &amp; overlay model.</span></span></label>
         <label class="tml-opt"><input type="checkbox" id="tml-exp-lists" checked>
             <span><strong>Blocked numbers &amp; word lists</strong><br><span class="tml-desc">Blocked phone numbers and your whitelist / blacklist words.</span></span></label>
-        <label class="tml-opt"><input type="checkbox" id="tml-exp-content" checked>
-            <span><strong>Content files</strong><br><span class="tml-desc">The Waiting &amp; Name Display sequences, images, and videos this plugin uses &mdash; copied file-for-file. Can be large.</span></span></label>
+        <label class="tml-opt"><input type="checkbox" id="tml-exp-content">
+            <span><strong>Content files</strong> (off by default)<br><span class="tml-desc">Copies the actual sequence / image / video files into the bundle - can be large. Leave OFF: xLights FPP Connect already distributes sequences to your Pis, so the export just records which content to use by name. Turn ON only for a fully self-contained copy.</span></span></label>
         <label class="tml-opt"><input type="checkbox" id="tml-exp-overlay" checked>
             <span><strong>Overlay model (matrix)</strong><br><span class="tml-desc">The FPP Pixel Overlay Model the names are drawn onto.</span></span></label>
         <div class="tml-actions">
@@ -93,6 +93,26 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
     });
     function tmlFrame() { return document.getElementById('sms-plugin-frame').contentWindow; }
 
+    // The plugin service base + its access token (same token the iframe loads with).
+    // Lets THIS parent page talk to :5000 directly - needed so the export download
+    // is triggered by the real Export click here (user activation) instead of a
+    // postMessage inside the cross-origin iframe, which browsers block.
+    var TML_SVC   = <?php echo json_encode("http://$host:5000/"); ?>;
+    var TML_TOKEN = <?php echo json_encode($token); ?>;
+
+    // Create the hidden download iframe ONCE, up front. Creating it and setting its
+    // src in the same click handler made the browser skip that first navigation (the
+    // export only started on a second click); a ready, already-attached iframe
+    // navigates reliably the first time.
+    (function() {
+        if (!document.getElementById('tml-export-dl')) {
+            var ifr = document.createElement('iframe');
+            ifr.id = 'tml-export-dl';
+            ifr.style.display = 'none';
+            document.body.appendChild(ifr);
+        }
+    })();
+
     /* ---------------- Export ---------------- */
     var _tmlExporting = false, _tmlExportTimer = null;
     function tmlResetExportBtn() {
@@ -119,10 +139,35 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
         var go = document.getElementById('tml-exp-go');
         go.disabled = true; go.textContent = 'Exporting...';
         document.getElementById('tml-exp-cancel').disabled = true;
-        tmlFrame().postMessage({ type: 'tml_export', sel: sel }, '*');
+
+        // Download straight from this parent page via a hidden iframe. The browser
+        // streams the (possibly very large) sequence zip to disk - it never buffers
+        // the whole file in JS memory, so the tab can't freeze. Triggering it here,
+        // from the real Export click, keeps the user activation browsers require and
+        // sidesteps the cross-origin-iframe download block. Auth via ?token; the
+        // server's Content-Disposition names the file.
+        // Cache-buster (&_ts) guarantees the iframe sees a new URL and navigates
+        // every time, even for two identical back-to-back exports.
+        var url = TML_SVC + 'api/config/export?settings=' + sel.s + '&lists=' + sel.l
+                + '&content=' + sel.c + '&overlay=' + sel.o
+                + (TML_TOKEN ? '&token=' + encodeURIComponent(TML_TOKEN) : '')
+                + '&_ts=' + Date.now();
+        var dl = document.getElementById('tml-export-dl');
+        if (!dl) {   // defensive: init IIFE should have made it already
+            dl = document.createElement('iframe');
+            dl.id = 'tml-export-dl';
+            dl.style.display = 'none';
+            document.body.appendChild(dl);
+        }
+        dl.src = url;
+
+        // Keep the modal up through the hand-off so the user sees it start, then
+        // close. The browser's own download manager shows the rest of the transfer.
+        go.textContent = 'Downloading...';
         _tmlExportTimer = setTimeout(function() {
-            if (_tmlExporting) { tmlResetExportBtn(); alert('Export timed out. Please try again.'); }
-        }, 120000);
+            document.getElementById('tml-export-modal').style.display = 'none';
+            tmlResetExportBtn();
+        }, 1800);
     }
 
     /* ---------------- Import ---------------- */

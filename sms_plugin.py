@@ -5312,7 +5312,7 @@ def index():
                             ℹ️ <strong>Remote mode:</strong> the Master's content must also exist on this remote - recommend using <strong>Config → Export/Import</strong>.
                         </div>
                         <div id="master_sync_box" style="display:none; margin-top:12px;">
-                            <label style="display:flex; align-items:center; gap:8px;">🔗 Sync to Plugin Master
+                            <label style="display:flex; align-items:center; gap:8px;">🔗 Sync from Plugin Master
                                 <button type="button" class="test-btn" id="btn_refresh_masters" onclick="refreshMasters(this)" style="padding:2px 10px; font-size:12px;">🔄 Refresh</button>
                             </label>
                             <div id="masters_list" style="margin-top:6px;">
@@ -5918,7 +5918,7 @@ def index():
             <!-- Backup & Restore -->
             <div class="section">
                 <h2>💾 Backup &amp; Restore</h2>
-                <p class="help-text" style="margin-bottom:12px;">Export all plugin settings, the content it uses (playlists, sequences, images), and the overlay model into one file - then import it on another Pi to reproduce this setup exactly. <strong>Credentials are not included</strong>; re-enter them after importing. <a id="backup_help_link" href="#" target="_top">Learn more</a></p>
+                <p class="help-text" style="margin-bottom:12px;">Export the plugin settings, block/word lists, and overlay model into one small file, then import it on another Pi to reproduce this setup. Heavy content files (sequences/videos) are <strong>not</strong> bundled by default - those are distributed by xLights FPP Connect; the export just records which content to use by name. <strong>Credentials are not included</strong>; re-enter them after importing. <a id="backup_help_link" href="#" target="_top">Learn more</a></p>
                 <div id="backup_actions" style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
                     <button type="button" class="test-btn" onclick="openExportModal()"
                        style="background:#4CAF50;">⬇️ Export Config</button>
@@ -5951,8 +5951,8 @@ def index():
                         <span><strong>Blocked numbers &amp; word lists</strong><br><span class="help-text">Blocked phone numbers and your whitelist / blacklist words.</span></span>
                     </label>
                     <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 12px;">
-                        <input type="checkbox" id="exp_content" checked style="width:auto; margin:3px 0 0;">
-                        <span><strong>Content files</strong><br><span class="help-text">The Waiting &amp; Name Display sequences, images, and videos this plugin uses - copied file-for-file. Can be large.</span></span>
+                        <input type="checkbox" id="exp_content" style="width:auto; margin:3px 0 0;">
+                        <span><strong>Content files</strong> (off by default)<br><span class="help-text">Copies the actual Waiting / Name Display sequence, image, and video files into the bundle - can be large. Leave OFF: xLights FPP Connect already distributes sequences to your Pis, so the export just records which content to use by name. Turn ON only for a fully self-contained copy.</span></span>
                     </label>
                     <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 18px;">
                         <input type="checkbox" id="exp_overlay" checked style="width:auto; margin:3px 0 0;">
@@ -9636,8 +9636,16 @@ def export_config():
         if inc_settings:
             settings_files.append(('settings', CONFIG_FILE))
         if inc_lists:
+            # Bundle the blocklist ONLY when a number is actually on it. An empty
+            # (or never-created) blocklist is left out so importing never wipes the
+            # target Pi's blocked numbers with an empty list.
+            try:
+                _bl_has_entries = bool(load_blocklist())
+            except Exception:
+                _bl_has_entries = False
+            if _bl_has_entries:
+                settings_files.append(('settings', BLOCKLIST_FILE))
             settings_files += [
-                ('settings', BLOCKLIST_FILE),
                 ('settings', WHITELIST_FILE),
                 ('settings', WHITELIST_ADDED_FILE),
                 ('settings', WHITELIST_REMOVED_FILE),
@@ -9662,69 +9670,100 @@ def export_config():
         # channel-output config (written to the zip as a small JSON payload below).
         overlay_payload = _extract_overlay_model(warnings) if inc_overlay else None
 
-        # Write to a temp file (FSEQ can be large; avoid holding the whole zip in
-        # RAM on a Pi). ZIP_STORED since FSEQ is already compressed.
-        # Write the temp zip onto the media partition (SD card), NOT the default
-        # TMPDIR: on a Pi /tmp is commonly a small tmpfs (RAM), and copying a large
-        # FSEQ sequence into a /tmp zip can exhaust it and fail the export with a
-        # 500. PLUGIN_DATA_DIR lives on the same roomy filesystem as the sequences.
-        _tmp_dir = PLUGIN_DATA_DIR if os.path.isdir(PLUGIN_DATA_DIR) else None
-        fd, tmp = tempfile.mkstemp(suffix='.zip', prefix='tml_export_', dir=_tmp_dir)
-        os.close(fd)
-        seen = set()
-        included = []
-        with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_STORED) as zf:
-            for arc_dir, path in settings_files + content_files:
-                if not path or not os.path.isfile(path):
-                    continue
-                arcname = f"{arc_dir}/{os.path.basename(path)}"
-                if arcname in seen:
-                    continue
-                seen.add(arcname)
-                # One unreadable/oversized file should not 500 the whole export -
-                # skip it with a warning in the manifest instead.
-                try:
-                    zf.write(path, arcname)
-                    included.append(arcname)
-                except Exception as fe:
-                    warnings.append(f"Could not add {arcname}: {fe}")
-
-            # Single-model overlay payload (not a file on disk).
-            if overlay_payload:
-                zf.writestr('overlay/overlay-model.json', overlay_payload)
-                included.append('overlay/overlay-model.json')
-
-            manifest = {
-                "bundle": BUNDLE_MARKER,
-                "format": BUNDLE_FORMAT,
-                "created": datetime.now(timezone.utc).isoformat(),
-                "includes": {
-                    "settings": inc_settings,
-                    "lists": inc_lists,
-                    "content": bool(content_files),
-                    "overlay_model": bool(overlay_payload),
-                    "credentials": False,
-                },
-                "overlay_model_name": config.get('overlay_model_name', ''),
-                "default_playlist": config.get('default_playlist', ''),
-                "name_display_playlist": config.get('name_display_playlist', ''),
-                "files": included,
-                "warnings": warnings,
-            }
-            zf.writestr('manifest.json', json.dumps(manifest, indent=2))
-
+        # Stream the zip straight to the HTTP response AS it is built - we never
+        # write an intermediate copy to the SD card first. This is what makes a
+        # large sequence export fast and start instantly, the way xLights' FPP
+        # Connect pushes files: the download's headers flush before the body, so it
+        # begins immediately, and each file is read only once (at read/network
+        # speed) instead of paying for a build-the-whole-zip-to-SD-then-resend round
+        # trip. ZIP_STORED since FSEQ is already compressed; a write-only (non
+        # seekable) sink makes zipfile emit a streamable archive (data descriptors).
         stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
         download_name = f"textmylights-config-{stamp}.zip"
-        # send_file streams the temp file; remove it once the response is sent.
-        resp = send_file(tmp, mimetype='application/zip',
-                         as_attachment=True, download_name=download_name)
+        seen = set()
+        included = []
 
-        @resp.call_on_close
-        def _cleanup():
-            try:
-                os.remove(tmp)
-            except OSError:
+        class _Sink:
+            def __init__(self):
+                self.buf = []
+            def write(self, data):
+                self.buf.append(bytes(data))
+                return len(data)
+            def flush(self):
                 pass
+
+        def _generate():
+            sink = _Sink()
+            def drain():
+                if sink.buf:
+                    out = b''.join(sink.buf)
+                    sink.buf = []
+                    return out
+                return b''
+            with zipfile.ZipFile(sink, 'w', zipfile.ZIP_STORED, allowZip64=True) as zf:
+                for arc_dir, path in settings_files + content_files:
+                    if not path or not os.path.isfile(path):
+                        continue
+                    arcname = f"{arc_dir}/{os.path.basename(path)}"
+                    if arcname in seen:
+                        continue
+                    seen.add(arcname)
+                    # A single unreadable file should not abort the export - skip it
+                    # with a manifest warning. (Once bytes have flushed we can't
+                    # recover, but the skip happens before any are written for it.)
+                    try:
+                        zi = zipfile.ZipInfo.from_file(path, arcname)
+                        zi.compress_type = zipfile.ZIP_STORED
+                        with zf.open(zi, 'w') as dest, open(path, 'rb') as src:
+                            while True:
+                                chunk = src.read(262144)
+                                if not chunk:
+                                    break
+                                dest.write(chunk)
+                                data = drain()
+                                if data:
+                                    yield data
+                        included.append(arcname)
+                    except Exception as fe:
+                        warnings.append(f"Could not add {arcname}: {fe}")
+                    data = drain()
+                    if data:
+                        yield data
+
+                # Single-model overlay payload (not a file on disk).
+                if overlay_payload:
+                    zf.writestr('overlay/overlay-model.json', overlay_payload)
+                    included.append('overlay/overlay-model.json')
+                    data = drain()
+                    if data:
+                        yield data
+
+                manifest = {
+                    "bundle": BUNDLE_MARKER,
+                    "format": BUNDLE_FORMAT,
+                    "created": datetime.now(timezone.utc).isoformat(),
+                    "includes": {
+                        "settings": inc_settings,
+                        "lists": inc_lists,
+                        "content": bool(content_files),
+                        "overlay_model": bool(overlay_payload),
+                        "credentials": False,
+                    },
+                    "overlay_model_name": config.get('overlay_model_name', ''),
+                    "default_playlist": config.get('default_playlist', ''),
+                    "name_display_playlist": config.get('name_display_playlist', ''),
+                    "files": included,
+                    "warnings": warnings,
+                }
+                zf.writestr('manifest.json', json.dumps(manifest, indent=2))
+            # ZipFile closed - central directory is now in the sink; flush the tail.
+            data = drain()
+            if data:
+                yield data
+
+        resp = Response(_generate(), mimetype='application/zip')
+        resp.headers['Content-Disposition'] = f'attachment; filename="{download_name}"'
+        resp.headers['Cache-Control'] = 'no-store'
         return resp
     except Exception as e:
         if tmp:
@@ -9997,6 +10036,30 @@ def import_config():
 
             else:
                 warnings.append(f"Unrecognized entry '{entry}' - skipped")
+
+        # Warn about content this config references that is NOT present on this Pi.
+        # Config-only bundles (the default) don't carry the heavy sequence/video
+        # files - they're distributed by xLights FPP Connect - so flag any the
+        # target is missing instead of letting the display silently fail later.
+        try:
+            _list_c = [it.get('content', '') for it in (config.get('names_content_list', []) or [])]
+            _wait_c = [it.get('content', '') for it in (config.get('default_content_list', []) or [])]
+            _missing = []
+            _checked_cv = set()
+            for cv in [config.get('default_playlist', ''), config.get('name_display_playlist', ''), *_wait_c, *_list_c]:
+                if not cv or cv in _checked_cv:
+                    continue
+                _checked_cv.add(cv)
+                for _, _p in _content_source_files(cv, []):
+                    if _p and not os.path.isfile(_p):
+                        _missing.append(os.path.basename(_p))
+            if _missing:
+                _miss = sorted(set(_missing))
+                warnings.append("Referenced content not on this Pi - push it with xLights "
+                                "FPP Connect: " + ", ".join(_miss[:10])
+                                + (f" (+{len(_miss) - 10} more)" if len(_miss) > 10 else ""))
+        except Exception as _we:
+            logging.warning(f"Import content-presence check failed: {_we}")
 
         # Refresh in-memory state: force cache reloads and re-sync Twilio client.
         _blocklist_cache = None

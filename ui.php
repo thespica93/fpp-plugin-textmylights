@@ -58,13 +58,13 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
 <div id="tml-export-modal" class="tml-modal" onclick="if(event.target===this)tmlHideExport()">
     <div class="tml-card">
         <h3>Export Config</h3>
-        <p class="tml-sub">Choose what to include. Only the content <strong>this plugin is set to use</strong> is exported &mdash; never all of FPP's files. <strong>Credentials are never included.</strong></p>
+        <p class="tml-sub">Choose what to include. Only the content <strong>this plugin is set to use</strong> is ever exported - never all of FPP's files. <strong>Credentials are never included.</strong></p>
         <label class="tml-opt"><input type="checkbox" id="tml-exp-settings" checked>
             <span><strong>Plugin settings</strong><br><span class="tml-desc">Display lines, message rules, response text, filters, poll interval, selected content &amp; overlay model.</span></span></label>
         <label class="tml-opt"><input type="checkbox" id="tml-exp-lists" checked>
             <span><strong>Blocked numbers &amp; word lists</strong><br><span class="tml-desc">Blocked phone numbers and your whitelist / blacklist words.</span></span></label>
-        <label class="tml-opt"><input type="checkbox" id="tml-exp-content" checked>
-            <span><strong>Content files</strong><br><span class="tml-desc">The Waiting &amp; Name Display sequences, images, and videos this plugin uses &mdash; copied file-for-file. Can be large.</span></span></label>
+        <label class="tml-opt"><input type="checkbox" id="tml-exp-content">
+            <span><strong>Content files</strong> (off by default)<br><span class="tml-desc">Copies the actual sequence / image / video files into the bundle - can be large. Leave OFF: xLights FPP Connect already distributes sequences to your Pis, so the export just records which content to use by name. Turn ON only for a fully self-contained copy.</span></span></label>
         <label class="tml-opt"><input type="checkbox" id="tml-exp-overlay" checked>
             <span><strong>Overlay model (matrix)</strong><br><span class="tml-desc">The FPP Pixel Overlay Model the names are drawn onto.</span></span></label>
         <div class="tml-actions">

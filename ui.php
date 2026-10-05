@@ -93,6 +93,13 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
     });
     function tmlFrame() { return document.getElementById('sms-plugin-frame').contentWindow; }
 
+    // The plugin service base + its access token (same token the iframe loads with).
+    // Lets THIS parent page talk to :5000 directly - needed so the export download
+    // is triggered by the real Export click here (user activation) instead of a
+    // postMessage inside the cross-origin iframe, which browsers block.
+    var TML_SVC   = <?php echo json_encode("http://$host:5000/"); ?>;
+    var TML_TOKEN = <?php echo json_encode($token); ?>;
+
     /* ---------------- Export ---------------- */
     var _tmlExporting = false, _tmlExportTimer = null;
     function tmlResetExportBtn() {
@@ -119,10 +126,32 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
         var go = document.getElementById('tml-exp-go');
         go.disabled = true; go.textContent = 'Exporting...';
         document.getElementById('tml-exp-cancel').disabled = true;
-        tmlFrame().postMessage({ type: 'tml_export', sel: sel }, '*');
+
+        // Download straight from this parent page via a hidden iframe. The browser
+        // streams the (possibly very large) sequence zip to disk - it never buffers
+        // the whole file in JS memory, so the tab can't freeze. Triggering it here,
+        // from the real Export click, keeps the user activation browsers require and
+        // sidesteps the cross-origin-iframe download block. Auth via ?token; the
+        // server's Content-Disposition names the file.
+        var url = TML_SVC + 'api/config/export?settings=' + sel.s + '&lists=' + sel.l
+                + '&content=' + sel.c + '&overlay=' + sel.o
+                + (TML_TOKEN ? '&token=' + encodeURIComponent(TML_TOKEN) : '');
+        var dl = document.getElementById('tml-export-dl');
+        if (!dl) {
+            dl = document.createElement('iframe');
+            dl.id = 'tml-export-dl';
+            dl.style.display = 'none';
+            document.body.appendChild(dl);
+        }
+        dl.src = url;
+
+        // Keep the modal up through the hand-off so the user sees it start, then
+        // close. The browser's own download manager shows the rest of the transfer.
+        go.textContent = 'Downloading...';
         _tmlExportTimer = setTimeout(function() {
-            if (_tmlExporting) { tmlResetExportBtn(); alert('Export timed out. Please try again.'); }
-        }, 120000);
+            document.getElementById('tml-export-modal').style.display = 'none';
+            tmlResetExportBtn();
+        }, 1800);
     }
 
     /* ---------------- Import ---------------- */

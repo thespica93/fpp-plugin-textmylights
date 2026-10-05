@@ -6,6 +6,7 @@
 	"homeURL": "https://github.com/thespica93/fpp-plugin-textmylights",
 	"srcURL": "https://github.com/thespica93/fpp-plugin-textmylights.git",
 	"bugURL": "https://github.com/thespica93/fpp-plugin-textmylights/issues",
+	"iconURL": "https://raw.githubusercontent.com/thespica93/fpp-plugin-textmylights/stable/icon.png",
 	"minMemoryMB": 512,
 	"minCpuCores": 1,
 	"allowUpdates": 1,

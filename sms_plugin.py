@@ -5986,18 +5986,23 @@ def index():
                     var url = '/api/config/export?settings=' + (sel.s ? 1 : 0)
                             + '&lists=' + (sel.l ? 1 : 0) + '&content=' + (sel.c ? 1 : 0)
                             + '&overlay=' + (sel.o ? 1 : 0);
-                    return fetch(url).then(function(r) {
-                        if (!r.ok) throw new Error('Server returned ' + r.status);
-                        var cd = r.headers.get('Content-Disposition') || '';
-                        var m = /filename="?([^";]+)"?/.exec(cd);
-                        var name = (m && m[1]) ? m[1] : 'textmylights-config.zip';
-                        return r.blob().then(function(b) { return { blob: b, name: name }; });
-                    }).then(function(o) {
-                        var u = URL.createObjectURL(o.blob);
+                    // Stream the download NATIVELY: a plain anchor lets the browser write
+                    // the (potentially very large) zip straight to disk. The old
+                    // fetch().blob() buffered the ENTIRE zip into JS memory first, which
+                    // froze the tab whenever large content files (sequences) were included
+                    // - small exports without content worked fine. Auth is cookie-based
+                    // after the first ?token= load, so this same-origin GET is authorized,
+                    // and the server's Content-Disposition names the file.
+                    return new Promise(function(resolve) {
                         var a = document.createElement('a');
-                        a.href = u; a.download = o.name;
-                        document.body.appendChild(a); a.click(); a.remove();
-                        setTimeout(function() { URL.revokeObjectURL(u); }, 2000);
+                        a.href = url;
+                        a.download = '';   // use the server's Content-Disposition filename
+                        document.body.appendChild(a);
+                        a.click();
+                        a.remove();
+                        // The download is now the browser's job; resolve promptly so the
+                        // modal closes instead of waiting on the whole file to transfer.
+                        setTimeout(resolve, 500);
                     });
                 }
                 // The parent-owned modal sends the chosen sections here to download,

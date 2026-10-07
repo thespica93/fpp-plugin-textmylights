@@ -2159,24 +2159,35 @@ def read_fseq_frame(header, frame_idx, start_ch, ch_count):
             raise ValueError(
                 f"Model channel count {ch_count} exceeds FSEQ channel count {total_ch}"
             )
-    elif not sparse_ranges and frame_byte + ch_count > total_ch and ch_count <= total_ch:
-        # Dense, model-specific / partial export: the file holds ONLY this
-        # model's channels starting at file offset 0, so the show-level start
-        # channel would overrun the file (e.g. FSEQ channel_count == model
-        # channel_count, but start_ch > 0).  Read from the top instead.
+    elif not sparse_ranges and frame_byte >= total_ch:
+        # The model's start channel is at/after the END of the file: the FSEQ
+        # holds ONLY this model's channels (model-specific / partial export) but
+        # FPP reports the show-level start channel, so start_ch overruns the whole
+        # file.  Read from the top instead (file offset 0).
         logging.warning(
-            f"FSEQ preview: model range {start_ch}..{start_ch + ch_count} exceeds "
-            f"file channel_count {total_ch} - treating as model-specific export "
-            f"(frame byte 0)"
+            f"FSEQ preview: start_ch {start_ch} is beyond file channel_count "
+            f"{total_ch} - treating as model-specific export (frame byte 0)"
         )
         frame_byte = 0
+    # NOTE: when frame_byte < total_ch but frame_byte + ch_count > total_ch, the
+    # model legitimately sits near the END of a FULL-layout export and overruns
+    # the last channel by a little (e.g. the matrix is the last prop and its
+    # ChannelCount rounds slightly past the file's channel_count).  KEEP frame_byte
+    # and let the read below clamp to what's present (the caller pads the missing
+    # tail with black).  Do NOT reset to 0 - that would paint a DIFFERENT model's
+    # channels (the start of the show) and show the wrong content.
+
+    # Never read past this frame's own channels into the next frame - when a
+    # model overruns the end of the file (see note above), clamp to what's left
+    # and let the caller pad the missing tail with black.
+    read_count = min(ch_count, max(0, total_ch - frame_byte))
 
     if ctype == 0:
         # Uncompressed: seek directly to frame + channel byte offset
         offset = header['chan_data_offset'] + frame_idx * total_ch + frame_byte
         with open(filepath, 'rb') as f:
             f.seek(offset)
-            return f.read(ch_count)
+            return f.read(read_count)
 
     elif ctype in (1, 2):
         # zlib (1) or zstd (2) block compression - same block table layout
@@ -2223,7 +2234,7 @@ def read_fseq_frame(header, frame_idx, start_ch, ch_count):
 
         local_frame  = frame_idx - block['first_frame']
         frame_offset = local_frame * total_ch + frame_byte
-        return decompressed[frame_offset: frame_offset + ch_count]
+        return decompressed[frame_offset: frame_offset + read_count]
 
     else:
         raise ValueError(f"FSEQ compression type {ctype} is not supported")

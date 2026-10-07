@@ -6441,6 +6441,16 @@ def index():
                                         <div id="fseq_status" style="font-size:11px; color:#888; margin-top:4px; min-height:16px;"></div>
                                     </div>
                                     <div id="fseq_load_status" style="font-size:11px; color:#888; margin-top:4px; min-height:16px;"></div>
+
+                                    <!-- Diagnostic: dump exactly how this box decoded the background
+                                         .fseq (compression, channels, sample pixels). Useful on a
+                                         remote (e.g. a Docker container) where you can't easily reach
+                                         the /api/fseq/debug URL by hand - just copy the output. -->
+                                    <div style="margin-top:8px;">
+                                        <button type="button" onclick="dumpPreviewDebug(this)" style="padding:4px 10px; font-size:11px; background:#455a64; color:#fff; border:none; border-radius:3px; cursor:pointer;">🐞 Print preview debug info</button>
+                                        <span class="help-text" style="margin-left:6px;">Shows how this preview decoded the background - copy it for support.</span>
+                                        <textarea id="preview_debug_out" readonly style="display:none; width:100%; height:240px; margin-top:6px; font-family:monospace; font-size:11px; background:#263238; color:#b2ccd6; border:1px solid #555; border-radius:4px; white-space:pre; overflow:auto;"></textarea>
+                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -8564,6 +8574,39 @@ def index():
 
                 // Alias so old callers still work
                 window.loadFseqPreview = loadBgPreview;
+
+                // Diagnostic dump for the Background Preview box. Fetches /api/fseq/debug for
+                // the CURRENTLY configured content + THIS instance's own overlay model, and
+                // prints the JSON into a textarea so it can be copied (handy on a remote where
+                // the raw URL is awkward to reach). Only meaningful for .fseq content.
+                window.dumpPreviewDebug = function(btn) {
+                    var out = document.getElementById('preview_debug_out');
+                    if (!out) return;
+                    out.style.display = '';
+                    var ct = getConfiguredContent();
+                    if (!ct || ct.type !== 'seq') {
+                        out.value = 'Background debug only applies to .fseq content.\\n'
+                                  + 'Current content: ' + (ct ? (ct.type + ':' + ct.file) : 'none configured');
+                        return;
+                    }
+                    var model = (document.getElementById('overlay_model_name')||{}).value || '';
+                    var mw    = (document.getElementById('overlay_model_width')||{}).value  || 0;
+                    var mh    = (document.getElementById('overlay_model_height')||{}).value || 0;
+                    out.value = 'Loading debug info\\u2026';
+                    if (btn) btn.disabled = true;
+                    var url = '/api/fseq/debug?sequence=' + encodeURIComponent(ct.file)
+                            + '&model='  + encodeURIComponent(model)
+                            + '&width='  + mw
+                            + '&height=' + mh;
+                    fetch(url).then(function(r){ return r.json(); }).then(function(d){
+                        out.value = JSON.stringify(d, null, 2);
+                        try { out.focus(); out.select(); } catch(e) {}
+                    }).catch(function(e){
+                        out.value = 'Failed to fetch debug info: ' + e;
+                    }).then(function(){
+                        if (btn) btn.disabled = false;
+                    });
+                };
 
                 var _scrubTimer = null;
                 var _pendingImg  = null;

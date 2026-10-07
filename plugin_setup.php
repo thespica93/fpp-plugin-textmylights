@@ -8,7 +8,7 @@
 // This file is required by FPP to recognize and install the plugin
 
 $pluginName = "fpp-plugin-textmylights";
-$pluginVersion = "3.7";
+$pluginVersion = "3.8";
 $pluginDescription = "Text My Lights - Viewers text a name that appears on your display (Twilio or Google Voice)";
 $pluginAuthor = "Nick";
 

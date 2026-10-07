@@ -2018,13 +2018,22 @@ def parse_fseq_header(filepath):
         raise ValueError(f"Unsupported FSEQ version {raw[7]}.{raw[6]}")
 
     chan_data_offset  = struct.unpack_from('<H', raw, 4)[0]
+    # Byte 8-9: offset to the variable-header section, i.e. the END of the
+    # (fixed header + compression block index + sparse range index).  We use
+    # this to locate the sparse range table from the back, which is far more
+    # robust than deriving it from the (often-wrong-in-v2.2) block count.
+    var_header_offset = struct.unpack_from('<H', raw, 8)[0]
     channel_count     = struct.unpack_from('<I', raw, 10)[0]
     frame_count       = struct.unpack_from('<I', raw, 14)[0]
     step_time_ms      = raw[18]
     compression_type  = raw[19] & 0x0F   # 0=none, 1=zlib, 2=zstd (per xLights: 1=zstd)
     # Offset 20 and 21 are separate uint8 fields - NOT a single uint16
     num_comp_blocks   = raw[20]           # uint8
-    num_sparse_ranges = raw[21]           # uint8
+    # The sparse-range COUNT lives in byte 22, not byte 21 (byte 21 is the low
+    # byte of the compression block count).  Reading byte 21 here was a latent
+    # bug: it only ever matched by luck on files with zero sparse ranges, and it
+    # silently mis-mapped genuinely sparse exports (channels packed, not dense).
+    num_sparse_ranges = raw[22] if len(raw) > 22 else 0
 
     # ── Auto-detect compression ──────────────────────────────────────────────
     # FSEQ v2.2 (minor_version >= 2) sometimes writes compression_type=0 in
@@ -2073,22 +2082,55 @@ def parse_fseq_header(filepath):
             _off += 8
 
     # ── Sparse range table ────────────────────────────────────────────────────
-    # For standard v2.0 files: sparse ranges follow the comp block table at
-    # offset 32 + num_comp_blocks*8, each entry 6 bytes (uint24 + uint24).
-    # For auto-detected zstd (v2.2): the block table fills the entire header
-    # space; sparse ranges are absent or in a variable-length metadata section
-    # we don't parse here - discard to ensure direct channel offset mapping.
-    sparse_ranges = []
-    if effective_ctype == compression_type and num_sparse_ranges > 0:
-        # Standard v2.0: sparse ranges at fixed position after comp block table
-        sr_table_offset = 32 + num_comp_blocks * 8
-        with open(filepath, 'rb') as f:
-            f.seek(sr_table_offset)
-            sr_raw = f.read(num_sparse_ranges * 6)
+    # A sparse FSEQ stores ONLY the listed channel ranges, packed together, so a
+    # logical (show-level) channel must be mapped to its packed byte offset via
+    # this table (see _sparse_ch_to_frame_byte).  Each entry is 6 bytes:
+    # uint24 start channel (0-indexed) + uint24 count.
+    #
+    # The table sits immediately before the variable-header section, so we locate
+    # it from var_header_offset (byte 8-9) rather than trusting the block count
+    # (byte 20/21 are unreliable in v2.2).  As a safety net it's SELF-VALIDATING:
+    # a well-formed sparse export's range counts sum to channel_count (the packed
+    # frame size), so if the parsed ranges don't sum to that we assume we guessed
+    # wrong / garbage and fall back to dense (direct) mapping - never worse than
+    # the previous behaviour.
+    def _parse_sparse_at(offset):
+        if offset < 32 or num_sparse_ranges <= 0:
+            return []
+        try:
+            with open(filepath, 'rb') as f:
+                f.seek(offset)
+                sr_raw = f.read(num_sparse_ranges * 6)
+        except Exception:
+            return []
+        out = []
         for i in range(num_sparse_ranges):
-            start = sr_raw[i*6] | (sr_raw[i*6+1] << 8) | (sr_raw[i*6+2] << 16)
+            if (i + 1) * 6 > len(sr_raw):
+                return []
+            start = sr_raw[i*6]   | (sr_raw[i*6+1] << 8) | (sr_raw[i*6+2] << 16)
             count = sr_raw[i*6+3] | (sr_raw[i*6+4] << 8) | (sr_raw[i*6+5] << 16)
-            sparse_ranges.append({'start': start, 'count': count})
+            if count == 0:
+                return []
+            out.append({'start': start, 'count': count})
+        # Trust the ranges only when their counts account for exactly the packed
+        # channel_count. (start values are absolute/logical and legitimately run
+        # past channel_count, so we can't bound-check those.)
+        if sum(sr['count'] for sr in out) != channel_count:
+            return []
+        return out
+
+    sparse_ranges = []
+    if num_sparse_ranges > 0:
+        # Primary: table ends where the variable headers begin.
+        sparse_ranges = _parse_sparse_at(var_header_offset - num_sparse_ranges * 6)
+        if not sparse_ranges:
+            # Fallback: right after the scanned compression block table.
+            sparse_ranges = _parse_sparse_at(32 + len(comp_blocks) * 8)
+        if not sparse_ranges:
+            logging.warning(
+                f"FSEQ: {num_sparse_ranges} sparse range(s) declared but none validated "
+                f"(counts != channel_count {channel_count}) - treating as dense"
+            )
 
     fps = 1000.0 / step_time_ms if step_time_ms > 0 else 25.0
     return {

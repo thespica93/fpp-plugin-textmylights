@@ -2106,38 +2106,38 @@ def parse_fseq_header(filepath):
     # A sparse FSEQ stores ONLY the listed channel ranges, packed together, so a
     # logical (show-level) channel must be mapped to its packed byte offset via
     # this table (see _sparse_ch_to_frame_byte).  Each entry is 6 bytes:
-    # uint24 start channel (0-indexed) + uint24 count.  The table sits between the
-    # block index and the variable headers:
-    #     [32 .. 32+numCompBlocks*8) block index
-    #     [32+numCompBlocks*8 .. var_header_offset) sparse ranges   <-- here
-    # We derive the range COUNT from that geometry (var_header_offset minus the
-    # block-table end, / 6) so it works even past 255 ranges - the header's byte-22
-    # count is a single byte and overflows on big rigs.  byte 22 is kept only as a
-    # secondary candidate.  The parse is SELF-VALIDATING: ranges must be ascending,
-    # non-overlapping, and their counts must sum to channel_count (the packed frame
-    # size of a sparse FSEQ).  If nothing validates we fall back to dense (direct)
-    # mapping - never worse than reading the file as non-sparse.
+    # uint24 start channel (0-indexed) + uint24 count.  The table ENDS at
+    # var_header_offset (byte 8-9); it sits after the block index with sometimes a
+    # few bytes of slack in between, so we anchor at the end and work backwards.
+    #
+    # Finding the COUNT is bulletproofed against both failure modes we've hit:
+    #   • header byte 22 is a single byte and OVERFLOWS past 255 ranges (big rigs)
+    #   • the geometric guess (var_header_offset - block-table end) is thrown off by
+    #     slack bytes between the block index and the sparse table.
+    # Key property: anchored at var_header_offset, the sum of the last k ranges is
+    # STRICTLY INCREASING in k (every range count >= 1), so AT MOST ONE k can sum to
+    # channel_count (the packed frame size of a sparse FSEQ).  We therefore try the
+    # cheap candidates first, then scan k outright - the sum check uniquely selects
+    # the right count independent of byte 22 and the block count.  Ranges must also
+    # be ascending + non-overlapping.  If nothing validates -> dense (direct) mapping,
+    # never worse than reading the file as non-sparse.
+    try:
+        with open(filepath, 'rb') as _f:
+            _f.seek(32)
+            _hdr_region = _f.read(max(0, var_header_offset - 32))
+    except Exception:
+        _hdr_region = b''
+
     def _parse_sparse(count):
-        if count <= 0:
+        if count <= 0 or count * 6 > len(_hdr_region):
             return []
-        offset = var_header_offset - count * 6   # table ends at var_header_offset
-        if offset < 32:
-            return []
-        try:
-            with open(filepath, 'rb') as f:
-                f.seek(offset)
-                sr_raw = f.read(count * 6)
-        except Exception:
-            return []
-        if len(sr_raw) < count * 6:
-            return []
+        sr_raw = _hdr_region[len(_hdr_region) - count * 6:]   # last `count` entries
         out = []
         prev_end = 0
         for i in range(count):
             start = sr_raw[i*6]   | (sr_raw[i*6+1] << 8) | (sr_raw[i*6+2] << 16)
             cnt   = sr_raw[i*6+3] | (sr_raw[i*6+4] << 8) | (sr_raw[i*6+5] << 16)
-            # Garbage guard: ranges are written in ascending, non-overlapping order.
-            if cnt == 0 or start < prev_end:
+            if cnt == 0 or start < prev_end:   # non-ascending / overlapping -> wrong count
                 return []
             out.append({'start': start, 'count': cnt})
             prev_end = start + cnt
@@ -2146,23 +2146,25 @@ def parse_fseq_header(filepath):
         return out
 
     sparse_ranges = []
-    if var_header_offset > 32:
+    if len(_hdr_region) >= 6:
+        _maxk      = len(_hdr_region) // 6
         _blk_end   = 32 + len(comp_blocks) * 8
         _sr_bytes  = var_header_offset - _blk_end
-        candidates = []
+        # Fast candidates first (usually right in one shot), then an exhaustive scan.
+        _candidates = []
         if _sr_bytes > 0 and _sr_bytes % 6 == 0:
-            candidates.append(_sr_bytes // 6)        # geometric (handles >255 ranges)
-        if num_sparse_ranges > 0 and num_sparse_ranges not in candidates:
-            candidates.append(num_sparse_ranges)     # header byte 22 (cross-check)
-        for _cnt in candidates:
+            _candidates.append(_sr_bytes // 6)       # geometric
+        if num_sparse_ranges > 0:
+            _candidates.append(num_sparse_ranges)    # header byte 22
+        _candidates += range(1, _maxk + 1)           # exhaustive fallback
+        _seen = set()
+        for _cnt in _candidates:
+            if _cnt in _seen or _cnt <= 0 or _cnt > _maxk:
+                continue
+            _seen.add(_cnt)
             sparse_ranges = _parse_sparse(_cnt)
             if sparse_ranges:
                 break
-        if not sparse_ranges and (num_sparse_ranges > 0 or (_sr_bytes and _sr_bytes % 6 == 0 and _sr_bytes > 0)):
-            logging.warning(
-                f"FSEQ: sparse ranges present but none validated "
-                f"(tried counts {candidates}, channel_count={channel_count}) - treating as dense"
-            )
 
     fps = 1000.0 / step_time_ms if step_time_ms > 0 else 25.0
     return {
@@ -6559,16 +6561,6 @@ def index():
                                         <div id="fseq_status" style="font-size:11px; color:#888; margin-top:4px; min-height:16px;"></div>
                                     </div>
                                     <div id="fseq_load_status" style="font-size:11px; color:#888; margin-top:4px; min-height:16px;"></div>
-
-                                    <!-- Diagnostic: dump exactly how this box decoded the background
-                                         .fseq (compression, channels, sample pixels). Useful on a
-                                         remote (e.g. a Docker container) where you can't easily reach
-                                         the /api/fseq/debug URL by hand - just copy the output. -->
-                                    <div style="margin-top:8px;">
-                                        <button type="button" onclick="dumpPreviewDebug(this)" style="padding:4px 10px; font-size:11px; background:#455a64; color:#fff; border:none; border-radius:3px; cursor:pointer;">🐞 Print preview debug info</button>
-                                        <span class="help-text" style="margin-left:6px;">Shows how this preview decoded the background - copy it for support.</span>
-                                        <textarea id="preview_debug_out" readonly style="display:none; width:100%; height:240px; margin-top:6px; font-family:monospace; font-size:11px; background:#263238; color:#b2ccd6; border:1px solid #555; border-radius:4px; white-space:pre; overflow:auto;"></textarea>
-                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -8692,39 +8684,6 @@ def index():
 
                 // Alias so old callers still work
                 window.loadFseqPreview = loadBgPreview;
-
-                // Diagnostic dump for the Background Preview box. Fetches /api/fseq/debug for
-                // the CURRENTLY configured content + THIS instance's own overlay model, and
-                // prints the JSON into a textarea so it can be copied (handy on a remote where
-                // the raw URL is awkward to reach). Only meaningful for .fseq content.
-                window.dumpPreviewDebug = function(btn) {
-                    var out = document.getElementById('preview_debug_out');
-                    if (!out) return;
-                    out.style.display = '';
-                    var ct = getConfiguredContent();
-                    if (!ct || ct.type !== 'seq') {
-                        out.value = 'Background debug only applies to .fseq content.\\n'
-                                  + 'Current content: ' + (ct ? (ct.type + ':' + ct.file) : 'none configured');
-                        return;
-                    }
-                    var model = (document.getElementById('overlay_model_name')||{}).value || '';
-                    var mw    = (document.getElementById('overlay_model_width')||{}).value  || 0;
-                    var mh    = (document.getElementById('overlay_model_height')||{}).value || 0;
-                    out.value = 'Loading debug info\\u2026';
-                    if (btn) btn.disabled = true;
-                    var url = '/api/fseq/debug?sequence=' + encodeURIComponent(ct.file)
-                            + '&model='  + encodeURIComponent(model)
-                            + '&width='  + mw
-                            + '&height=' + mh;
-                    fetch(url).then(function(r){ return r.json(); }).then(function(d){
-                        out.value = JSON.stringify(d, null, 2);
-                        try { out.focus(); out.select(); } catch(e) {}
-                    }).catch(function(e){
-                        out.value = 'Failed to fetch debug info: ' + e;
-                    }).then(function(){
-                        if (btn) btn.disabled = false;
-                    });
-                };
 
                 var _scrubTimer = null;
                 var _pendingImg  = null;

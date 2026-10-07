@@ -2063,73 +2063,105 @@ def parse_fseq_header(filepath):
         )
 
     # ── Compression block table ───────────────────────────────────────────────
-    # When compression is active (or auto-detected), scan from offset 32 for
-    # valid (firstFrame uint32, dataLen uint32) block entries.  FSEQ v2.2 may
-    # report num_comp_blocks incorrectly in byte 20; derive actual count by
-    # scanning until firstFrame >= frameCount or dataLen == 0.
+    # The block index is a run of (firstFrame uint32, dataLen uint32) entries at
+    # offset 32.  We must NOT trust the header's block count (byte 20/21 are wrong
+    # in v2.2) nor a simple "stop at firstFrame >= frameCount" scan (undercounts
+    # when late blocks hold a single frame).  Instead use the exact invariant that
+    # the block dataLens sum to the compressed channel-data size (filesize minus
+    # chan_data_offset): read entries until that budget is exactly spent.  This is
+    # correct for any number of blocks - essential for large sequences with
+    # thousands of them.
+    try:
+        filesize = os.path.getsize(filepath)
+    except OSError:
+        filesize = 0
+    total_data_size = max(0, filesize - chan_data_offset)
     comp_blocks = []
     if effective_ctype in (1, 2):
         with open(filepath, 'rb') as _f:
             _f.seek(32)
             _blk_raw = _f.read(chan_data_offset - 32)
         _off = 0
-        while _off + 7 < len(_blk_raw):
+        _acc = 0
+        while _off + 8 <= len(_blk_raw):
             ff = struct.unpack_from('<I', _blk_raw, _off)[0]
             ds = struct.unpack_from('<I', _blk_raw, _off + 4)[0]
-            if ff >= frame_count or ds == 0:
+            if ds == 0:
+                break
+            # A valid block's first frame is within the sequence; anything past the
+            # frame count means we've walked off the block table into other header
+            # data (sparse ranges / variable headers), so stop.
+            if ff >= frame_count and comp_blocks:
                 break
             comp_blocks.append({'first_frame': ff, 'data_size': ds})
+            _acc += ds
             _off += 8
+            # Stop as soon as the dataLens account for all compressed data - this
+            # lands us exactly at the end of the block table (so we never misread
+            # sparse-range bytes as blocks) regardless of block count.
+            if total_data_size and _acc >= total_data_size:
+                break
 
     # ── Sparse range table ────────────────────────────────────────────────────
     # A sparse FSEQ stores ONLY the listed channel ranges, packed together, so a
     # logical (show-level) channel must be mapped to its packed byte offset via
     # this table (see _sparse_ch_to_frame_byte).  Each entry is 6 bytes:
-    # uint24 start channel (0-indexed) + uint24 count.
-    #
-    # The table sits immediately before the variable-header section, so we locate
-    # it from var_header_offset (byte 8-9) rather than trusting the block count
-    # (byte 20/21 are unreliable in v2.2).  As a safety net it's SELF-VALIDATING:
-    # a well-formed sparse export's range counts sum to channel_count (the packed
-    # frame size), so if the parsed ranges don't sum to that we assume we guessed
-    # wrong / garbage and fall back to dense (direct) mapping - never worse than
-    # the previous behaviour.
-    def _parse_sparse_at(offset):
-        if offset < 32 or num_sparse_ranges <= 0:
+    # uint24 start channel (0-indexed) + uint24 count.  The table sits between the
+    # block index and the variable headers:
+    #     [32 .. 32+numCompBlocks*8) block index
+    #     [32+numCompBlocks*8 .. var_header_offset) sparse ranges   <-- here
+    # We derive the range COUNT from that geometry (var_header_offset minus the
+    # block-table end, / 6) so it works even past 255 ranges - the header's byte-22
+    # count is a single byte and overflows on big rigs.  byte 22 is kept only as a
+    # secondary candidate.  The parse is SELF-VALIDATING: ranges must be ascending,
+    # non-overlapping, and their counts must sum to channel_count (the packed frame
+    # size of a sparse FSEQ).  If nothing validates we fall back to dense (direct)
+    # mapping - never worse than reading the file as non-sparse.
+    def _parse_sparse(count):
+        if count <= 0:
+            return []
+        offset = var_header_offset - count * 6   # table ends at var_header_offset
+        if offset < 32:
             return []
         try:
             with open(filepath, 'rb') as f:
                 f.seek(offset)
-                sr_raw = f.read(num_sparse_ranges * 6)
+                sr_raw = f.read(count * 6)
         except Exception:
             return []
+        if len(sr_raw) < count * 6:
+            return []
         out = []
-        for i in range(num_sparse_ranges):
-            if (i + 1) * 6 > len(sr_raw):
-                return []
+        prev_end = 0
+        for i in range(count):
             start = sr_raw[i*6]   | (sr_raw[i*6+1] << 8) | (sr_raw[i*6+2] << 16)
-            count = sr_raw[i*6+3] | (sr_raw[i*6+4] << 8) | (sr_raw[i*6+5] << 16)
-            if count == 0:
+            cnt   = sr_raw[i*6+3] | (sr_raw[i*6+4] << 8) | (sr_raw[i*6+5] << 16)
+            # Garbage guard: ranges are written in ascending, non-overlapping order.
+            if cnt == 0 or start < prev_end:
                 return []
-            out.append({'start': start, 'count': count})
-        # Trust the ranges only when their counts account for exactly the packed
-        # channel_count. (start values are absolute/logical and legitimately run
-        # past channel_count, so we can't bound-check those.)
+            out.append({'start': start, 'count': cnt})
+            prev_end = start + cnt
         if sum(sr['count'] for sr in out) != channel_count:
             return []
         return out
 
     sparse_ranges = []
-    if num_sparse_ranges > 0:
-        # Primary: table ends where the variable headers begin.
-        sparse_ranges = _parse_sparse_at(var_header_offset - num_sparse_ranges * 6)
-        if not sparse_ranges:
-            # Fallback: right after the scanned compression block table.
-            sparse_ranges = _parse_sparse_at(32 + len(comp_blocks) * 8)
-        if not sparse_ranges:
+    if var_header_offset > 32:
+        _blk_end   = 32 + len(comp_blocks) * 8
+        _sr_bytes  = var_header_offset - _blk_end
+        candidates = []
+        if _sr_bytes > 0 and _sr_bytes % 6 == 0:
+            candidates.append(_sr_bytes // 6)        # geometric (handles >255 ranges)
+        if num_sparse_ranges > 0 and num_sparse_ranges not in candidates:
+            candidates.append(num_sparse_ranges)     # header byte 22 (cross-check)
+        for _cnt in candidates:
+            sparse_ranges = _parse_sparse(_cnt)
+            if sparse_ranges:
+                break
+        if not sparse_ranges and (num_sparse_ranges > 0 or (_sr_bytes and _sr_bytes % 6 == 0 and _sr_bytes > 0)):
             logging.warning(
-                f"FSEQ: {num_sparse_ranges} sparse range(s) declared but none validated "
-                f"(counts != channel_count {channel_count}) - treating as dense"
+                f"FSEQ: sparse ranges present but none validated "
+                f"(tried counts {candidates}, channel_count={channel_count}) - treating as dense"
             )
 
     fps = 1000.0 / step_time_ms if step_time_ms > 0 else 25.0
@@ -2168,6 +2200,33 @@ def _sparse_ch_to_frame_byte(sparse_ranges, logical_ch):
             return byte_offset + (logical_ch - sr['start'])
         byte_offset += sr['count']
     return None             # Channel is after all ranges
+
+
+def _sparse_contiguous_len(sparse_ranges, logical_ch):
+    """How many channels from logical_ch onward are stored as ONE contiguous packed
+    run (i.e. up to the first logical gap).  Returns None for dense FSEQs (no limit).
+
+    Lets a reader clamp to a model's actually-stored extent so a model defined
+    larger than what the file packed for it can't bleed into the next prop's data.
+    """
+    if not sparse_ranges:
+        return None   # Dense - no packing boundary to respect
+    idx = None
+    for i, sr in enumerate(sparse_ranges):
+        if sr['start'] <= logical_ch < sr['start'] + sr['count']:
+            idx = i
+            break
+    if idx is None:
+        return 0      # channel not present in the file
+    end = sparse_ranges[idx]['start'] + sparse_ranges[idx]['count']
+    # Extend across ranges that are logically adjacent (no gap) - they're also
+    # packed adjacently, so a model spanning them reads straight through.
+    for j in range(idx + 1, len(sparse_ranges)):
+        if sparse_ranges[j]['start'] == end:
+            end = sparse_ranges[j]['start'] + sparse_ranges[j]['count']
+        else:
+            break
+    return end - logical_ch
 
 
 def read_fseq_frame(header, frame_idx, start_ch, ch_count):
@@ -2223,6 +2282,12 @@ def read_fseq_frame(header, frame_idx, start_ch, ch_count):
     # model overruns the end of the file (see note above), clamp to what's left
     # and let the caller pad the missing tail with black.
     read_count = min(ch_count, max(0, total_ch - frame_byte))
+    # On a sparse FSEQ, also clamp to the model's actually-stored contiguous run so
+    # a model defined larger than what the file packed for it can't read a
+    # neighbouring prop's channels (caller pads the shortfall with black).
+    _run = _sparse_contiguous_len(sparse_ranges, start_ch)
+    if _run is not None:
+        read_count = min(read_count, max(0, _run))
 
     if ctype == 0:
         # Uncompressed: seek directly to frame + channel byte offset

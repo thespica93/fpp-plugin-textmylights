@@ -325,23 +325,24 @@ function tml_shot($file, $alt) {
 (function () {
     var el = document.querySelector('.sms-help');
     if (!el) return;
-    function fromEl(e2) {
-        try {
-            var bg = getComputedStyle(e2).backgroundColor || '';
-            var m = bg.match(/rgba?\(([^)]+)\)/i);
-            if (!m) return null;
-            var p = m[1].split(',').map(function (s) { return parseFloat(s); });
-            var a = p.length > 3 ? p[3] : 1;
-            if (!(a > 0.1)) return null;
-            var lum = 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
-            return lum < 128 ? 'dark' : 'light';
-        } catch (e) { return null; }
+    function lumOf(str) {
+        var m = (str || '').match(/rgba?\(([^)]+)\)/i);
+        if (!m) return null;
+        var p = m[1].split(',').map(function (s) { return parseFloat(s); });
+        var a = p.length > 3 ? p[3] : 1;
+        if (!(a > 0.1)) return null;
+        return 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
     }
     function detect() {
-        // Skip transparent backgrounds (read as black → wrongly dark); fall back to browser pref.
-        return fromEl(document.body)
-            || fromEl(document.documentElement)
-            || ((window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light');
+        // Background (body→html) if opaque, else text color (light text => dark theme), else OS pref.
+        try {
+            var bg = lumOf(getComputedStyle(document.body).backgroundColor);
+            if (bg === null) bg = lumOf(getComputedStyle(document.documentElement).backgroundColor);
+            if (bg !== null) return bg < 128 ? 'dark' : 'light';
+            var fg = lumOf(getComputedStyle(document.body).color);
+            if (fg !== null) return fg > 150 ? 'dark' : 'light';
+        } catch (e) {}
+        return (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
     }
     function apply() { el.classList.toggle('tml-dark', detect() === 'dark'); }
     apply();

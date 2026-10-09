@@ -7107,7 +7107,7 @@ def index():
                         // user proceed - re-send with force once they confirm.
                         if (d.confirm_required) {
                             btn.disabled = false;
-                            if (confirm((d.error || 'Nothing is set up to display text.') + '\n\nStart anyway?')) {
+                            if (confirm((d.error || 'Nothing is set up to display text.') + '\\n\\nStart anyway?')) {
                                 pluginToggle(true);
                             } else {
                                 updateLiveStatus();

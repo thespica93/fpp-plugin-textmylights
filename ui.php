@@ -104,27 +104,29 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
     // own theme. We judge the theme from the luminance of FPP's page background - robust to
     // whatever class names/CSS vars the installed FPP theme uses - and forward it to the iframe,
     // which applies it. Falls back to the browser preference if the background can't be read.
-    function tmlThemeFromEl(el) {
-        // Returns 'dark'/'light' from an element's background, or null if transparent/unreadable.
-        try {
-            var bg = getComputedStyle(el).backgroundColor || '';
-            var m = bg.match(/rgba?\(([^)]+)\)/i);
-            if (!m) return null;
-            var p = m[1].split(',').map(function (s) { return parseFloat(s); });
-            var a = p.length > 3 ? p[3] : 1;
-            if (!(a > 0.1)) return null;           // transparent → can't judge from this element
-            var lum = 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
-            return lum < 128 ? 'dark' : 'light';
-        } catch (e) { return null; }
+    function tmlLum(str) {
+        // Relative luminance of a CSS color, or null if transparent/unreadable.
+        var m = (str || '').match(/rgba?\(([^)]+)\)/i);
+        if (!m) return null;
+        var p = m[1].split(',').map(function (s) { return parseFloat(s); });
+        var a = p.length > 3 ? p[3] : 1;
+        if (!(a > 0.1)) return null;
+        return 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
     }
     function tmlDetectTheme() {
-        // Judge FPP's theme from the first element with an actual (non-transparent) background -
-        // body, then <html>. A transparent background reads as rgba(0,0,0,0); treating that as
-        // black made the plugin stick on dark even when FPP was light, so skip it and fall back
-        // to the OS/browser preference (what FPP's "system default" follows anyway).
-        return tmlThemeFromEl(document.body)
-            || tmlThemeFromEl(document.documentElement)
-            || ((window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light');
+        // Judge FPP's theme without depending on its internal class names:
+        //  1) a non-transparent page background (body, then <html>) - dark bg => dark theme;
+        //  2) else the TEXT color, which the theme always sets even when backgrounds are
+        //     transparent - light text => dark theme (inverted);
+        //  3) else the OS/browser preference (what FPP's "system default" follows).
+        try {
+            var bg = tmlLum(getComputedStyle(document.body).backgroundColor);
+            if (bg === null) bg = tmlLum(getComputedStyle(document.documentElement).backgroundColor);
+            if (bg !== null) return bg < 128 ? 'dark' : 'light';
+            var fg = tmlLum(getComputedStyle(document.body).color);
+            if (fg !== null) return fg > 150 ? 'dark' : 'light';
+        } catch (e) {}
+        return (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
     }
     var _tmlLastTheme = null;
     function tmlSendTheme() {

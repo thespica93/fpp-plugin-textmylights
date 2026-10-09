@@ -795,9 +795,10 @@ def discover_remotes(force=False):
 
 
 def discover_remotes_detailed(force=False):
-    """Master side: detailed list of reachable plugin REMOTES on the FPP MultiSync network,
-    each `{address, base, name}`, so the master UI can show which projectors are connected.
-    Cached briefly (same TTL as the other discovery caches)."""
+    """Master side: detailed list of reachable plugin REMOTES that are SYNCED TO THIS master
+    (their 'Sync to Master' is pinned here - the remote confirms the caller is its master via
+    `synced_to_caller` in its ping). Each `{address, base, name, model_w, model_h, overlay_model}`
+    so the master UI can show connected projectors and preview using their overlay. Cached briefly."""
     global _remotes_detail_cache, _remotes_detail_cache_time
     now = time.time()
     if not force and _remotes_detail_cache and (now - _remotes_detail_cache_time) < _REMOTES_CACHE_TTL:
@@ -810,8 +811,14 @@ def discover_remotes_detailed(force=False):
             pr = requests.get(f"{base}/api/tml/ping", timeout=2)
             if pr.status_code == 200:
                 j = pr.json()
-                if j.get('plugin') == 'textmylights' and j.get('role') == 'remote':
-                    found.append({"address": host, "base": base, "name": j.get('name') or host})
+                # Only remotes pinned to THIS master (synced_to_caller), so the preview and the
+                # "connected" count reflect the projectors this master actually drives.
+                if (j.get('plugin') == 'textmylights' and j.get('role') == 'remote'
+                        and j.get('synced_to_caller')):
+                    found.append({"address": host, "base": base, "name": j.get('name') or host,
+                                  "model_w": int(j.get('model_w') or 0),
+                                  "model_h": int(j.get('model_h') or 0),
+                                  "overlay_model": j.get('overlay_model') or ''})
         except Exception:
             pass  # unreachable / not the plugin - skip silently
     found.sort(key=lambda m: (m.get('name') or '').lower())
@@ -6059,6 +6066,8 @@ def index():
                     // pushes the duration), so a remote has no duration control - show a note instead.
                     showIf('content_duration_row', !remote);
                     showIf('content_duration_hint', !remote);
+                    // Preview-from-a-remote is a master-only aid; a remote renders on its own overlay.
+                    if (remote) { showIf('preview_remote_row', false); window._previewRemote = null; }
                     var _cdn = document.getElementById('content_duration_remote_note');
                     if (_cdn) _cdn.style.display = remote ? 'block' : 'none';
                     // SMS Responses are Google-Voice-only, so for a non-remote the source
@@ -6696,6 +6705,15 @@ def index():
                                 <span id="fseq_scrub_hint" style="font-weight:normal; font-size:11px; color:#bbb; margin-left:6px;">Use scroll bar to move preview.</span>
                                 <div id="fseq_preview_controls" style="margin-top:8px;">
 
+                                    <!-- Master with no local projector: preview using a synced remote's
+                                         overlay (its real size + its rendered background). Shown only on a
+                                         master that has synced remotes; defaults to the largest overlay. -->
+                                    <div id="preview_remote_row" style="display:none; margin-bottom:8px; padding:8px; background:#3a3a3a; border:1px solid #555; border-radius:4px;">
+                                        <label style="display:block; margin:0 0 4px; font-size:12px; color:#eee;">🖥️ Preview from projector:</label>
+                                        <select id="preview_remote_select" onchange="onPreviewRemoteChange()" style="width:100%;"></select>
+                                        <p class="help-text" id="preview_remote_note" style="margin:4px 0 0; color:#bbb;"></p>
+                                    </div>
+
                                     <!-- Per-content editor: pick which Names content's text you are
                                          arranging/previewing. Shown only when >1 content is configured. -->
                                     <div id="preview_content_row" style="display:none; margin-bottom:8px; padding:8px; background:#3a3a3a; border:1px solid #555; border-radius:4px;">
@@ -7179,6 +7197,7 @@ def index():
                 if (roleEl && roleEl.value === 'remote') { el.style.display = 'none'; return; }
                 fetch('/api/tml/remotes').then(function(r){ return r.json(); }).then(function(d){
                     if (!d || d.role !== 'master') { el.style.display = 'none'; return; }
+                    updatePreviewRemotes(d.remotes || [], (d.overlay_model || '').trim());
                     el.style.display = 'block';
                     if (d.count > 0) {
                         var names = (d.remotes || []).map(function(x){ return x.name; }).filter(Boolean).join(', ');
@@ -7197,6 +7216,65 @@ def index():
                                        (d.overlay_model || '') + '”).';
                     }
                 }).catch(function(){});
+            }
+
+            // Master "preview from a projector": populate the selector from the synced-remote list
+            // (with overlay sizes), defaulting to the LARGEST overlay - it's easier to scale a
+            // layout down to smaller remotes than up. The selector is hidden when there are no
+            // synced remotes with usable dimensions.
+            window._previewRemote = null;            // {address,name,w,h} or null (= this box)
+            window._previewRemotesList = [];
+            function updatePreviewRemotes(remotes) {
+                var row = document.getElementById('preview_remote_row');
+                var sel = document.getElementById('preview_remote_select');
+                var note = document.getElementById('preview_remote_note');
+                if (!row || !sel) return;
+                var usable = (remotes || []).filter(function(r){ return r.model_w > 0 && r.model_h > 0; });
+                window._previewRemotesList = usable;
+                if (usable.length === 0) {
+                    // No synced remote with a known overlay size → hide and fall back to local/assumed.
+                    if (row.style.display !== 'none') { row.style.display = 'none'; window._previewRemote = null; }
+                    return;
+                }
+                // Largest overlay by pixel area.
+                var largest = usable.slice().sort(function(a,b){ return (b.model_w*b.model_h)-(a.model_w*a.model_h); })[0];
+                var prev = sel.value;
+                sel.innerHTML = '';
+                var optThis = document.createElement('option');
+                optThis.value = ''; optThis.textContent = 'This box (assumed 16:9)';
+                sel.appendChild(optThis);
+                usable.forEach(function(r){
+                    var o = document.createElement('option');
+                    o.value = r.address;
+                    o.textContent = r.name + ' (' + r.model_w + '×' + r.model_h + ')' + (r === largest ? ' — largest' : '');
+                    sel.appendChild(o);
+                });
+                // Keep the user's choice if still present; otherwise default to the largest.
+                var stillThere = usable.some(function(r){ return r.address === prev; });
+                sel.value = (prev && (prev === '' || stillThere)) ? prev : largest.address;
+                row.style.display = 'block';
+                if (note) note.textContent = 'Shows what that projector will display, at its real size, using its overlay.';
+                // Apply the (possibly new default) selection once, on first populate.
+                if (!window._previewRemoteInit) { window._previewRemoteInit = true; onPreviewRemoteChange(); }
+            }
+
+            function onPreviewRemoteChange() {
+                var sel = document.getElementById('preview_remote_select');
+                if (!sel) return;
+                var r = (window._previewRemotesList || []).filter(function(x){ return x.address === sel.value; })[0];
+                if (r) {
+                    window._previewRemote = {address: r.address, name: r.name, w: r.model_w, h: r.model_h};
+                    window._canvasModelW = r.model_w;
+                    window._canvasModelH = r.model_h;
+                } else {
+                    window._previewRemote = null;   // "This box" → local/assumed handled by loadBgPreview
+                }
+                // Re-shape the canvas to the chosen size, then redraw the preview.
+                var canvas = document.getElementById('matrix_canvas');
+                if (canvas && window._canvasModelW > 0 && window._canvasModelH > 0) {
+                    canvas.height = Math.round(canvas.width * window._canvasModelH / window._canvasModelW);
+                }
+                if (typeof window.loadBgPreview === 'function') window.loadBgPreview();
             }
 
             // Resolves a line's movement ('Center'|'L2R'|'R2L'|'T2B'|'B2T'), defaulting to Center
@@ -8817,7 +8895,7 @@ def index():
                     // background fetch, assume a 16:9 preview (480\u00d7270) so text positioning still
                     // works, and tell the user the size is assumed. (The exact-size preview with
                     // the live background returns once a model is selected.)
-                    if (!((document.getElementById('overlay_model_name') || {}).value || '')) {
+                    if (!window._previewRemote && !((document.getElementById('overlay_model_name') || {}).value || '')) {
                         window._fseqBgImage = null;
                         // Only FSEQ truly needs the model (to map channels \u2192 pixels). Images and
                         // videos just get resized server-side, so they can still render at the
@@ -8871,7 +8949,11 @@ def index():
                                     return;
                                 }
                                 _fseqMeta = data;
-                                if (data.detected_start_channel) {
+                                if (window._previewRemote) {
+                                    loadEl.textContent = '\ud83d\udda5\ufe0f Preview from ' + window._previewRemote.name +
+                                                         ' (' + window._previewRemote.w + '\u00d7' + window._previewRemote.h + ')';
+                                    loadEl.style.color = '#a5d6a7';
+                                } else if (data.detected_start_channel) {
                                     loadEl.textContent = '';
                                 } else {
                                     loadEl.textContent = '\u26a0 Overlay model not found \u2014 verify model name in settings';
@@ -8939,6 +9021,14 @@ def index():
                         Math.round(sec * _fseqMeta.fps),
                         _fseqMeta.frame_count - 1
                     );
+                    // Preview-from-remote: let the chosen remote render the frame with its own
+                    // overlay (channel-accurate), proxied through this master.
+                    if (window._previewRemote) {
+                        _loadImageUrl('/api/tml/remote-frame?remote=' + encodeURIComponent(window._previewRemote.address)
+                            + '&content=' + encodeURIComponent('seq:' + _fseqSeq)
+                            + '&frame='   + frameIdx);
+                        return;
+                    }
                     var mw    = document.getElementById('overlay_model_width').value  || 0;
                     var mh    = document.getElementById('overlay_model_height').value || 0;
                     var model = document.getElementById('overlay_model_name').value   || '';
@@ -8960,6 +9050,13 @@ def index():
 
                 function doMediaFetch(seconds) {
                     if (!_contentType || !_contentFile || _contentType === 'seq') return;
+                    // Preview-from-remote: render on the chosen remote (its overlay size), proxied here.
+                    if (window._previewRemote) {
+                        _loadImageUrl('/api/tml/remote-frame?remote=' + encodeURIComponent(window._previewRemote.address)
+                            + '&content=' + encodeURIComponent(_contentType + ':' + _contentFile)
+                            + '&time='    + Math.floor(seconds));
+                        return;
+                    }
                     // Images/videos just get resized to these dims server-side (no model needed),
                     // so when no overlay model is set, fall back to the assumed 16:9 preview size.
                     var mw = parseInt(document.getElementById('overlay_model_width').value)  || window._canvasModelW || 480;
@@ -10695,39 +10792,21 @@ def fseq_info():
     except Exception as e:
         return _client_error("fseq_info", e, 500)
 
-@app.route('/api/fseq/frame')
-def fseq_frame():
-    """Return a single FSEQ frame as a PNG image for the canvas background preview."""
-    if not PIL_AVAILABLE:
-        return jsonify({'error': 'Pillow not installed - run fpp_install.sh'}), 503
-
-    seq        = request.args.get('sequence', '').strip()
-    frame_idx  = max(0, int(request.args.get('frame', 0)))
-    model_name = request.args.get('model', config.get('overlay_model_name', ''))
-    width      = int(request.args.get('width',  config.get('overlay_model_width',  0)))
-    height     = int(request.args.get('height', config.get('overlay_model_height', 0)))
-    start_ch_override  = request.args.get('start_channel', '').strip()
-    ch_count_override  = request.args.get('channel_count', '').strip()
-
+def _render_fseq_frame_png(seq, frame_idx, model_name, width, height,
+                           start_ch_override='', ch_count_override=''):
+    """Render one FSEQ frame to PNG bytes using the given model/dims. Returns
+    (png_bytes, None) on success or (None, (error_message, http_status)) on failure.
+    Shared by the local preview route and the remote-render endpoint."""
     if not seq:
-        return jsonify({'error': 'No sequence specified'}), 400
+        return None, ('No sequence specified', 400)
     if width <= 0 or height <= 0:
-        # The page sends width/height from hidden inputs that are 0 when the model
-        # dims were resolved server-side but never written back to the form. Resolve
-        # the model's real pixel size (fetched live from FPP and cached) before 400ing.
-        rw, rh = _overlay_model_dims()
-        width  = width  if width  > 0 else rw
-        height = height if height > 0 else rh
-    if width <= 0 or height <= 0:
-        return jsonify({'error': 'Overlay model dimensions unknown - select a model first'}), 400
-
+        return None, ('Overlay model dimensions unknown - select a model first', 400)
     name = seq.removeprefix('seq:').removesuffix('.fseq')
     name = os.path.basename(name)   # no path traversal - keep filename only
     filepath = os.path.join(FSEQ_SEQUENCE_PATH, name + '.fseq')
     if not os.path.exists(filepath):
-        return jsonify({'error': f'Sequence not found: {name}.fseq'}), 404
+        return None, (f'Sequence not found: {name}.fseq', 404)
 
-    # Determine start channel and channel count from FPP model info
     if start_ch_override:
         start_ch_1 = int(start_ch_override)
         ch_count   = int(ch_count_override) if ch_count_override else width * height * 3
@@ -10737,123 +10816,141 @@ def fseq_frame():
         ch_count = ch_count_fpp if ch_count_fpp else width * height * 3
 
     if not start_ch_1:
-        # Overlay models that render on top of a matrix report StartChannel 0, and
-        # some models can't be resolved at all. Rather than failing the preview with
-        # a 400, assume a model-specific / zero-based export and read from the first
-        # channel (frame byte 0). A full-layout export may be offset, but a
-        # best-effort preview beats a hard error.
+        # Overlay-on-matrix models report StartChannel 0, and some can't be resolved;
+        # read from channel 1 rather than failing the preview outright.
         start_ch_1 = 1
-        logging.info(
-            f"FSEQ preview: start channel for model '{model_name}' unknown/zero; "
-            "defaulting to channel 1 (frame byte 0)"
-        )
 
-    try:
-        hdr          = parse_fseq_header(filepath)
-        frame_idx    = min(frame_idx, hdr['frame_count'] - 1)
-        start_ch     = start_ch_1 - 1   # convert to 0-indexed
-        num_pixels   = width * height
-        # bytes_per_pixel: 3 for RGB, 4 for RGBW - derived from actual channel count
-        bpp          = max(3, ch_count // num_pixels) if num_pixels > 0 else 3
+    hdr        = parse_fseq_header(filepath)
+    frame_idx  = min(max(0, frame_idx), hdr['frame_count'] - 1)
+    start_ch   = start_ch_1 - 1   # 0-indexed
+    num_pixels = width * height
+    bpp        = max(3, ch_count // num_pixels) if num_pixels > 0 else 3
+    raw        = read_fseq_frame(hdr, frame_idx, start_ch, ch_count)
 
-        raw = read_fseq_frame(hdr, frame_idx, start_ch, ch_count)
+    img = Image.new('RGB', (width, height))
+    pixels = []
+    for i in range(num_pixels):
+        b = i * bpp
+        if b + 2 < len(raw):
+            pixels.append((raw[b], raw[b + 1], raw[b + 2]))
+        else:
+            pixels.append((0, 0, 0))
+    img.putdata(pixels)
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    return buf.getvalue(), None
 
-        logging.info(
-            f"FSEQ preview: model={model_name} start_ch={start_ch_1} "
-            f"ch_count={ch_count} bpp={bpp} frame={frame_idx} "
-            f"first_px=({raw[0] if raw else '?'},{raw[1] if len(raw)>1 else '?'},"
-            f"{raw[2] if len(raw)>2 else '?'})"
-        )
 
-        img = Image.new('RGB', (width, height))
-        pixels = []
-        for i in range(num_pixels):
-            b = i * bpp
-            if b + 2 < len(raw):
-                pixels.append((raw[b], raw[b + 1], raw[b + 2]))
+def _render_media_png(media_type, filename, time_sec, width, height):
+    """Render an image/video frame to PNG bytes, resized to width x height. Returns
+    (png_bytes, None) or (None, (error_message, http_status))."""
+    if media_type not in ('img', 'vid') or not filename:
+        return None, ('Requires type=img|vid and a file', 400)
+    if width <= 0 or height <= 0:
+        return None, ('Overlay model dimensions unknown - select a model first', 400)
+    filename = os.path.basename(filename)   # no path traversal
+    if media_type == 'img':
+        img_path = os.path.join(FPP_IMAGES_PATH, filename)
+        if not os.path.exists(img_path):
+            return None, (f'Image not found: {filename}', 404)
+        img = Image.open(img_path).convert('RGB').resize((width, height), Image.LANCZOS)
+    else:  # vid
+        vid_path = os.path.join(FPP_VIDEOS_PATH, filename)
+        if not os.path.exists(vid_path):
+            return None, (f'Video not found: {filename}', 404)
+        import subprocess as _sp
+        try:
+            result = _sp.run(['ffmpeg', '-ss', str(time_sec), '-i', vid_path,
+                              '-vframes', '1', '-f', 'image2pipe', '-vcodec', 'png', '-'],
+                             capture_output=True, timeout=10)
+            if result.returncode == 0 and result.stdout:
+                img = Image.open(io.BytesIO(result.stdout)).convert('RGB').resize((width, height), Image.LANCZOS)
             else:
-                pixels.append((0, 0, 0))
-        img.putdata(pixels)
+                img = Image.new('RGB', (width, height), (32, 32, 32))
+        except (FileNotFoundError, _sp.TimeoutExpired):
+            img = Image.new('RGB', (width, height), (32, 32, 32))
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    return buf.getvalue(), None
 
-        buf = io.BytesIO()
-        img.save(buf, format='PNG')
-        buf.seek(0)
-        return Response(buf.read(), mimetype='image/png',
-                        headers={'Cache-Control': 'no-store'})
+
+@app.route('/api/fseq/frame')
+def fseq_frame():
+    """Return a single FSEQ frame as a PNG image for the canvas background preview."""
+    if not PIL_AVAILABLE:
+        return jsonify({'error': 'Pillow not installed - run fpp_install.sh'}), 503
+    seq        = request.args.get('sequence', '').strip()
+    frame_idx  = max(0, int(request.args.get('frame', 0)))
+    model_name = request.args.get('model', config.get('overlay_model_name', ''))
+    width      = int(request.args.get('width',  config.get('overlay_model_width',  0)))
+    height     = int(request.args.get('height', config.get('overlay_model_height', 0)))
+    if width <= 0 or height <= 0:
+        rw, rh = _overlay_model_dims()   # resolve the model's real size live if the form sent 0
+        width  = width  if width  > 0 else rw
+        height = height if height > 0 else rh
+    try:
+        png, err = _render_fseq_frame_png(seq, frame_idx, model_name, width, height,
+                                          request.args.get('start_channel', '').strip(),
+                                          request.args.get('channel_count', '').strip())
+        if err:
+            return jsonify({'error': err[0]}), err[1]
+        return Response(png, mimetype='image/png', headers={'Cache-Control': 'no-store'})
     except Exception as e:
         logging.error(f"FSEQ frame error: {e}")
         return _client_error("fseq_frame", e, 500)
 
+
 @app.route('/api/media/preview')
 def media_preview():
-    """Return a canvas-preview PNG for an image or video file.
-    ?type=img&file=filename.jpg - resize image to model dims and return as PNG.
-    ?type=vid&file=filename.mp4&time=0 - extract a frame at `time` seconds via ffmpeg,
-        resize to model dims, return as PNG.  Falls back to a black frame if ffmpeg
-        is unavailable or extraction fails."""
+    """Return a canvas-preview PNG for an image or video file, resized to the model dims."""
     if not PIL_AVAILABLE:
         return jsonify({'error': 'Pillow not installed - run fpp_install.sh'}), 503
-
-    media_type = request.args.get('type', '').strip()   # 'img' or 'vid'
+    media_type = request.args.get('type', '').strip()
     filename   = request.args.get('file', '').strip()
     time_sec   = max(0.0, float(request.args.get('time', 0)))
     width  = int(request.args.get('width',  config.get('overlay_model_width',  0)))
     height = int(request.args.get('height', config.get('overlay_model_height', 0)))
-
-    if not filename or media_type not in ('img', 'vid'):
-        return jsonify({'error': 'Requires ?type=img|vid&file=filename'}), 400
     if width <= 0 or height <= 0:
-        # Fall back to the model's real size when the page's hidden inputs are 0
-        # (same reason as /api/fseq/frame).
         rw, rh = _overlay_model_dims()
         width  = width  if width  > 0 else rw
         height = height if height > 0 else rh
-    if width <= 0 or height <= 0:
-        return jsonify({'error': 'Overlay model dimensions unknown - select a model first'}), 400
-
-    # Security: no path traversal - strip all directory components
-    filename = os.path.basename(filename)
-
     try:
-        if media_type == 'img':
-            img_path = os.path.join(FPP_IMAGES_PATH, filename)
-            if not os.path.exists(img_path):
-                return jsonify({'error': f'Image not found: {filename}'}), 404
-            img = Image.open(img_path).convert('RGB')
-            img = img.resize((width, height), Image.LANCZOS)
-
-        else:  # vid
-            vid_path = os.path.join(FPP_VIDEOS_PATH, filename)
-            if not os.path.exists(vid_path):
-                return jsonify({'error': f'Video not found: {filename}'}), 404
-            # Try ffmpeg to extract a single frame at the requested timestamp
-            import subprocess as _sp
-            try:
-                result = _sp.run(
-                    [
-                        'ffmpeg', '-ss', str(time_sec), '-i', vid_path,
-                        '-vframes', '1', '-f', 'image2pipe',
-                        '-vcodec', 'png', '-'
-                    ],
-                    capture_output=True, timeout=10
-                )
-                if result.returncode == 0 and result.stdout:
-                    img = Image.open(io.BytesIO(result.stdout)).convert('RGB')
-                    img = img.resize((width, height), Image.LANCZOS)
-                else:
-                    # ffmpeg failed - return a dark grey placeholder
-                    img = Image.new('RGB', (width, height), (32, 32, 32))
-            except (FileNotFoundError, _sp.TimeoutExpired):
-                # ffmpeg not installed on this system - return placeholder
-                img = Image.new('RGB', (width, height), (32, 32, 32))
-
-        buf = io.BytesIO()
-        img.save(buf, format='PNG')
-        buf.seek(0)
-        return Response(buf.read(), mimetype='image/png',
-                        headers={'Cache-Control': 'no-store'})
+        png, err = _render_media_png(media_type, filename, time_sec, width, height)
+        if err:
+            return jsonify({'error': err[0]}), err[1]
+        return Response(png, mimetype='image/png', headers={'Cache-Control': 'no-store'})
     except Exception as e:
         return _client_error("media_preview", e, 500)
+
+
+@app.route('/api/tml/render-frame')
+def api_tml_render_frame():
+    """Render a background preview frame for the given content id using THIS box's OWN overlay
+    model + dimensions, returned as PNG. Lets a master mirror what this projector will show.
+    Trusted-peer accessible (no token) - gated by the before_request MultiSync peer allowlist."""
+    if not PIL_AVAILABLE:
+        return jsonify({'error': 'Pillow not installed'}), 503
+    content   = request.args.get('content', '').strip()
+    frame_idx = max(0, int(request.args.get('frame', 0) or 0))
+    time_sec  = max(0.0, float(request.args.get('time', 0) or 0))
+    model     = config.get('overlay_model_name', '') or ''
+    width, height = _overlay_model_dims()
+    if width <= 0 or height <= 0:
+        return jsonify({'error': 'This box has no overlay model dimensions'}), 400
+    try:
+        if content.startswith('seq:'):
+            png, err = _render_fseq_frame_png(content, frame_idx, model, width, height)
+        elif content.startswith('img:'):
+            png, err = _render_media_png('img', content[4:], 0, width, height)
+        elif content.startswith('vid:'):
+            png, err = _render_media_png('vid', content[4:], time_sec, width, height)
+        else:
+            return jsonify({'error': 'Unsupported content type'}), 400
+        if err:
+            return jsonify({'error': err[0]}), err[1]
+        return Response(png, mimetype='image/png', headers={'Cache-Control': 'no-store'})
+    except Exception as e:
+        return _client_error("api_tml_render_frame", e, 500)
 
 
 @app.route('/api/test')
@@ -12408,11 +12505,16 @@ def view_messages():
 
 @app.route('/api/tml/ping', methods=['GET'])
 def api_tml_ping():
-    """Identify this instance to a discovering peer: plugin name + effective role, plus a
-    friendly name and source number so a remote can tell multiple masters apart. A master
-    pushes only to peers that answer here with role == 'remote'."""
+    """Identify this instance to a discovering peer: plugin name + effective role, a friendly
+    name and source number (so a remote can tell masters apart), this box's overlay model size,
+    and - for a remote - whether the CALLER is the master it is pinned to (so a master can limit
+    the preview to remotes actually synced to it). A master pushes only to role == 'remote' peers."""
+    mw, mh = _overlay_model_dims()
     return jsonify({"plugin": "textmylights", "role": get_plugin_role(),
-                    "name": _instance_label(), "phone": _instance_phone_label()})
+                    "name": _instance_label(), "phone": _instance_phone_label(),
+                    "model_w": mw, "model_h": mh,
+                    "overlay_model": config.get('overlay_model_name', '') or '',
+                    "synced_to_caller": bool(is_remote() and _push_from_selected_master())})
 
 
 @app.route('/api/tml/remotes', methods=['GET'])
@@ -12427,6 +12529,30 @@ def api_tml_remotes():
     details = discover_remotes_detailed(force=request.args.get('force') == '1')
     return jsonify({"role": "master", "remotes": details, "count": len(details),
                     "overlay_model": config.get('overlay_model_name', '') or ''})
+
+
+@app.route('/api/tml/remote-frame', methods=['GET'])
+def api_tml_remote_frame():
+    """Master (browser-facing): proxy a background frame rendered by one of THIS master's synced
+    remotes, using that remote's overlay model, so the master can preview what that projector will
+    show. The master reaches the remote as a trusted MultiSync peer; the browser can't (cross-origin
+    + the remote's token). The remote address is validated against the synced-remote list (no SSRF)."""
+    if is_remote():
+        return jsonify({"error": "not a master"}), 409
+    addr = request.args.get('remote', '').strip()
+    base = next((r['base'] for r in discover_remotes_detailed() if r['address'] == addr), None)
+    if not base:
+        return jsonify({"error": "unknown or not-synced remote"}), 404
+    params = {k: request.args.get(k) for k in ('content', 'frame', 'time')
+              if request.args.get(k) is not None}
+    try:
+        r = requests.get(f"{base}/api/tml/render-frame", params=params, timeout=8)
+        if r.status_code != 200:
+            return jsonify({"error": f"remote render failed ({r.status_code})"}), 502
+        return Response(r.content, mimetype=r.headers.get('Content-Type', 'image/png'),
+                        headers={'Cache-Control': 'no-store'})
+    except Exception as e:
+        return _client_error("api_tml_remote_frame", e, 502)
 
 
 @app.route('/api/tml/content-list', methods=['GET'])

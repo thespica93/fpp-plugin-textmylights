@@ -16,6 +16,23 @@ function tml_shot($file, $alt) {
     return '<img class="shot" src="data:image/png;base64,' . $data . '" alt="'
          . htmlspecialchars($alt, ENT_QUOTES) . '">';
 }
+
+// FPP's UI theme, read server-side (see ui.php) - 'light'/'dark' or '' for System/unknown.
+function tml_fpp_theme_help() {
+    $raw = '';
+    if (isset($GLOBALS['settings']['Theme']))      $raw = $GLOBALS['settings']['Theme'];
+    if ($raw === '' && is_readable('/home/fpp/media/settings')) {
+        foreach (file('/home/fpp/media/settings', FILE_IGNORE_NEW_LINES) as $line) {
+            if (preg_match('/^\s*Theme\s*=\s*"?([^"]*)"?\s*$/i', $line, $m)) { $raw = $m[1]; break; }
+        }
+    }
+    if ($raw === '' && isset($_COOKIE['fppTheme'])) $raw = $_COOKIE['fppTheme'];
+    $r = strtolower(trim($raw));
+    if (strpos($r, 'dark')  !== false) return 'dark';
+    if (strpos($r, 'light') !== false) return 'light';
+    return '';
+}
+$fppTheme = tml_fpp_theme_help();
 ?>
 <style>
     .sms-help { max-width: 1100px; margin: 0 auto; font-family: Arial, sans-serif; line-height: 1.5; }
@@ -333,7 +350,9 @@ function tml_shot($file, $alt) {
         if (!(a > 0.1)) return null;
         return 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
     }
+    var TML_FPP_THEME = <?php echo json_encode($fppTheme); ?>;
     function detect() {
+        if (TML_FPP_THEME === 'dark' || TML_FPP_THEME === 'light') return TML_FPP_THEME;
         // Background (body→html) if opaque, else text color (light text => dark theme), else OS pref.
         try {
             var bg = lumOf(getComputedStyle(document.body).backgroundColor);

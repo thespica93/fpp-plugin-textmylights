@@ -8804,6 +8804,7 @@ def index():
                     _contentType = ct.type;
                     _contentFile = ct.file;
                     _fseqSeq     = (ct.type === 'seq') ? ct.file : null;
+                    window._previewAssumedSize = false;   // reset; set true only in the no-model branch
 
                     var loadEl = document.getElementById('fseq_load_status');
                     var scrubHint = document.getElementById('fseq_scrub_hint');
@@ -8818,12 +8819,28 @@ def index():
                     // the live background returns once a model is selected.)
                     if (!((document.getElementById('overlay_model_name') || {}).value || '')) {
                         window._fseqBgImage = null;
+                        window._previewAssumedSize = true;
                         loadEl.innerHTML = '\u26a0 No overlay model selected \u2014 preview shown at an assumed 16:9 size (480\u00d7270). '
                                          + 'Select an overlay model for an exact-size preview with the live background.';
                         loadEl.style.color = '#ff9800';
-                        if (scrubHint) scrubHint.style.display = 'none';
-                        var _sr = document.getElementById('fseq_scrubber_row');
-                        if (_sr) _sr.style.display = 'none';
+                        if (ct.type === 'img') {
+                            // Static image: no scrubber (nothing to scrub through).
+                            if (scrubHint) scrubHint.style.display = 'none';
+                            var _sr = document.getElementById('fseq_scrubber_row');
+                            if (_sr) _sr.style.display = 'none';
+                        } else {
+                            // seq / video: keep the scrubber so the scrolling-text preview still
+                            // works across the duration window - just with no background image
+                            // (we have no model dims to render one).
+                            if (scrubHint) scrubHint.style.display = '';
+                            var _cap = Math.max(1, _previewCapSeconds());
+                            var _sc = document.getElementById('fseq_scrubber');
+                            _sc.max = _cap; _sc.value = 0; window._scrubSeconds = 0;
+                            document.getElementById('fseq_scrubber_row').style.display = '';
+                            document.getElementById('fseq_time_display').textContent = '0:00 / ' + fmtTime(_cap * 1000);
+                            var _st = document.getElementById('fseq_status');
+                            if (_st) _st.textContent = 'Scrub to preview scrolling text (no background - select an overlay model for the live background)';
+                        }
                         if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
                         return;
                     }
@@ -8972,6 +8989,14 @@ def index():
                     window._scrubSeconds = parseFloat(seconds) || 0;
                     if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
                     var loadEl = document.getElementById('fseq_load_status');
+                    if (window._previewAssumedSize) {
+                        // No overlay model → no background frame to fetch; just move the readout
+                        // along the duration window while the scroll preview updates above.
+                        var _cap = Math.max(1, _previewCapSeconds());
+                        document.getElementById('fseq_time_display').textContent =
+                            fmtTime(parseInt(seconds) * 1000) + ' / ' + fmtTime(_cap * 1000);
+                        return;
+                    }
                     if (_contentType === 'seq') {
                         if (!_fseqMeta) return;
                         document.getElementById('fseq_time_display').textContent =

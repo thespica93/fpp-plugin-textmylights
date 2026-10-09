@@ -5,7 +5,30 @@ $host = preg_replace('/:\d+$/', '', $_SERVER['HTTP_HOST']);
 // FPP's own web server, so only someone who can reach the FPP UI gets the token.
 $tokenFile = "/home/fpp/media/plugin.fpp-textmylights/.access_token";
 $token = is_readable($tokenFile) ? trim(file_get_contents($tokenFile)) : "";
+
+// Read FPP's own UI theme server-side (this PHP runs inside FPP) so the plugin, which
+// lives in a cross-origin iframe and can't see FPP's CSS, matches it exactly - 'light',
+// 'dark', or '' for System/unknown (then the iframe follows the OS preference). Checked
+// via FPP's $settings global, then the settings file, then a theme cookie.
+function tml_fpp_theme() {
+    $raw = '';
+    if (isset($GLOBALS['settings']['Theme']))      $raw = $GLOBALS['settings']['Theme'];
+    if ($raw === '' && is_readable('/home/fpp/media/settings')) {
+        foreach (file('/home/fpp/media/settings', FILE_IGNORE_NEW_LINES) as $line) {
+            if (preg_match('/^\s*Theme\s*=\s*"?([^"]*)"?\s*$/i', $line, $m)) { $raw = $m[1]; break; }
+        }
+    }
+    if ($raw === '' && isset($_COOKIE['fppTheme'])) $raw = $_COOKIE['fppTheme'];
+    $r = strtolower(trim($raw));
+    if (strpos($r, 'dark')  !== false) return 'dark';
+    if (strpos($r, 'light') !== false) return 'light';
+    return '';
+}
+$fppTheme  = tml_fpp_theme();
 $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($token) : "");
+if ($fppTheme !== "") {
+    $pluginUrl .= ($token !== "" ? "&" : "?") . "theme=" . $fppTheme;
+}
 ?>
 <style>
     #sms-plugin-frame {
@@ -113,8 +136,12 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
         if (!(a > 0.1)) return null;
         return 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
     }
+    // FPP's theme as read server-side ('light'/'dark', or '' for System/unknown).
+    var TML_FPP_THEME = <?php echo json_encode($fppTheme); ?>;
     function tmlDetectTheme() {
-        // Judge FPP's theme without depending on its internal class names:
+        // Authoritative: FPP's actual setting when it's an explicit light/dark.
+        if (TML_FPP_THEME === 'dark' || TML_FPP_THEME === 'light') return TML_FPP_THEME;
+        // System/unknown → infer from the FPP page without depending on its class names:
         //  1) a non-transparent page background (body, then <html>) - dark bg => dark theme;
         //  2) else the TEXT color, which the theme always sets even when backgrounds are
         //     transparent - light text => dark theme (inverted);

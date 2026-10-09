@@ -3,7 +3,27 @@ $host = preg_replace('/:\d+$/', '', $_SERVER['HTTP_HOST']);
 // Pass the plugin's network access token to the iframe (see ui.php for details).
 $tokenFile = "/home/fpp/media/plugin.fpp-textmylights/.access_token";
 $token = is_readable($tokenFile) ? trim(file_get_contents($tokenFile)) : "";
+
+// Match FPP's UI theme (read server-side; see ui.php) - 'light'/'dark', or '' for System.
+function tml_fpp_theme_msg() {
+    $raw = '';
+    if (isset($GLOBALS['settings']['Theme']))      $raw = $GLOBALS['settings']['Theme'];
+    if ($raw === '' && is_readable('/home/fpp/media/settings')) {
+        foreach (file('/home/fpp/media/settings', FILE_IGNORE_NEW_LINES) as $line) {
+            if (preg_match('/^\s*Theme\s*=\s*"?([^"]*)"?\s*$/i', $line, $m)) { $raw = $m[1]; break; }
+        }
+    }
+    if ($raw === '' && isset($_COOKIE['fppTheme'])) $raw = $_COOKIE['fppTheme'];
+    $r = strtolower(trim($raw));
+    if (strpos($r, 'dark')  !== false) return 'dark';
+    if (strpos($r, 'light') !== false) return 'light';
+    return '';
+}
+$fppTheme  = tml_fpp_theme_msg();
 $pluginUrl = "http://$host:5000/messages" . ($token !== "" ? "?token=" . urlencode($token) : "");
+if ($fppTheme !== "") {
+    $pluginUrl .= ($token !== "" ? "&" : "?") . "theme=" . $fppTheme;
+}
 ?>
 <style>
     #sms-messages-frame {
@@ -31,7 +51,9 @@ $pluginUrl = "http://$host:5000/messages" . ($token !== "" ? "?token=" . urlenco
         if (!(a > 0.1)) return null;
         return 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
     }
+    var TML_FPP_THEME = <?php echo json_encode($fppTheme); ?>;
     function tmlMsgDetectTheme() {
+        if (TML_FPP_THEME === 'dark' || TML_FPP_THEME === 'light') return TML_FPP_THEME;
         // Background (body→html) if opaque, else text color (light text => dark theme), else OS pref.
         try {
             var bg = tmlMsgLum(getComputedStyle(document.body).backgroundColor);

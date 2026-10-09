@@ -8819,19 +8819,17 @@ def index():
                     // the live background returns once a model is selected.)
                     if (!((document.getElementById('overlay_model_name') || {}).value || '')) {
                         window._fseqBgImage = null;
-                        window._previewAssumedSize = true;
-                        loadEl.innerHTML = '\u26a0 No overlay model selected \u2014 preview shown at an assumed 16:9 size (480\u00d7270). '
-                                         + 'Select an overlay model for an exact-size preview with the live background.';
+                        // Only FSEQ truly needs the model (to map channels \u2192 pixels). Images and
+                        // videos just get resized server-side, so they can still render at the
+                        // assumed size. The flag below tells the scrubber to skip the background
+                        // fetch for FSEQ only (text-scroll preview), not for video.
+                        window._previewAssumedSize = (ct.type === 'seq');
+                        loadEl.innerHTML = '\u26a0 No overlay model selected \u2014 preview at an assumed 16:9 size (480\u00d7270). '
+                                         + 'Select an overlay model for an exact-size, channel-accurate preview.';
                         loadEl.style.color = '#ff9800';
-                        if (ct.type === 'img') {
-                            // Static image: no scrubber (nothing to scrub through).
-                            if (scrubHint) scrubHint.style.display = 'none';
-                            var _sr = document.getElementById('fseq_scrubber_row');
-                            if (_sr) _sr.style.display = 'none';
-                        } else {
-                            // seq / video: keep the scrubber so the scrolling-text preview still
-                            // works across the duration window - just with no background image
-                            // (we have no model dims to render one).
+                        if (ct.type === 'seq') {
+                            // Can't render FSEQ pixels without the model's channel map \u2192 show the
+                            // text layout on black, with the scrubber driving the scroll preview.
                             if (scrubHint) scrubHint.style.display = '';
                             var _cap = Math.max(1, _previewCapSeconds());
                             var _sc = document.getElementById('fseq_scrubber');
@@ -8839,7 +8837,22 @@ def index():
                             document.getElementById('fseq_scrubber_row').style.display = '';
                             document.getElementById('fseq_time_display').textContent = '0:00 / ' + fmtTime(_cap * 1000);
                             var _st = document.getElementById('fseq_status');
-                            if (_st) _st.textContent = 'Scrub to preview scrolling text (no background - select an overlay model for the live background)';
+                            if (_st) _st.textContent = 'Text preview only \u2014 select an overlay model to preview the sequence background';
+                        } else if (ct.type === 'vid') {
+                            // Video frames resize fine without a model - show them + scrubber.
+                            if (scrubHint) scrubHint.style.display = '';
+                            var _cap2 = Math.max(1, _previewCapSeconds());
+                            var _sc2 = document.getElementById('fseq_scrubber');
+                            _sc2.max = _cap2; _sc2.value = 0; window._scrubSeconds = 0;
+                            document.getElementById('fseq_scrubber_row').style.display = '';
+                            document.getElementById('fseq_time_display').textContent = '0:00';
+                            doMediaFetch(0);
+                        } else {
+                            // Image - render once at the assumed size, no scrubber.
+                            if (scrubHint) scrubHint.style.display = 'none';
+                            document.getElementById('fseq_scrubber_row').style.display = 'none';
+                            window._scrubSeconds = 0;
+                            doMediaFetch(0);
                         }
                         if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
                         return;
@@ -8947,8 +8960,10 @@ def index():
 
                 function doMediaFetch(seconds) {
                     if (!_contentType || !_contentFile || _contentType === 'seq') return;
-                    var mw = document.getElementById('overlay_model_width').value  || 0;
-                    var mh = document.getElementById('overlay_model_height').value || 0;
+                    // Images/videos just get resized to these dims server-side (no model needed),
+                    // so when no overlay model is set, fall back to the assumed 16:9 preview size.
+                    var mw = parseInt(document.getElementById('overlay_model_width').value)  || window._canvasModelW || 480;
+                    var mh = parseInt(document.getElementById('overlay_model_height').value) || window._canvasModelH || 270;
                     var url = '/api/media/preview'
                         + '?type='   + _contentType
                         + '&file='   + encodeURIComponent(_contentFile)

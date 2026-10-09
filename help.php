@@ -20,11 +20,12 @@ function tml_shot($file, $alt) {
 // FPP's UI theme, read server-side (see ui.php) - 'light'/'dark' or '' for System/unknown.
 function tml_fpp_theme_help() {
     $raw = '';
-    if (isset($GLOBALS['settings']['Theme']))      $raw = $GLOBALS['settings']['Theme'];
+    if (isset($GLOBALS['settings']['themeOverride'])) $raw = $GLOBALS['settings']['themeOverride'];
+    if ($raw === '' && isset($GLOBALS['settings']['Theme'])) $raw = $GLOBALS['settings']['Theme'];
     if ($raw === '' && is_readable('/home/fpp/media/settings')) {
-        foreach (file('/home/fpp/media/settings', FILE_IGNORE_NEW_LINES) as $line) {
-            if (preg_match('/^\s*Theme\s*=\s*"?([^"]*)"?\s*$/i', $line, $m)) { $raw = $m[1]; break; }
-        }
+        $lines = file('/home/fpp/media/settings', FILE_IGNORE_NEW_LINES);
+        foreach ($lines as $line) { if (preg_match('/^\s*themeOverride\s*=\s*"?([^"]*)"?\s*$/i', $line, $m)) { $raw = $m[1]; break; } }
+        if ($raw === '') { foreach ($lines as $line) { if (preg_match('/^\s*Theme\s*=\s*"?([^"]*)"?\s*$/i', $line, $m)) { $raw = $m[1]; break; } } }
     }
     if ($raw === '' && isset($_COOKIE['fppTheme'])) $raw = $_COOKIE['fppTheme'];
     $r = strtolower(trim($raw));

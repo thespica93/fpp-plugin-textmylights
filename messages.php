@@ -23,16 +23,24 @@ $pluginUrl = "http://$host:5000/messages" . ($token !== "" ? "?token=" . urlenco
 
     // Match the cross-origin plugin iframe to FPP's theme (same approach as ui.php): judge it
     // from FPP's page-background luminance and forward it to the iframe, which applies it.
-    function tmlMsgDetectTheme() {
+    function tmlMsgThemeFromEl(el) {
         try {
-            var bg = getComputedStyle(document.body).backgroundColor || '';
-            var m = bg.match(/\d+/g);
-            if (m && m.length >= 3) {
-                var lum = 0.299 * (+m[0]) + 0.587 * (+m[1]) + 0.114 * (+m[2]);
-                return lum < 128 ? 'dark' : 'light';
-            }
-        } catch (e) {}
-        return (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+            var bg = getComputedStyle(el).backgroundColor || '';
+            var m = bg.match(/rgba?\(([^)]+)\)/i);
+            if (!m) return null;
+            var p = m[1].split(',').map(function (s) { return parseFloat(s); });
+            var a = p.length > 3 ? p[3] : 1;
+            if (!(a > 0.1)) return null;
+            var lum = 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
+            return lum < 128 ? 'dark' : 'light';
+        } catch (e) { return null; }
+    }
+    function tmlMsgDetectTheme() {
+        // Skip transparent backgrounds (which read as black and stuck us on dark); fall back to
+        // the browser preference, which is what FPP's "system default" follows.
+        return tmlMsgThemeFromEl(document.body)
+            || tmlMsgThemeFromEl(document.documentElement)
+            || ((window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light');
     }
     var _tmlMsgLastTheme = null;
     function tmlSendMsgTheme() {

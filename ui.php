@@ -104,16 +104,27 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
     // own theme. We judge the theme from the luminance of FPP's page background - robust to
     // whatever class names/CSS vars the installed FPP theme uses - and forward it to the iframe,
     // which applies it. Falls back to the browser preference if the background can't be read.
-    function tmlDetectTheme() {
+    function tmlThemeFromEl(el) {
+        // Returns 'dark'/'light' from an element's background, or null if transparent/unreadable.
         try {
-            var bg = getComputedStyle(document.body).backgroundColor || '';
-            var m = bg.match(/\d+/g);
-            if (m && m.length >= 3) {
-                var lum = 0.299 * (+m[0]) + 0.587 * (+m[1]) + 0.114 * (+m[2]);
-                return lum < 128 ? 'dark' : 'light';
-            }
-        } catch (e) {}
-        return (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+            var bg = getComputedStyle(el).backgroundColor || '';
+            var m = bg.match(/rgba?\(([^)]+)\)/i);
+            if (!m) return null;
+            var p = m[1].split(',').map(function (s) { return parseFloat(s); });
+            var a = p.length > 3 ? p[3] : 1;
+            if (!(a > 0.1)) return null;           // transparent → can't judge from this element
+            var lum = 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
+            return lum < 128 ? 'dark' : 'light';
+        } catch (e) { return null; }
+    }
+    function tmlDetectTheme() {
+        // Judge FPP's theme from the first element with an actual (non-transparent) background -
+        // body, then <html>. A transparent background reads as rgba(0,0,0,0); treating that as
+        // black made the plugin stick on dark even when FPP was light, so skip it and fall back
+        // to the OS/browser preference (what FPP's "system default" follows anyway).
+        return tmlThemeFromEl(document.body)
+            || tmlThemeFromEl(document.documentElement)
+            || ((window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light');
     }
     var _tmlLastTheme = null;
     function tmlSendTheme() {

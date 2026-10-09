@@ -325,16 +325,23 @@ function tml_shot($file, $alt) {
 (function () {
     var el = document.querySelector('.sms-help');
     if (!el) return;
-    function detect() {
+    function fromEl(e2) {
         try {
-            var bg = getComputedStyle(document.body).backgroundColor || '';
-            var m = bg.match(/\d+/g);
-            if (m && m.length >= 3) {
-                var lum = 0.299 * (+m[0]) + 0.587 * (+m[1]) + 0.114 * (+m[2]);
-                return lum < 128 ? 'dark' : 'light';
-            }
-        } catch (e) {}
-        return (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+            var bg = getComputedStyle(e2).backgroundColor || '';
+            var m = bg.match(/rgba?\(([^)]+)\)/i);
+            if (!m) return null;
+            var p = m[1].split(',').map(function (s) { return parseFloat(s); });
+            var a = p.length > 3 ? p[3] : 1;
+            if (!(a > 0.1)) return null;
+            var lum = 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
+            return lum < 128 ? 'dark' : 'light';
+        } catch (e) { return null; }
+    }
+    function detect() {
+        // Skip transparent backgrounds (read as black → wrongly dark); fall back to browser pref.
+        return fromEl(document.body)
+            || fromEl(document.documentElement)
+            || ((window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light');
     }
     function apply() { el.classList.toggle('tml-dark', detect() === 'dark'); }
     apply();

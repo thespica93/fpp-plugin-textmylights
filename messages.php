@@ -18,7 +18,33 @@ $pluginUrl = "http://$host:5000/messages" . ($token !== "" ? "?token=" . urlenco
 <script>
     document.getElementById('sms-messages-frame').addEventListener('load', function() {
         window.scrollTo(0, 0);
+        tmlSendMsgTheme();   // match the plugin page to FPP's theme on load
     });
+
+    // Match the cross-origin plugin iframe to FPP's theme (same approach as ui.php): judge it
+    // from FPP's page-background luminance and forward it to the iframe, which applies it.
+    function tmlMsgDetectTheme() {
+        try {
+            var bg = getComputedStyle(document.body).backgroundColor || '';
+            var m = bg.match(/\d+/g);
+            if (m && m.length >= 3) {
+                var lum = 0.299 * (+m[0]) + 0.587 * (+m[1]) + 0.114 * (+m[2]);
+                return lum < 128 ? 'dark' : 'light';
+            }
+        } catch (e) {}
+        return (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+    }
+    var _tmlMsgLastTheme = null;
+    function tmlSendMsgTheme() {
+        var t = tmlMsgDetectTheme();
+        _tmlMsgLastTheme = t;
+        try { document.getElementById('sms-messages-frame').contentWindow.postMessage({ type: 'tml_theme', theme: t }, '*'); } catch (e) {}
+    }
+    setInterval(function () {
+        var t = tmlMsgDetectTheme();
+        if (t !== _tmlMsgLastTheme) tmlSendMsgTheme();
+    }, 1500);
+
     window.addEventListener('message', function(e) {
         if (e.data && e.data.type === 'iframeHeight') {
             document.getElementById('sms-messages-frame').style.height = (e.data.height + 20) + 'px';

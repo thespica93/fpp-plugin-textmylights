@@ -30,6 +30,12 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
     }
     .tml-modal h3 { margin: 0 0 6px; color: #333; font-size: 20px; }
     .tml-modal .tml-sub { font-size: 13px; color: #555; margin: 0 0 14px; }
+    /* Dark theme (set via the .tml-dark class from tmlDetectTheme) to match FPP. */
+    .tml-modal.tml-dark .tml-card { background: #262a31; color: #e6e6e6; box-shadow: 0 8px 30px rgba(0,0,0,0.6); }
+    .tml-modal.tml-dark h3 { color: #e6e6e6; }
+    .tml-modal.tml-dark .tml-sub { color: #a0a6b0; }
+    .tml-modal.tml-dark .tml-opt .tml-desc { color: #9098a4; }
+    .tml-modal.tml-dark .tml-status { color: #a0a6b0; }
     .tml-modal label.tml-opt {
         display: flex; gap: 10px; align-items: flex-start; margin: 0 0 14px; cursor: pointer;
     }
@@ -90,8 +96,36 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
 <script>
     document.getElementById('sms-plugin-frame').addEventListener('load', function() {
         window.scrollTo(0, 0);
+        tmlSendTheme();   // tell the plugin which theme to use as soon as it loads
     });
     function tmlFrame() { return document.getElementById('sms-plugin-frame').contentWindow; }
+
+    // Match the plugin (served cross-origin in the iframe, so it can't read FPP's CSS) to FPP's
+    // own theme. We judge the theme from the luminance of FPP's page background - robust to
+    // whatever class names/CSS vars the installed FPP theme uses - and forward it to the iframe,
+    // which applies it. Falls back to the browser preference if the background can't be read.
+    function tmlDetectTheme() {
+        try {
+            var bg = getComputedStyle(document.body).backgroundColor || '';
+            var m = bg.match(/\d+/g);
+            if (m && m.length >= 3) {
+                var lum = 0.299 * (+m[0]) + 0.587 * (+m[1]) + 0.114 * (+m[2]);
+                return lum < 128 ? 'dark' : 'light';
+            }
+        } catch (e) {}
+        return (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+    }
+    var _tmlLastTheme = null;
+    function tmlSendTheme() {
+        var t = tmlDetectTheme();
+        _tmlLastTheme = t;
+        try { tmlFrame().postMessage({ type: 'tml_theme', theme: t }, '*'); } catch (e) {}
+    }
+    // Re-forward if the user toggles FPP's theme while the page is open.
+    setInterval(function () {
+        var t = tmlDetectTheme();
+        if (t !== _tmlLastTheme) tmlSendTheme();
+    }, 1500);
 
     // The plugin service base + its access token (same token the iframe loads with).
     // Lets THIS parent page talk to :5000 directly - needed so the export download
@@ -123,7 +157,9 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
     }
     function tmlShowExport() {
         tmlResetExportBtn();
-        document.getElementById('tml-export-modal').style.display = 'flex';
+        var m = document.getElementById('tml-export-modal');
+        m.classList.toggle('tml-dark', tmlDetectTheme() === 'dark');
+        m.style.display = 'flex';
     }
     function tmlHideExport() {
         if (_tmlExporting) return;
@@ -183,7 +219,9 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
         document.getElementById('tml-imp-name').textContent = name || 'the selected file';
         document.getElementById('tml-imp-status').textContent = '';
         document.getElementById('tml-imp-status').style.color = '#555';
-        document.getElementById('tml-import-modal').style.display = 'flex';
+        var m = document.getElementById('tml-import-modal');
+        m.classList.toggle('tml-dark', tmlDetectTheme() === 'dark');
+        m.style.display = 'flex';
     }
     function tmlHideImport() {
         if (_tmlImporting) return;                 // don't close mid-import

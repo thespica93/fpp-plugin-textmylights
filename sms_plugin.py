@@ -7720,19 +7720,30 @@ def index():
                     }
                 }
 
-                // Returns the 8 resize handle points (4 corners + 4 edge midpoints) for a
-                // box rect, each tagged with its handle key and CSS resize cursor.
+                // A Center line's box hugs the text (its size IS the text's size); a scrolling
+                // line's box is a travel window (not text-sized), so the two get different resize
+                // behavior - see getHandlePoints / the mousemove resize branch.
+                function lineHugsText(i) { return getLineMovement(i) === 'Center'; }
+
+                // Returns the resize handle points for a box rect, each tagged with its handle
+                // key and CSS resize cursor. Center (hug) lines get corners only (a corner scales
+                // the text proportionally); scrolling lines also get the 4 edge midpoints so width
+                // and height can be set independently (a travel window isn't tied to the text size).
                 var HANDLE_SIZE = 8;
-                function getHandlePoints(r) {
-                    // Corners only - the box always hugs the text (its size IS the text's size),
-                    // so dragging a corner scales the text proportionally. Edge handles are gone
-                    // because changing one dimension on its own would just add empty space.
-                    return {
+                function getHandlePoints(r, i) {
+                    var pts = {
                         nw: {x: r.x,       y: r.y,       cursor: 'nwse-resize'},
                         se: {x: r.x + r.w, y: r.y + r.h, cursor: 'nwse-resize'},
                         ne: {x: r.x + r.w, y: r.y,       cursor: 'nesw-resize'},
                         sw: {x: r.x,       y: r.y + r.h, cursor: 'nesw-resize'}
                     };
+                    if (i != null && !lineHugsText(i)) {
+                        pts.n = {x: r.x + r.w / 2, y: r.y,         cursor: 'ns-resize'};
+                        pts.s = {x: r.x + r.w / 2, y: r.y + r.h,   cursor: 'ns-resize'};
+                        pts.e = {x: r.x + r.w,     y: r.y + r.h / 2, cursor: 'ew-resize'};
+                        pts.w = {x: r.x,           y: r.y + r.h / 2, cursor: 'ew-resize'};
+                    }
+                    return pts;
                 }
 
                 // Draws the box outline + (when selected) its 8 resize handles. The box
@@ -7748,7 +7759,7 @@ def index():
                     if (i === selectedLine) {
                         ctx.save();
                         ctx.fillStyle = '#4CAF50';
-                        var pts = getHandlePoints({x: boxX, y: boxY, w: boxW, h: boxH});
+                        var pts = getHandlePoints({x: boxX, y: boxY, w: boxW, h: boxH}, i);
                         for (var key in pts) {
                             var p = pts[key];
                             ctx.fillRect(p.x - HANDLE_SIZE / 2, p.y - HANDLE_SIZE / 2, HANDLE_SIZE, HANDLE_SIZE);
@@ -8142,16 +8153,18 @@ def index():
                     if (selectedLine < 0) return null;
                     var r = lineRects[selectedLine];
                     if (!r) return null;
-                    var pts = getHandlePoints(r);
+                    var pts = getHandlePoints(r, selectedLine);
                     // Keep grab zones tight to the corner squares so a hugged box still has a
                     // draggable interior for moving it (a corner is resize; the middle is move).
                     // On a small box, cap the zone to a third of each side so the center stays
-                    // grabbable instead of the four corners swallowing the whole box.
+                    // grabbable instead of the handles swallowing the whole box.
                     var PAD = Math.max(4, Math.min(8, Math.floor(Math.min(r.w, r.h) / 3)));
-                    // Corners only now - the box hugs the text, so there are no edge handles.
-                    var order = ['nw', 'ne', 'sw', 'se'];
+                    // Corners first so they win over edges on small boxes where zones overlap.
+                    // Edge handles only exist on scrolling lines (see getHandlePoints).
+                    var order = ['nw', 'ne', 'sw', 'se', 'n', 's', 'e', 'w'];
                     for (var idx = 0; idx < order.length; idx++) {
                         var key = order[idx], p = pts[key];
+                        if (!p) continue;
                         if (Math.abs(cx - p.x) <= PAD && Math.abs(cy - p.y) <= PAD) return key;
                     }
                     return null;
@@ -8178,7 +8191,7 @@ def index():
                         // box proportionally (diagonal only) instead of stretching one dimension.
                         resizeFixed = {left: curX, right: curX + b.w, top: curY, bottom: curY + b.h,
                                        w: Math.max(1, b.w), h: Math.max(1, b.h)};
-                        canvas.style.cursor = getHandlePoints(r)[handle].cursor;
+                        canvas.style.cursor = getHandlePoints(r, selectedLine)[handle].cursor;
                         e.preventDefault();
                         return;
                     }
@@ -8205,26 +8218,41 @@ def index():
                         var cxClamped = Math.max(0, Math.min(canvas.width,  c.cx));
                         var cyClamped = Math.max(0, Math.min(canvas.height, c.cy));
                         var mx = cxClamped / modelScaleX, my = cyClamped / modelScaleY;
-                        // Proportional (diagonal-only) resize: the box always hugs the text, so a
-                        // corner drag just scales it uniformly - the fixed corner stays anchored and
-                        // the box keeps its start aspect ratio. We take whichever axis the mouse has
-                        // moved furthest as the scale, so the gesture feels like dragging the corner
-                        // along the diagonal no matter the exact mouse path.
                         var hasW = resizeHandle.indexOf('w') >= 0; // dragging the left edge
+                        var hasE = resizeHandle.indexOf('e') >= 0; // dragging the right edge
                         var hasN = resizeHandle.indexOf('n') >= 0; // dragging the top edge
-                        // Fixed (anchor) corner = the one opposite the handle being dragged.
-                        var anchorX = hasW ? resizeFixed.right : resizeFixed.left;
-                        var anchorY = hasN ? resizeFixed.bottom : resizeFixed.top;
-                        var candW = Math.abs(mx - anchorX);
-                        var candH = Math.abs(my - anchorY);
-                        var scale = Math.max(candW / resizeFixed.w, candH / resizeFixed.h);
-                        var minScale = MIN_SIZE / Math.min(resizeFixed.w, resizeFixed.h);
-                        if (!(scale > minScale)) scale = minScale;
-                        var newW = Math.round(resizeFixed.w * scale);
-                        var newH = Math.round(resizeFixed.h * scale);
-                        b.w = newW; b.h = newH;
-                        b.x = Math.round(hasW ? anchorX - newW : anchorX); if (b.x === -1) b.x = -2;
-                        b.y = Math.round(hasN ? anchorY - newH : anchorY); if (b.y === -1) b.y = -2;
+                        var hasS = resizeHandle.indexOf('s') >= 0; // dragging the bottom edge
+                        if (lineHugsText(selectedLine)) {
+                            // Center line: the box hugs the text, so a corner drag scales it
+                            // uniformly (diagonal only) - the fixed (opposite) corner stays
+                            // anchored and the box keeps its start aspect ratio. Whichever axis
+                            // the mouse moved furthest drives the scale, so the gesture reads as
+                            // dragging the corner along the diagonal regardless of the mouse path.
+                            var anchorX = hasW ? resizeFixed.right : resizeFixed.left;
+                            var anchorY = hasN ? resizeFixed.bottom : resizeFixed.top;
+                            var candW = Math.abs(mx - anchorX), candH = Math.abs(my - anchorY);
+                            var scale = Math.max(candW / resizeFixed.w, candH / resizeFixed.h);
+                            var minScale = MIN_SIZE / Math.min(resizeFixed.w, resizeFixed.h);
+                            if (!(scale > minScale)) scale = minScale;
+                            var newW = Math.round(resizeFixed.w * scale);
+                            var newH = Math.round(resizeFixed.h * scale);
+                            b.w = newW; b.h = newH;
+                            b.x = Math.round(hasW ? anchorX - newW : anchorX); if (b.x === -1) b.x = -2;
+                            b.y = Math.round(hasN ? anchorY - newH : anchorY); if (b.y === -1) b.y = -2;
+                        } else {
+                            // Scrolling line: the box is a travel window, not tied to the text
+                            // size, so each handle moves its own edge(s) freely - width and height
+                            // are independent (corners move two edges, edges move one), like a
+                            // normal image resize. This is what lets the box be shrunk on one axis.
+                            var newLeft   = hasW ? Math.min(mx, resizeFixed.right - MIN_SIZE)  : resizeFixed.left;
+                            var newRight  = hasE ? Math.max(mx, resizeFixed.left + MIN_SIZE)   : resizeFixed.right;
+                            var newTop    = hasN ? Math.min(my, resizeFixed.bottom - MIN_SIZE) : resizeFixed.top;
+                            var newBottom = hasS ? Math.max(my, resizeFixed.top + MIN_SIZE)    : resizeFixed.bottom;
+                            b.x = Math.round(newLeft);  if (b.x === -1) b.x = -2;
+                            b.w = Math.round(newRight - newLeft);
+                            b.y = Math.round(newTop);   if (b.y === -1) b.y = -2;
+                            b.h = Math.round(newBottom - newTop);
+                        }
                         renderCanvasPreview();
                     } else if (dragging && selectedLine >= 0) {
                         var r2 = lineRects[selectedLine] || {w: 20, h: 20};
@@ -8242,7 +8270,7 @@ def index():
                         var prev = hoveredLine;
                         hoveredLine = hitTestLine(c.cx, c.cy);
                         if (overHandle) {
-                            canvas.style.cursor = getHandlePoints(lineRects[selectedLine])[overHandle].cursor;
+                            canvas.style.cursor = getHandlePoints(lineRects[selectedLine], selectedLine)[overHandle].cursor;
                         } else {
                             canvas.style.cursor = hoveredLine >= 0 ? 'grab' : 'default';
                         }

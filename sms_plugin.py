@@ -8950,7 +8950,7 @@ def index():
                                 }
                                 _fseqMeta = data;
                                 if (window._previewRemote) {
-                                    loadEl.textContent = '\ud83d\udda5\ufe0f Preview from ' + window._previewRemote.name +
+                                    loadEl.textContent = '🖥️ Preview from ' + window._previewRemote.name +
                                                          ' (' + window._previewRemote.w + '\u00d7' + window._previewRemote.h + ')';
                                     loadEl.style.color = '#a5d6a7';
                                 } else if (data.detected_start_channel) {

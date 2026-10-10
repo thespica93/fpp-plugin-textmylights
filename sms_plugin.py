@@ -1500,18 +1500,13 @@ def _fit_text_to_box(draw, text, font_name, box_w, box_h, min_size=6, max_size=N
         return None, 0, 0
     if max_size is None:
         max_size = max([300] + [int(d * 2) for d in (box_w, box_h) if d is not None])
-    # Measure WIDTH as the advance width (what the browser's canvas measureText().width
-    # returns), not the ink width (textbbox right-left). For decorative fonts with large side
-    # bearings the two differ a lot, and using ink width here made the device fit a bigger font
-    # than the preview - so the projection overflowed/overlapped while the preview looked fine.
-    # Height stays the ink height (matches the canvas actualBoundingBox ascent+descent).
+    # Measure BOTH width and height as the INK box (actual glyph pixels, via textbbox). The
+    # canvas preview is matched to this by fitting on its actualBoundingBox ink metrics too, so
+    # both engines size the text the same way (advance width disagrees between the browser and
+    # PIL for decorative fonts, which made the projection bigger than the preview).
     def _wh(font):
         bbox = draw.textbbox((0, 0), text, font=font)
-        try:
-            w = int(round(draw.textlength(text, font=font)))   # advance width (float → int)
-        except Exception:
-            w = bbox[2] - bbox[0]
-        return w, bbox[3] - bbox[1]
+        return bbox[2] - bbox[0], bbox[3] - bbox[1]
     lo, hi = min_size, max_size
     # Seed with the smallest size so a box too small for even min_size to fit still
     # renders something (slightly overflowing) instead of the line silently vanishing.
@@ -1612,8 +1607,13 @@ def _render_oriented_text_strip(text, font_name, box_w, box_h, color_rgb, orient
         font, tw, th = _fit_text_to_box(pdraw, text, font_name, box_w, box_h)
         if font is None:
             return None, 0, 0
+        # Offset the draw by the ink's top-left (-bbox[0], -bbox[1]) so the glyphs sit flush in
+        # the tightly-sized strip. PIL's default anchor leaves the font's ascender gap at the
+        # top, which pushed the text to the BOTTOM of the box on the device while the preview
+        # centered it. (The vertical_stacked branch already does this same -bbox offset.)
+        bbox = pdraw.textbbox((0, 0), text, font=font)
         strip = Image.new('RGB', (max(1, tw), max(1, th)), (0, 0, 0))
-        ImageDraw.Draw(strip).text((0, 0), text, fill=color_rgb, font=font)
+        ImageDraw.Draw(strip).text((-bbox[0], -bbox[1]), text, fill=color_rgb, font=font)
         return strip, strip.width, strip.height
 
 

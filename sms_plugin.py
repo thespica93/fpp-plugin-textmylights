@@ -7352,66 +7352,24 @@ def index():
                 window._lineMovements = window._lineMovements || ['Center','Center','Center','Center'];
                 var newMovement = el.value;
                 window._lineMovements[i] = newMovement;
-                // T2B/B2T reads much better with the text itself rotated to match its
-                // vertical travel (a single horizontal line moving straight up/down is an
-                // unusual look) -- default to that unless the line already has an explicit
-                // orientation, so switching to T2B/B2T "just works" without an extra step.
-                if ((newMovement === 'T2B' || newMovement === 'B2T') && getLineOrientation(i) === 'horizontal') {
-                    var orientSel = document.getElementById('line_' + (i + 1) + '_orientation');
-                    if (orientSel) { orientSel.value = 'vertical_rotated'; onLineOrientationChange(i); }
-                }
+                // Changing the movement must NEVER move or resize the box - the box stays
+                // exactly where/what it is; only the way the text travels changes. (We used to
+                // auto-switch orientation here, which swapped the box's W/H; that's gone.)
                 updateLineSpeedRowVisibility(i);
                 updateLineOrientationRowVisibility(i);
                 if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
                 if (typeof saveConfig === 'function') saveConfig();
             }
 
-            // Per-line Orientation select. Swaps the box's W/H when crossing the
-            // horizontal/vertical boundary (either direction) so switching to vertical
-            // starts from a sensible portrait-shaped box instead of a leftover wide one.
+            // Per-line Orientation select. Changing orientation must NEVER move or resize the
+            // box - it only changes how the text is drawn inside the box (horizontal, rotated,
+            // or stacked). The box stays exactly where/what the user set it. (We used to swap
+            // the box's W/H here; that auto-mutation is gone.)
             function onLineOrientationChange(i) {
                 var el = document.getElementById('line_' + (i + 1) + '_orientation');
                 if (!el) return;
                 window._lineOrientations = window._lineOrientations || ['horizontal','horizontal','horizontal','horizontal'];
-                var prev = getLineOrientation(i);
-                var next = el.value;
-                if (isVerticalOrientation(prev) !== isVerticalOrientation(next)) {
-                    var b = window._lineBoxes && window._lineBoxes[i];
-                    // _lineBoxes are stored in MODEL pixel space (window._canvasModelW/H),
-                    // not the preview canvas's own raster size -- matrix_canvas.width is
-                    // always a fixed 640px-wide bitmap scaled to the model's aspect ratio,
-                    // a completely different number from the model's real width/height
-                    // whenever the model isn't 640px wide. Comparing/assigning against the
-                    // canvas element here compared box coordinates against the wrong
-                    // coordinate space and could inflate the box's model-space size well
-                    // past the model's actual extent.
-                    var modelW = window._canvasModelW, modelH = window._canvasModelH;
-                    if (b && modelW && modelH) {
-                        // A plain w<->h swap is wrong when the box was sized to span the
-                        // full overlay along its old axis -- model width and height are
-                        // rarely equal, so reusing the raw old number leaves the new axis
-                        // either short of, or overflowing, the overlay's actual extent.
-                        // Detect "was full span" before swapping and, if so, snap the new
-                        // axis to the overlay's real size on that axis instead.
-                        var wasFullW = b.w >= modelW - 2;
-                        var wasFullH = b.h >= modelH - 2;
-                        if (wasFullW && wasFullH) {
-                            // Box already covered the entire model in both dimensions --
-                            // there's no meaningful "shape" to transpose (the model itself
-                            // usually isn't square), so keep it covering the entire model
-                            // after the flip too instead of collapsing one axis down to the
-                            // other's old (unrelated) size.
-                            b.w = modelW; b.h = modelH;
-                        } else {
-                            var t = b.w; b.w = b.h; b.h = t;
-                            if (isVerticalOrientation(next) && wasFullW) b.h = modelH;
-                            else if (!isVerticalOrientation(next) && wasFullH) b.w = modelW;
-                        }
-                    } else if (b) {
-                        var t2 = b.w; b.w = b.h; b.h = t2;
-                    }
-                }
-                window._lineOrientations[i] = next;
+                window._lineOrientations[i] = el.value;
                 if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
                 if (typeof saveConfig === 'function') saveConfig();
             }
@@ -7720,30 +7678,23 @@ def index():
                     }
                 }
 
-                // A Center line's box hugs the text (its size IS the text's size); a scrolling
-                // line's box is a travel window (not text-sized), so the two get different resize
-                // behavior - see getHandlePoints / the mousemove resize branch.
-                function lineHugsText(i) { return getLineMovement(i) === 'Center'; }
-
-                // Returns the resize handle points for a box rect, each tagged with its handle
-                // key and CSS resize cursor. Center (hug) lines get corners only (a corner scales
-                // the text proportionally); scrolling lines also get the 4 edge midpoints so width
-                // and height can be set independently (a travel window isn't tied to the text size).
+                // Returns the 8 resize handle points (4 corners + 4 edge midpoints) for a box
+                // rect, each tagged with its handle key and CSS resize cursor. The box is a
+                // user-controlled MAX bounding box (text auto-fits to fill it); every line gets
+                // the full set of handles so width and height can be set freely, like resizing an
+                // image in Word/PowerPoint. Corners move two edges, edge handles move one.
                 var HANDLE_SIZE = 8;
-                function getHandlePoints(r, i) {
-                    var pts = {
-                        nw: {x: r.x,       y: r.y,       cursor: 'nwse-resize'},
-                        se: {x: r.x + r.w, y: r.y + r.h, cursor: 'nwse-resize'},
-                        ne: {x: r.x + r.w, y: r.y,       cursor: 'nesw-resize'},
-                        sw: {x: r.x,       y: r.y + r.h, cursor: 'nesw-resize'}
+                function getHandlePoints(r) {
+                    return {
+                        nw: {x: r.x,           y: r.y,           cursor: 'nwse-resize'},
+                        se: {x: r.x + r.w,     y: r.y + r.h,     cursor: 'nwse-resize'},
+                        ne: {x: r.x + r.w,     y: r.y,           cursor: 'nesw-resize'},
+                        sw: {x: r.x,           y: r.y + r.h,     cursor: 'nesw-resize'},
+                        n:  {x: r.x + r.w / 2, y: r.y,           cursor: 'ns-resize'},
+                        s:  {x: r.x + r.w / 2, y: r.y + r.h,     cursor: 'ns-resize'},
+                        e:  {x: r.x + r.w,     y: r.y + r.h / 2, cursor: 'ew-resize'},
+                        w:  {x: r.x,           y: r.y + r.h / 2, cursor: 'ew-resize'}
                     };
-                    if (i != null && !lineHugsText(i)) {
-                        pts.n = {x: r.x + r.w / 2, y: r.y,         cursor: 'ns-resize'};
-                        pts.s = {x: r.x + r.w / 2, y: r.y + r.h,   cursor: 'ns-resize'};
-                        pts.e = {x: r.x + r.w,     y: r.y + r.h / 2, cursor: 'ew-resize'};
-                        pts.w = {x: r.x,           y: r.y + r.h / 2, cursor: 'ew-resize'};
-                    }
-                    return pts;
                 }
 
                 // Draws the box outline + (when selected) its 8 resize handles. The box
@@ -7759,7 +7710,7 @@ def index():
                     if (i === selectedLine) {
                         ctx.save();
                         ctx.fillStyle = '#4CAF50';
-                        var pts = getHandlePoints({x: boxX, y: boxY, w: boxW, h: boxH}, i);
+                        var pts = getHandlePoints({x: boxX, y: boxY, w: boxW, h: boxH});
                         for (var key in pts) {
                             var p = pts[key];
                             ctx.fillRect(p.x - HANDLE_SIZE / 2, p.y - HANDLE_SIZE / 2, HANDLE_SIZE, HANDLE_SIZE);
@@ -7806,6 +7757,22 @@ def index():
                     ctx.textBaseline = 'top';
 
                     lineRects = [null, null, null, null];
+
+                    // A box can never be larger than the model (the preview area). Heal any box
+                    // left oversized by older logic (e.g. a W/H swap that pushed a dimension past
+                    // the model edge) and clamp it back inside, persisting once if anything
+                    // changed so the device uses the same box. Steady state: no change, no save.
+                    var _clampChanged = false;
+                    for (var cbi = 0; cbi < 4; cbi++) {
+                        var cb = window._lineBoxes[cbi]; if (!cb) continue;
+                        if (cb.w > mw) { cb.w = mw; _clampChanged = true; }
+                        if (cb.h > mh) { cb.h = mh; _clampChanged = true; }
+                        if (cb.x !== -1 && cb.x < 0) { cb.x = 0; _clampChanged = true; }
+                        if (cb.y !== -1 && cb.y < 0) { cb.y = 0; _clampChanged = true; }
+                        if (cb.x !== -1 && cb.x + cb.w > mw) { cb.x = Math.max(0, mw - cb.w); _clampChanged = true; }
+                        if (cb.y !== -1 && cb.y + cb.h > mh) { cb.y = Math.max(0, mh - cb.h); _clampChanged = true; }
+                    }
+                    if (_clampChanged && typeof saveConfig === 'function') saveConfig();
 
                     // Precompute each non-empty line's scaled box height for auto-stacking
                     var boxHeights = [0, 0, 0, 0], totalStackHeight = 0;
@@ -8064,10 +8031,6 @@ def index():
                             ctx.textBaseline = 'alphabetic';
                             ctx.fillStyle = getLineColor(i);
                             ctx.fillText(lineText, drawXH, drawBaselineH);
-                            // Remember this line's fitted text size (model px) so a corner-resize
-                            // can snap the box to exactly the text (no empty space).
-                            (window._lineTextSize = window._lineTextSize || [null, null, null, null])[i] =
-                                { w: inkWH / modelScaleX, h: textHH / modelScaleY };
                         }
 
                         if (i === selectedLine) {
@@ -8076,36 +8039,6 @@ def index():
                             ) + '  •  ' + b.w + '×' + b.h + ' box';
                         }
                         cumulativeY += boxHeights[i];
-                    }
-
-                    // Auto-hug: snap each static line's box to its fitted text size so existing /
-                    // loaded boxes also match the text exactly (no empty space), then persist so
-                    // the device renders with the same box. Skipped while dragging/resizing and
-                    // guarded against recursion; a 1px tolerance avoids jitter/re-save loops.
-                    if (!dragging && !resizing && !window._snappingBoxes) {
-                        var _snapChanged = false;
-                        for (var si = 0; si < 4; si++) {
-                            if (!getLineText(si) || getLineMovement(si) !== 'Center') continue;
-                            var _ts = window._lineTextSize && window._lineTextSize[si];
-                            if (!_ts) continue;
-                            var _bb = window._lineBoxes[si];
-                            var _nW = Math.max(1, Math.round(_ts.w)), _nH = Math.max(1, Math.round(_ts.h));
-                            // Shrink-only: trim empty space from an oversized box. We never grow a
-                            // box here, so once it hugs the text this is a no-op - which means a
-                            // move (position change, same size) never re-triggers it and can't snap.
-                            if (_bb.w - _nW > 1 || _bb.h - _nH > 1) {
-                                if (_bb.x !== -1) _bb.x = Math.round(_bb.x + (_bb.w - _nW) / 2);
-                                if (_bb.y !== -1) _bb.y = Math.round(_bb.y + (_bb.h - _nH) / 2);
-                                _bb.w = _nW; _bb.h = _nH; _snapChanged = true;
-                            }
-                        }
-                        if (_snapChanged) {
-                            window._snappingBoxes = true;
-                            renderCanvasPreview();
-                            window._snappingBoxes = false;
-                            if (typeof saveConfig === 'function') saveConfig();
-                            return;
-                        }
                     }
 
                     // Draw all box decorations (dashed border + resize handles) after every
@@ -8153,14 +8086,13 @@ def index():
                     if (selectedLine < 0) return null;
                     var r = lineRects[selectedLine];
                     if (!r) return null;
-                    var pts = getHandlePoints(r, selectedLine);
-                    // Keep grab zones tight to the corner squares so a hugged box still has a
-                    // draggable interior for moving it (a corner is resize; the middle is move).
-                    // On a small box, cap the zone to a third of each side so the center stays
-                    // grabbable instead of the handles swallowing the whole box.
+                    var pts = getHandlePoints(r);
+                    // Keep grab zones tight to the handle squares so the box keeps a draggable
+                    // interior for moving it (a handle is resize; the middle is move). On a small
+                    // box, cap the zone to a third of each side so the center stays grabbable
+                    // instead of the handles swallowing the whole box.
                     var PAD = Math.max(4, Math.min(8, Math.floor(Math.min(r.w, r.h) / 3)));
                     // Corners first so they win over edges on small boxes where zones overlap.
-                    // Edge handles only exist on scrolling lines (see getHandlePoints).
                     var order = ['nw', 'ne', 'sw', 'se', 'n', 's', 'e', 'w'];
                     for (var idx = 0; idx < order.length; idx++) {
                         var key = order[idx], p = pts[key];
@@ -8187,11 +8119,8 @@ def index():
                         b.x = curX; b.y = curY;
                         resizing = true;
                         resizeHandle = handle;
-                        // Capture the start box + its aspect ratio so the corner drag scales the
-                        // box proportionally (diagonal only) instead of stretching one dimension.
-                        resizeFixed = {left: curX, right: curX + b.w, top: curY, bottom: curY + b.h,
-                                       w: Math.max(1, b.w), h: Math.max(1, b.h)};
-                        canvas.style.cursor = getHandlePoints(r, selectedLine)[handle].cursor;
+                        resizeFixed = {left: curX, right: curX + b.w, top: curY, bottom: curY + b.h};
+                        canvas.style.cursor = getHandlePoints(r)[handle].cursor;
                         e.preventDefault();
                         return;
                     }
@@ -8218,41 +8147,20 @@ def index():
                         var cxClamped = Math.max(0, Math.min(canvas.width,  c.cx));
                         var cyClamped = Math.max(0, Math.min(canvas.height, c.cy));
                         var mx = cxClamped / modelScaleX, my = cyClamped / modelScaleY;
-                        var hasW = resizeHandle.indexOf('w') >= 0; // dragging the left edge
-                        var hasE = resizeHandle.indexOf('e') >= 0; // dragging the right edge
-                        var hasN = resizeHandle.indexOf('n') >= 0; // dragging the top edge
-                        var hasS = resizeHandle.indexOf('s') >= 0; // dragging the bottom edge
-                        if (lineHugsText(selectedLine)) {
-                            // Center line: the box hugs the text, so a corner drag scales it
-                            // uniformly (diagonal only) - the fixed (opposite) corner stays
-                            // anchored and the box keeps its start aspect ratio. Whichever axis
-                            // the mouse moved furthest drives the scale, so the gesture reads as
-                            // dragging the corner along the diagonal regardless of the mouse path.
-                            var anchorX = hasW ? resizeFixed.right : resizeFixed.left;
-                            var anchorY = hasN ? resizeFixed.bottom : resizeFixed.top;
-                            var candW = Math.abs(mx - anchorX), candH = Math.abs(my - anchorY);
-                            var scale = Math.max(candW / resizeFixed.w, candH / resizeFixed.h);
-                            var minScale = MIN_SIZE / Math.min(resizeFixed.w, resizeFixed.h);
-                            if (!(scale > minScale)) scale = minScale;
-                            var newW = Math.round(resizeFixed.w * scale);
-                            var newH = Math.round(resizeFixed.h * scale);
-                            b.w = newW; b.h = newH;
-                            b.x = Math.round(hasW ? anchorX - newW : anchorX); if (b.x === -1) b.x = -2;
-                            b.y = Math.round(hasN ? anchorY - newH : anchorY); if (b.y === -1) b.y = -2;
-                        } else {
-                            // Scrolling line: the box is a travel window, not tied to the text
-                            // size, so each handle moves its own edge(s) freely - width and height
-                            // are independent (corners move two edges, edges move one), like a
-                            // normal image resize. This is what lets the box be shrunk on one axis.
-                            var newLeft   = hasW ? Math.min(mx, resizeFixed.right - MIN_SIZE)  : resizeFixed.left;
-                            var newRight  = hasE ? Math.max(mx, resizeFixed.left + MIN_SIZE)   : resizeFixed.right;
-                            var newTop    = hasN ? Math.min(my, resizeFixed.bottom - MIN_SIZE) : resizeFixed.top;
-                            var newBottom = hasS ? Math.max(my, resizeFixed.top + MIN_SIZE)    : resizeFixed.bottom;
-                            b.x = Math.round(newLeft);  if (b.x === -1) b.x = -2;
-                            b.w = Math.round(newRight - newLeft);
-                            b.y = Math.round(newTop);   if (b.y === -1) b.y = -2;
-                            b.h = Math.round(newBottom - newTop);
-                        }
+                        // The box is a user-controlled MAX bounding box: each handle moves its own
+                        // edge(s) freely so width and height are independent (corners move two
+                        // edges, edge handles move one), like resizing an image. Text auto-fits to
+                        // fill the box - the box never changes on its own.
+                        var hasW = resizeHandle.indexOf('w') >= 0, hasE = resizeHandle.indexOf('e') >= 0;
+                        var hasN = resizeHandle.indexOf('n') >= 0, hasS = resizeHandle.indexOf('s') >= 0;
+                        var newLeft   = hasW ? Math.min(mx, resizeFixed.right - MIN_SIZE)  : resizeFixed.left;
+                        var newRight  = hasE ? Math.max(mx, resizeFixed.left + MIN_SIZE)   : resizeFixed.right;
+                        var newTop    = hasN ? Math.min(my, resizeFixed.bottom - MIN_SIZE) : resizeFixed.top;
+                        var newBottom = hasS ? Math.max(my, resizeFixed.top + MIN_SIZE)    : resizeFixed.bottom;
+                        b.x = Math.round(newLeft);  if (b.x === -1) b.x = -2; // -1 is the auto-position sentinel
+                        b.w = Math.round(newRight - newLeft);
+                        b.y = Math.round(newTop);   if (b.y === -1) b.y = -2;
+                        b.h = Math.round(newBottom - newTop);
                         renderCanvasPreview();
                     } else if (dragging && selectedLine >= 0) {
                         var r2 = lineRects[selectedLine] || {w: 20, h: 20};
@@ -8270,7 +8178,7 @@ def index():
                         var prev = hoveredLine;
                         hoveredLine = hitTestLine(c.cx, c.cy);
                         if (overHandle) {
-                            canvas.style.cursor = getHandlePoints(lineRects[selectedLine], selectedLine)[overHandle].cursor;
+                            canvas.style.cursor = getHandlePoints(lineRects[selectedLine])[overHandle].cursor;
                         } else {
                             canvas.style.cursor = hoveredLine >= 0 ? 'grab' : 'default';
                         }
@@ -8280,24 +8188,9 @@ def index():
 
                 window.addEventListener('mouseup', function() {
                     if (dragging || resizing) {
-                        var wasResizing = resizing;
                         dragging = false; resizing = false; resizeHandle = null; resizeFixed = null;
                         canvas.style.cursor = hoveredLine >= 0 ? 'grab' : 'default';
-                        // After a corner resize, snap the box to the fitted text's exact size so
-                        // it always hugs the text (no empty space). The corner drag set the font
-                        // size; this makes the box match it. Scrolling lines are skipped (their
-                        // box is a travel window, not the text's size).
-                        var selMove = (selectedLine >= 0) ? getLineMovement(selectedLine) : 'Center';
-                        if (wasResizing && selectedLine >= 0 && selMove === 'Center'
-                                && window._lineTextSize && window._lineTextSize[selectedLine]) {
-                            var ts = window._lineTextSize[selectedLine];
-                            var b  = window._lineBoxes[selectedLine];
-                            var tW = Math.max(1, Math.round(ts.w)), tH = Math.max(1, Math.round(ts.h));
-                            if (b.x !== -1) b.x = Math.round(b.x + (b.w - tW) / 2);
-                            if (b.y !== -1) b.y = Math.round(b.y + (b.h - tH) / 2);
-                            b.w = tW; b.h = tH;
-                            renderCanvasPreview();
-                        }
+                        // The box stays exactly as the user left it - no snapping to the text.
                         saveConfig();
                     }
                 });

@@ -1658,6 +1658,9 @@ def render_to_shm(line_items, model_name, width, height):
             if strip is not None:
                 draw_x = resolved_bx + max(0, (box_w - sw) // 2)
                 draw_y = resolved_by + max(0, (box_h - sh) // 2)
+                logging.info(f"🅰️ TEXTPOS model={width}x{height} box=(x{box_x},y{box_y},w{box_w},h{box_h}) "
+                             f"font={font_name!r} text={text!r} rendered_text={sw}x{sh} "
+                             f"draw=(x{draw_x},y{draw_y}) orient={orientation}")
                 img.paste(strip, (draw_x, draw_y))
 
         shm_path = f"/dev/shm/FPP-Model-Data-{model_name}"

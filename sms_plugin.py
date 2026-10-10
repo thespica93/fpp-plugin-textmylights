@@ -7607,12 +7607,19 @@ def index():
                         var mid = Math.floor((lo + hi) / 2);
                         ctx.font = mid + 'px "' + fontName + '", sans-serif';
                         var metrics = ctx.measureText(text);
-                        var w = metrics.width;
                         var ascent = metrics.actualBoundingBoxAscent || mid * 0.8;
                         var descent = metrics.actualBoundingBoxDescent || mid * 0.2;
+                        // INK width (actual glyph extent), matching the device's PIL textbbox.
+                        // The advance width (metrics.width) includes side bearings and disagrees
+                        // between the browser and PIL for decorative fonts - using it left empty
+                        // space in the box and mis-sized the text vs the projector.
+                        var w = (metrics.actualBoundingBoxRight != null && metrics.actualBoundingBoxLeft != null)
+                                ? (metrics.actualBoundingBoxRight + metrics.actualBoundingBoxLeft)
+                                : metrics.width;
                         var h = ascent + descent;
                         if (w <= boxW && h <= boxH) {
-                            best = { size: mid, ascent: ascent, descent: descent };
+                            best = { size: mid, ascent: ascent, descent: descent,
+                                     inkW: w, left: (metrics.actualBoundingBoxLeft || 0) };
                             lo = mid + 1;
                         } else {
                             hi = mid - 1;
@@ -7717,16 +7724,14 @@ def index():
                 // box rect, each tagged with its handle key and CSS resize cursor.
                 var HANDLE_SIZE = 8;
                 function getHandlePoints(r) {
-                    var midX = r.x + r.w / 2, midY = r.y + r.h / 2;
+                    // Corners only - the box always hugs the text (its size IS the text's size),
+                    // so dragging a corner scales the text proportionally. Edge handles are gone
+                    // because changing one dimension on its own would just add empty space.
                     return {
                         nw: {x: r.x,       y: r.y,       cursor: 'nwse-resize'},
                         se: {x: r.x + r.w, y: r.y + r.h, cursor: 'nwse-resize'},
                         ne: {x: r.x + r.w, y: r.y,       cursor: 'nesw-resize'},
-                        sw: {x: r.x,       y: r.y + r.h, cursor: 'nesw-resize'},
-                        n:  {x: midX,      y: r.y,       cursor: 'ns-resize'},
-                        s:  {x: midX,      y: r.y + r.h, cursor: 'ns-resize'},
-                        e:  {x: r.x + r.w, y: midY,      cursor: 'ew-resize'},
-                        w:  {x: r.x,       y: midY,      cursor: 'ew-resize'}
+                        sw: {x: r.x,       y: r.y + r.h, cursor: 'nesw-resize'}
                     };
                 }
 
@@ -8038,13 +8043,20 @@ def index():
                         } else {
                             var fitH = fitTextSize(lineText, fontName, boxW, boxH);
                             ctx.font = fitH.size + 'px "' + fontName + '", sans-serif';
-                            var textWH = ctx.measureText(lineText).width;
+                            var inkWH = fitH.inkW != null ? fitH.inkW : ctx.measureText(lineText).width;
                             var textHH = fitH.ascent + fitH.descent;
-                            var drawXH = boxX + Math.max(0, (boxW - textWH) / 2);
+                            // Center the INK in the box (shift by the left side-bearing so the
+                            // visible glyphs, not the advance box, are centered - matches the
+                            // device, which centers the ink strip).
+                            var drawXH = boxX + Math.max(0, (boxW - inkWH) / 2) + (fitH.left || 0);
                             var drawBaselineH = boxY + Math.max(0, (boxH - textHH) / 2) + fitH.ascent;
                             ctx.textBaseline = 'alphabetic';
                             ctx.fillStyle = getLineColor(i);
                             ctx.fillText(lineText, drawXH, drawBaselineH);
+                            // Remember this line's fitted text size (model px) so a corner-resize
+                            // can snap the box to exactly the text (no empty space).
+                            (window._lineTextSize = window._lineTextSize || [null, null, null, null])[i] =
+                                { w: inkWH / modelScaleX, h: textHH / modelScaleY };
                         }
 
                         if (i === selectedLine) {
@@ -8053,6 +8065,33 @@ def index():
                             ) + '  •  ' + b.w + '×' + b.h + ' box';
                         }
                         cumulativeY += boxHeights[i];
+                    }
+
+                    // Auto-hug: snap each static line's box to its fitted text size so existing /
+                    // loaded boxes also match the text exactly (no empty space), then persist so
+                    // the device renders with the same box. Skipped while dragging/resizing and
+                    // guarded against recursion; a 1px tolerance avoids jitter/re-save loops.
+                    if (!dragging && !resizing && !window._snappingBoxes) {
+                        var _snapChanged = false;
+                        for (var si = 0; si < 4; si++) {
+                            if (!getLineText(si) || getLineMovement(si) !== 'Center') continue;
+                            var _ts = window._lineTextSize && window._lineTextSize[si];
+                            if (!_ts) continue;
+                            var _bb = window._lineBoxes[si];
+                            var _nW = Math.max(1, Math.round(_ts.w)), _nH = Math.max(1, Math.round(_ts.h));
+                            if (Math.abs(_bb.w - _nW) > 1 || Math.abs(_bb.h - _nH) > 1) {
+                                if (_bb.x !== -1) _bb.x = Math.round(_bb.x + (_bb.w - _nW) / 2);
+                                if (_bb.y !== -1) _bb.y = Math.round(_bb.y + (_bb.h - _nH) / 2);
+                                _bb.w = _nW; _bb.h = _nH; _snapChanged = true;
+                            }
+                        }
+                        if (_snapChanged) {
+                            window._snappingBoxes = true;
+                            renderCanvasPreview();
+                            window._snappingBoxes = false;
+                            if (typeof saveConfig === 'function') saveConfig();
+                            return;
+                        }
                     }
 
                     // Draw all box decorations (dashed border + resize handles) after every
@@ -8193,8 +8232,24 @@ def index():
 
                 window.addEventListener('mouseup', function() {
                     if (dragging || resizing) {
+                        var wasResizing = resizing;
                         dragging = false; resizing = false; resizeHandle = null; resizeFixed = null;
                         canvas.style.cursor = hoveredLine >= 0 ? 'grab' : 'default';
+                        // After a corner resize, snap the box to the fitted text's exact size so
+                        // it always hugs the text (no empty space). The corner drag set the font
+                        // size; this makes the box match it. Scrolling lines are skipped (their
+                        // box is a travel window, not the text's size).
+                        var selMove = (selectedLine >= 0) ? getLineMovement(selectedLine) : 'Center';
+                        if (wasResizing && selectedLine >= 0 && selMove === 'Center'
+                                && window._lineTextSize && window._lineTextSize[selectedLine]) {
+                            var ts = window._lineTextSize[selectedLine];
+                            var b  = window._lineBoxes[selectedLine];
+                            var tW = Math.max(1, Math.round(ts.w)), tH = Math.max(1, Math.round(ts.h));
+                            if (b.x !== -1) b.x = Math.round(b.x + (b.w - tW) / 2);
+                            if (b.y !== -1) b.y = Math.round(b.y + (b.h - tH) / 2);
+                            b.w = tW; b.h = tH;
+                            renderCanvasPreview();
+                        }
                         saveConfig();
                     }
                 });

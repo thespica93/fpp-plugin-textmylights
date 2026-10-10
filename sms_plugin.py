@@ -8079,7 +8079,10 @@ def index():
                             if (!_ts) continue;
                             var _bb = window._lineBoxes[si];
                             var _nW = Math.max(1, Math.round(_ts.w)), _nH = Math.max(1, Math.round(_ts.h));
-                            if (Math.abs(_bb.w - _nW) > 1 || Math.abs(_bb.h - _nH) > 1) {
+                            // Shrink-only: trim empty space from an oversized box. We never grow a
+                            // box here, so once it hugs the text this is a no-op - which means a
+                            // move (position change, same size) never re-triggers it and can't snap.
+                            if (_bb.w - _nW > 1 || _bb.h - _nH > 1) {
                                 if (_bb.x !== -1) _bb.x = Math.round(_bb.x + (_bb.w - _nW) / 2);
                                 if (_bb.y !== -1) _bb.y = Math.round(_bb.y + (_bb.h - _nH) / 2);
                                 _bb.w = _nW; _bb.h = _nH; _snapChanged = true;
@@ -8140,9 +8143,13 @@ def index():
                     var r = lineRects[selectedLine];
                     if (!r) return null;
                     var pts = getHandlePoints(r);
-                    var PAD = 9;
-                    // Corners first so they win over edges on small boxes where zones overlap
-                    var order = ['nw', 'ne', 'sw', 'se', 'n', 's', 'e', 'w'];
+                    // Keep grab zones tight to the corner squares so a hugged box still has a
+                    // draggable interior for moving it (a corner is resize; the middle is move).
+                    // On a small box, cap the zone to a third of each side so the center stays
+                    // grabbable instead of the four corners swallowing the whole box.
+                    var PAD = Math.max(4, Math.min(8, Math.floor(Math.min(r.w, r.h) / 3)));
+                    // Corners only now - the box hugs the text, so there are no edge handles.
+                    var order = ['nw', 'ne', 'sw', 'se'];
                     for (var idx = 0; idx < order.length; idx++) {
                         var key = order[idx], p = pts[key];
                         if (Math.abs(cx - p.x) <= PAD && Math.abs(cy - p.y) <= PAD) return key;
@@ -8167,7 +8174,10 @@ def index():
                         b.x = curX; b.y = curY;
                         resizing = true;
                         resizeHandle = handle;
-                        resizeFixed = {left: curX, right: curX + b.w, top: curY, bottom: curY + b.h};
+                        // Capture the start box + its aspect ratio so the corner drag scales the
+                        // box proportionally (diagonal only) instead of stretching one dimension.
+                        resizeFixed = {left: curX, right: curX + b.w, top: curY, bottom: curY + b.h,
+                                       w: Math.max(1, b.w), h: Math.max(1, b.h)};
                         canvas.style.cursor = getHandlePoints(r)[handle].cursor;
                         e.preventDefault();
                         return;
@@ -8195,16 +8205,26 @@ def index():
                         var cxClamped = Math.max(0, Math.min(canvas.width,  c.cx));
                         var cyClamped = Math.max(0, Math.min(canvas.height, c.cy));
                         var mx = cxClamped / modelScaleX, my = cyClamped / modelScaleY;
-                        var hasW = resizeHandle.indexOf('w') >= 0, hasE = resizeHandle.indexOf('e') >= 0;
-                        var hasN = resizeHandle.indexOf('n') >= 0, hasS = resizeHandle.indexOf('s') >= 0;
-                        var newLeft   = hasW ? Math.min(mx, resizeFixed.right - MIN_SIZE)  : resizeFixed.left;
-                        var newRight  = hasE ? Math.max(mx, resizeFixed.left + MIN_SIZE)   : resizeFixed.right;
-                        var newTop    = hasN ? Math.min(my, resizeFixed.bottom - MIN_SIZE) : resizeFixed.top;
-                        var newBottom = hasS ? Math.max(my, resizeFixed.top + MIN_SIZE)    : resizeFixed.bottom;
-                        b.x = Math.round(newLeft);  if (b.x === -1) b.x = -2; // -1 is the auto-position sentinel
-                        b.w = Math.round(newRight - newLeft);
-                        b.y = Math.round(newTop);   if (b.y === -1) b.y = -2;
-                        b.h = Math.round(newBottom - newTop);
+                        // Proportional (diagonal-only) resize: the box always hugs the text, so a
+                        // corner drag just scales it uniformly - the fixed corner stays anchored and
+                        // the box keeps its start aspect ratio. We take whichever axis the mouse has
+                        // moved furthest as the scale, so the gesture feels like dragging the corner
+                        // along the diagonal no matter the exact mouse path.
+                        var hasW = resizeHandle.indexOf('w') >= 0; // dragging the left edge
+                        var hasN = resizeHandle.indexOf('n') >= 0; // dragging the top edge
+                        // Fixed (anchor) corner = the one opposite the handle being dragged.
+                        var anchorX = hasW ? resizeFixed.right : resizeFixed.left;
+                        var anchorY = hasN ? resizeFixed.bottom : resizeFixed.top;
+                        var candW = Math.abs(mx - anchorX);
+                        var candH = Math.abs(my - anchorY);
+                        var scale = Math.max(candW / resizeFixed.w, candH / resizeFixed.h);
+                        var minScale = MIN_SIZE / Math.min(resizeFixed.w, resizeFixed.h);
+                        if (!(scale > minScale)) scale = minScale;
+                        var newW = Math.round(resizeFixed.w * scale);
+                        var newH = Math.round(resizeFixed.h * scale);
+                        b.w = newW; b.h = newH;
+                        b.x = Math.round(hasW ? anchorX - newW : anchorX); if (b.x === -1) b.x = -2;
+                        b.y = Math.round(hasN ? anchorY - newH : anchorY); if (b.y === -1) b.y = -2;
                         renderCanvasPreview();
                     } else if (dragging && selectedLine >= 0) {
                         var r2 = lineRects[selectedLine] || {w: 20, h: 20};

@@ -4073,8 +4073,10 @@ def send_to_fpp(name, override=None):
                                     line_color, movement, speed, font_name, orientation))
 
         # Compute stacked Y defaults (group centered vertically). Each line's own box height
-        # determines its own height in the stack.
-        mh_pre = config.get('overlay_model_height', 0)
+        # determines its own height in the stack. Use the RESOLVED model height (same source the
+        # render below uses) - reading config.overlay_model_height directly could be 0/stale and
+        # would then stack from the top while the preview centers, so positions wouldn't match.
+        _mw_pre, mh_pre = _overlay_model_dims()
         line_heights = [item[4] for item in rendered_lines]
         total_stack_height = sum(line_heights)
         stack_start_y = max(0, (mh_pre - total_stack_height) // 2) if mh_pre > 0 else 0
@@ -7270,7 +7272,13 @@ def index():
                     window._canvasModelW = r.model_w;
                     window._canvasModelH = r.model_h;
                 } else {
-                    window._previewRemote = null;   // "This box" → local/assumed handled by loadBgPreview
+                    // "This box" → preview THIS instance's own projection: restore its overlay
+                    // model dimensions (or the assumed 480×270 if it has none) so the preview's
+                    // coordinate space matches what this box actually renders. Without this it
+                    // would keep the last-selected remote's size and mis-place everything.
+                    window._previewRemote = null;
+                    window._canvasModelW = parseInt(document.getElementById('overlay_model_width').value)  || 480;
+                    window._canvasModelH = parseInt(document.getElementById('overlay_model_height').value) || 270;
                 }
                 // Re-shape the canvas to the chosen size, then redraw the preview.
                 var canvas = document.getElementById('matrix_canvas');

@@ -265,7 +265,10 @@ def _require_access_token():
     if request.path.startswith('/api/tml/'):
         if request.remote_addr in _trusted_tml_peers():
             return None
-        return Response("Not a recognized FPP peer.", status=403, mimetype='text/plain')
+        # Not a MultiSync peer - fall through to the normal token/cookie check below, so the
+        # master's OWN browser UI can reach the browser-facing /api/tml/* endpoints
+        # (/api/tml/remotes, /api/tml/remote-frame). Inter-instance calls still pass via the
+        # peer check above without needing a token.
     # First load carries the token as a query param (embedded by the FPP UI);
     # we then set a cookie so subsequent same-origin fetches are authorized.
     qtok = request.args.get('token', '')
@@ -495,6 +498,8 @@ _remotes_cache = []              # cached list of remote base URLs the master pu
 _remotes_cache_time = 0.0
 _masters_cache = []              # remote side: cached detailed master list [{address,base,name,phone}]
 _masters_cache_time = 0.0
+_remotes_detail_cache = []       # master side: cached detailed remote list [{address,base,name}]
+_remotes_detail_cache_time = 0.0
 _REMOTES_CACHE_TTL = 30          # seconds between MultiSync discovery refreshes
 _tml_peer_cache = set()          # cached IPs allowed to call /api/tml/* (FPP peers)
 _tml_peer_cache_time = 0.0
@@ -630,6 +635,49 @@ def is_remote():
     return get_plugin_role() == 'remote'
 
 
+# FPP auto-lists every script in this directory under Scheduler → Command → Run Script.
+# The Start/Stop scheduler scripts map to fpp_activate.sh / fpp_deactivate.sh.
+FPP_SCRIPTS_DIR  = "/home/fpp/media/scripts"
+SCHEDULER_SCRIPTS = (
+    ("fpp_activate.sh",   "TextMyLightsStart.sh"),
+    ("fpp_deactivate.sh", "TextMyLightsStop.sh"),
+)
+
+
+def sync_scheduler_scripts():
+    """Install or hide the Start/Stop scheduler scripts to match the plugin role. A REMOTE is
+    driven entirely by its master - running "Text My Lights Start/Stop" on it directly does
+    nothing useful - so the scripts are removed and no longer appear in FPP's Run Script list.
+    A master (or an unset/auto role) keeps them, (re)installed from the plugin's bundled copies.
+    Best-effort and idempotent: on a non-FPP box (no scripts dir) it quietly no-ops."""
+    try:
+        remote = is_remote()
+        for src_name, dest_name in SCHEDULER_SCRIPTS:
+            dest = os.path.join(FPP_SCRIPTS_DIR, dest_name)
+            if remote:
+                try:
+                    if os.path.exists(dest):
+                        os.remove(dest)
+                        logging.info(f"🔒 Remote mode: hid scheduler script {dest_name}")
+                except OSError as e:
+                    logging.warning(f"Could not remove scheduler script {dest_name}: {e}")
+            else:
+                if not os.path.isdir(FPP_SCRIPTS_DIR):
+                    continue  # not a real FPP box - nothing to install into
+                src = os.path.join(PLUGIN_DIR, 'scripts', src_name)
+                if not os.path.exists(src):
+                    continue
+                try:
+                    import shutil
+                    shutil.copy2(src, dest)
+                    os.chmod(dest, 0o755)
+                    logging.info(f"🔓 Master mode: ensured scheduler script {dest_name}")
+                except OSError as e:
+                    logging.warning(f"Could not install scheduler script {dest_name}: {e}")
+    except Exception as e:
+        logging.warning(f"sync_scheduler_scripts failed: {e}")
+
+
 def _instance_label():
     """Friendly name this instance advertises to remotes: the FPP hostname."""
     try:
@@ -749,6 +797,38 @@ def discover_remotes(force=False):
     return remotes
 
 
+def discover_remotes_detailed(force=False):
+    """Master side: detailed list of reachable plugin REMOTES that are SYNCED TO THIS master
+    (their 'Sync to Master' is pinned here - the remote confirms the caller is its master via
+    `synced_to_caller` in its ping). Each `{address, base, name, model_w, model_h, overlay_model}`
+    so the master UI can show connected projectors and preview using their overlay. Cached briefly."""
+    global _remotes_detail_cache, _remotes_detail_cache_time
+    now = time.time()
+    if not force and _remotes_detail_cache and (now - _remotes_detail_cache_time) < _REMOTES_CACHE_TTL:
+        return _remotes_detail_cache
+    found = []
+    for host in _multisync_addresses():
+        h = f"[{host}]" if (':' in host and not host.startswith('[')) else host  # bracket IPv6
+        base = f"http://{h}:5000"
+        try:
+            pr = requests.get(f"{base}/api/tml/ping", timeout=2)
+            if pr.status_code == 200:
+                j = pr.json()
+                # Only remotes pinned to THIS master (synced_to_caller), so the preview and the
+                # "connected" count reflect the projectors this master actually drives.
+                if (j.get('plugin') == 'textmylights' and j.get('role') == 'remote'
+                        and j.get('synced_to_caller')):
+                    found.append({"address": host, "base": base, "name": j.get('name') or host,
+                                  "model_w": int(j.get('model_w') or 0),
+                                  "model_h": int(j.get('model_h') or 0),
+                                  "overlay_model": j.get('overlay_model') or ''})
+        except Exception:
+            pass  # unreachable / not the plugin - skip silently
+    found.sort(key=lambda m: (m.get('name') or '').lower())
+    _remotes_detail_cache, _remotes_detail_cache_time = found, now
+    return found
+
+
 def discover_masters(force=False):
     """Remote side: detailed list of reachable plugin MASTERS on the FPP MultiSync network,
     each `{address, base, name, phone}`, so the UI can present them for selection. Cached
@@ -841,7 +921,9 @@ def sync_names_content_from_master():
         r = requests.get(f"{master}/api/tml/content-list", timeout=3)
         if r.status_code != 200:
             return False
-        master_ids = [c for c in (r.json().get('names') or []) if c]
+        _j = r.json()
+        master_ids = [c for c in (_j.get('names') or []) if c]
+        master_durations = _j.get('durations') or {}
     except Exception as e:
         logging.debug(f"sync_names_content_from_master: fetch failed ({e})")
         return False
@@ -853,14 +935,25 @@ def sync_names_content_from_master():
     new_list = []
     for cid in target:
         if cid in existing:
-            new_list.append(existing[cid])          # keep this remote's own layout
+            item = existing[cid]                    # keep this remote's own layout
         else:
             item = _names_item_defaults()
             item['content'] = cid
             item['message_lines'] = ['{name}', '', '', '']   # sensible starting layout
-            new_list.append(item)
+        # Timing is the master's: mirror its duration so this remote's preview scrubber matches
+        # (the live display already runs for the master's pushed duration). Re-syncs whenever the
+        # master changes it, via the signature check below.
+        _md = master_durations.get(cid)
+        if _md:
+            try:
+                item['display_duration'] = max(1, int(_md))
+            except (TypeError, ValueError):
+                pass
+        new_list.append(item)
 
-    if [it.get('content') for it in new_list] != [it.get('content') for it in lst]:
+    def _sig(_l):
+        return [(it.get('content'), it.get('display_duration')) for it in _l]
+    if _sig(new_list) != _sig(lst):
         config['names_content_list'] = new_list
         if int(config.get('names_content_rr_index', -1) or -1) >= len(new_list):
             config['names_content_rr_index'] = -1
@@ -1407,21 +1500,26 @@ def _fit_text_to_box(draw, text, font_name, box_w, box_h, min_size=6, max_size=N
         return None, 0, 0
     if max_size is None:
         max_size = max([300] + [int(d * 2) for d in (box_w, box_h) if d is not None])
+    # Measure BOTH width and height as the INK box (actual glyph pixels, via textbbox). The
+    # canvas preview is matched to this by fitting on its actualBoundingBox ink metrics too, so
+    # both engines size the text the same way (advance width disagrees between the browser and
+    # PIL for decorative fonts, which made the projection bigger than the preview).
+    def _wh(font):
+        bbox = draw.textbbox((0, 0), text, font=font)
+        return bbox[2] - bbox[0], bbox[3] - bbox[1]
     lo, hi = min_size, max_size
     # Seed with the smallest size so a box too small for even min_size to fit still
     # renders something (slightly overflowing) instead of the line silently vanishing.
     best_font = _find_font(font_name, min_size)
     if best_font is not None:
-        bbox = draw.textbbox((0, 0), text, font=best_font)
-        best_w, best_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        best_w, best_h = _wh(best_font)
     else:
         best_w, best_h = len(text) * (min_size * 0.6), min_size
     while lo <= hi:
         mid = (lo + hi) // 2
         font = _find_font(font_name, mid)
         if font is not None:
-            bbox = draw.textbbox((0, 0), text, font=font)
-            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            w, h = _wh(font)
         else:
             w, h = len(text) * (mid * 0.6), mid
         if (box_w is None or w <= box_w) and (box_h is None or h <= box_h):
@@ -1509,8 +1607,13 @@ def _render_oriented_text_strip(text, font_name, box_w, box_h, color_rgb, orient
         font, tw, th = _fit_text_to_box(pdraw, text, font_name, box_w, box_h)
         if font is None:
             return None, 0, 0
+        # Offset the draw by the ink's top-left (-bbox[0], -bbox[1]) so the glyphs sit flush in
+        # the tightly-sized strip. PIL's default anchor leaves the font's ascender gap at the
+        # top, which pushed the text to the BOTTOM of the box on the device while the preview
+        # centered it. (The vertical_stacked branch already does this same -bbox offset.)
+        bbox = pdraw.textbbox((0, 0), text, font=font)
         strip = Image.new('RGB', (max(1, tw), max(1, th)), (0, 0, 0))
-        ImageDraw.Draw(strip).text((0, 0), text, fill=color_rgb, font=font)
+        ImageDraw.Draw(strip).text((-bbox[0], -bbox[1]), text, fill=color_rgb, font=font)
         return strip, strip.width, strip.height
 
 
@@ -1565,6 +1668,9 @@ def render_to_shm(line_items, model_name, width, height):
             if strip is not None:
                 draw_x = resolved_bx + max(0, (box_w - sw) // 2)
                 draw_y = resolved_by + max(0, (box_h - sh) // 2)
+                logging.info(f"🅰️ TEXTPOS model={width}x{height} box=(x{box_x},y{box_y},w{box_w},h{box_h}) "
+                             f"font={font_name!r} text={text!r} rendered_text={sw}x{sh} "
+                             f"draw=(x{draw_x},y{draw_y}) orient={orientation}")
                 img.paste(strip, (draw_x, draw_y))
 
         shm_path = f"/dev/shm/FPP-Model-Data-{model_name}"
@@ -3980,8 +4086,10 @@ def send_to_fpp(name, override=None):
                                     line_color, movement, speed, font_name, orientation))
 
         # Compute stacked Y defaults (group centered vertically). Each line's own box height
-        # determines its own height in the stack.
-        mh_pre = config.get('overlay_model_height', 0)
+        # determines its own height in the stack. Use the RESOLVED model height (same source the
+        # render below uses) - reading config.overlay_model_height directly could be 0/stale and
+        # would then stack from the top while the preview centers, so positions wouldn't match.
+        _mw_pre, mh_pre = _overlay_model_dims()
         line_heights = [item[4] for item in rendered_lines]
         total_stack_height = sum(line_heights)
         stack_start_y = max(0, (mh_pre - total_stack_height) // 2) if mh_pre > 0 else 0
@@ -5339,11 +5447,49 @@ def index():
     <head>
         <title>Text My Lights - Configuration</title>
         <style>
-            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #ffffff; color: #333; }
+            /* Theme palette. Light defaults; the [data-theme="dark"] override is applied by
+               the head script below (from a ?theme= param forwarded by FPP, or the browser
+               preference). Brand accent colors (#4CAF50 etc.) are intentionally theme-agnostic. */
+            :root {
+              --bg:#ffffff; --fg:#333333; --fg-muted:#666666;
+              --card-bg:#ffffff; --section-bg:#f8f8f8;
+              --border:#dddddd; --border-strong:#cccccc; --input-bg:#ffffff;
+              --warn-bg:#fff3cd; --warn-fg:#856404; --warn-border:#ffc107;
+              --note-bg:#e3f2fd; --note-fg:#0d47a1; --note-border:#90caf9;
+              --tab-bg:#f0f0f0; --tab-fg:#555555; --tab-hover:#e8e8e8;
+              --queue-bg:#f3e5f5; --queue-border:#ce93d8;
+              --ok-bg:#e8f5e9; --ok-border:#c8e6c9;
+              --row-alt:#f5f5f5; --shadow:rgba(0,0,0,0.35);
+            }
+            :root[data-theme="dark"] {
+              --bg:#1e2127; --fg:#e6e6e6; --fg-muted:#a0a6b0;
+              --card-bg:#262a31; --section-bg:#23262d;
+              --border:#3a3f47; --border-strong:#4a5059; --input-bg:#2d323a;
+              --warn-bg:#4a3c0a; --warn-fg:#ffd98a; --warn-border:#8a6d00;
+              --note-bg:#0e2a40; --note-fg:#9fd0ff; --note-border:#2b5c82;
+              --tab-bg:#2a2e35; --tab-fg:#b8bec8; --tab-hover:#343941;
+              --queue-bg:#33263a; --queue-border:#6a4a78;
+              --ok-bg:#16341c; --ok-border:#2d5a37;
+              --row-alt:#262a31; --shadow:rgba(0,0,0,0.6);
+            }
+            @media (prefers-color-scheme: dark) {
+              :root:not([data-theme="light"]) {
+                --bg:#1e2127; --fg:#e6e6e6; --fg-muted:#a0a6b0;
+                --card-bg:#262a31; --section-bg:#23262d;
+                --border:#3a3f47; --border-strong:#4a5059; --input-bg:#2d323a;
+                --warn-bg:#4a3c0a; --warn-fg:#ffd98a; --warn-border:#8a6d00;
+                --note-bg:#0e2a40; --note-fg:#9fd0ff; --note-border:#2b5c82;
+                --tab-bg:#2a2e35; --tab-fg:#b8bec8; --tab-hover:#343941;
+                --queue-bg:#33263a; --queue-border:#6a4a78;
+                --ok-bg:#16341c; --ok-border:#2d5a37;
+                --row-alt:#262a31; --shadow:rgba(0,0,0,0.6);
+              }
+            }
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: var(--bg); color: var(--fg); }
             h1 { color: #4CAF50; }
-            .section { background: #f8f8f8; padding: 20px; margin: 20px 0; border-radius: 5px; border: 1px solid #ddd; }
+            .section { background: var(--section-bg); padding: 20px; margin: 20px 0; border-radius: 5px; border: 1px solid var(--border); }
             label { display: block; margin: 10px 0 5px; font-weight: bold; }
-            input, select, textarea { width: 100%; padding: 8px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; background: #fff; color: #333; box-sizing: border-box; }
+            input, select, textarea { width: 100%; padding: 8px; margin-bottom: 10px; border: 1px solid var(--border-strong); border-radius: 4px; background: var(--input-bg); color: var(--fg); box-sizing: border-box; }
             button { background: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin: 5px; }
             button:hover { background: #45a049; }
             .test-btn { background: #2196F3; }
@@ -5355,34 +5501,52 @@ def index():
             .checkbox-label { display: inline; margin-left: 10px; font-weight: normal; vertical-align: middle; }
             .toggle-switch { position: relative; display: inline-block; width: 44px; height: 26px; flex-shrink: 0; vertical-align: middle; }
             .toggle-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
-            .toggle-slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background: #555; border-radius: 26px; transition: background .2s; }
-            .toggle-slider:before { position: absolute; content: ""; height: 20px; width: 20px; left: 3px; bottom: 3px; background: #fff; border-radius: 50%; transition: transform .2s; box-shadow: 0 1px 3px rgba(0,0,0,.4); }
+            .toggle-slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background: #888; border-radius: 26px; transition: background .2s; }
+            .toggle-slider:before { position: absolute; content: ""; height: 20px; width: 20px; left: 3px; bottom: 3px; background: var(--card-bg); border-radius: 50%; transition: transform .2s; box-shadow: 0 1px 3px rgba(0,0,0,.4); }
             .toggle-switch input:checked + .toggle-slider { background: #4CAF50; }
             .toggle-switch input:checked + .toggle-slider:before { transform: translateX(18px); }
             .success { color: #4CAF50; }
             .error { color: #f44336; }
-            .info { background: #e3f2fd; padding: 15px; border-radius: 5px; margin: 20px 0; border: 1px solid #90caf9; color: #333; }
-            .queue-info { background: #f3e5f5; padding: 15px; border-radius: 5px; margin: 20px 0; border: 1px solid #ce93d8; color: #333; }
+            .info { background: var(--note-bg); padding: 15px; border-radius: 5px; margin: 20px 0; border: 1px solid var(--note-border); color: var(--fg); }
+            .queue-info { background: var(--queue-bg); padding: 15px; border-radius: 5px; margin: 20px 0; border: 1px solid var(--queue-border); color: var(--fg); }
             h3 { color: #4CAF50; margin-top: 20px; margin-bottom: 10px; }
-            .help-text { font-size: 12px; color: #666; margin-top: 5px; }
+            .help-text { font-size: 12px; color: var(--fg-muted); margin-top: 5px; }
             select[id$="_font"] option { padding: 8px; font-size: 14px; }
             .columns { display: flex; gap: 20px; margin: 0; align-items: stretch; }
             .column { flex: 1; min-width: 0; display: flex; flex-direction: column; }
             .column .section { flex: 0 0 auto; }
             .column .section:last-child { flex: 1; }
-            .top-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 15px 0; padding: 15px; background: #f8f8f8; border-radius: 5px; border: 1px solid #ddd; }
+            .top-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 15px 0; padding: 15px; background: var(--section-bg); border-radius: 5px; border: 1px solid var(--border); }
             .tabs { display: flex; gap: 0; margin: 20px 0 0 0; border-bottom: 2px solid #4CAF50; }
-            .tab-btn { background: #f0f0f0; color: #555; padding: 7px 14px; border: 1px solid #ddd; border-bottom: none; border-radius: 4px 4px 0 0; cursor: pointer; font-size: 13px; font-weight: bold; margin-right: 2px; }
+            .tab-btn { background: var(--tab-bg); color: var(--tab-fg); padding: 7px 14px; border: 1px solid var(--border); border-bottom: none; border-radius: 4px 4px 0 0; cursor: pointer; font-size: 13px; font-weight: bold; margin-right: 2px; }
             .tab-btn.active { background: #4CAF50; color: white; border-color: #4CAF50; }
-            .tab-btn:hover:not(.active) { background: #e8e8e8; }
+            .tab-btn:hover:not(.active) { background: var(--tab-hover); }
             .tab-content { display: none; }
             .tab-content.active { display: block; }
         </style>
+        <script>
+            /* Apply the theme BEFORE first paint to avoid a flash. Priority: explicit ?theme=
+               (forwarded by the FPP parent page so we match FPP's own theme), else the browser
+               preference. The parent may also postMessage a theme later (live FPP toggle). */
+            (function(){
+              try {
+                var p = new URLSearchParams(location.search).get('theme');
+                var dark = p ? (p === 'dark')
+                             : (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+                document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+              } catch (e) {}
+              window.addEventListener('message', function(e){
+                if (e.data && e.data.type === 'tml_theme' && (e.data.theme === 'dark' || e.data.theme === 'light')) {
+                  document.documentElement.setAttribute('data-theme', e.data.theme);
+                }
+              });
+            })();
+        </script>
     </head>
     <body><script>if('scrollRestoration'in history)history.scrollRestoration='manual';function _toTop(){window.scrollTo(0,0);document.documentElement.scrollTop=0;document.body.scrollTop=0;try{window.parent.postMessage({type:'scrollTop'},'*');}catch(e){}}_toTop();document.addEventListener('DOMContentLoaded',_toTop);window.addEventListener('load',_toTop);</script>
 
         <!-- SMS cost disclaimer - shown on every role (master and remote) -->
-        <div style="background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:6px; padding:10px 14px; margin:14px 0 0 0; font-size:13px; line-height:1.5;">
+        <div style="background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn-fg); border-radius:6px; padding:10px 14px; margin:14px 0 0 0; font-size:13px; line-height:1.5;">
             <strong>DISCLAIMER:</strong> The author of this plugin is NOT responsible for SMS charges that may be incurred by using this plugin, or any inappropriate content that may be displayed from incorrectly configured settings.
         </div>
 
@@ -5412,6 +5576,9 @@ def index():
             <span style="font-weight:normal; font-size:12px;">Note: Viewers can still send messages, messaging rates will apply, but no messages will be displayed.</span></span>
         </div>
 
+        <!-- Remotes-connected indicator (master only) - where pushed names can render -->
+        <div id="remotes_indicator" style="display:none; margin-top:10px; padding:8px 14px; border-radius:5px; font-size:13px; line-height:1.4;"></div>
+
         <!-- Settings Tab -->
         <div id="tab-settings" class="tab-content active">
             <div class="columns">
@@ -5428,7 +5595,7 @@ def index():
                             <option value="remote" {{ 'selected' if effective_role == 'remote' else '' }}>Remote - only displays pushed names</option>
                         </select>
 
-                        <div id="remote_mode_note" style="display:none; background:#e3f2fd; border:1px solid #90caf9; color:#0d47a1; border-radius:5px; padding:8px 12px; margin-top:10px; font-size:13px;">
+                        <div id="remote_mode_note" style="display:none; background:var(--note-bg); border:1px solid #90caf9; color:var(--note-fg); border-radius:5px; padding:8px 12px; margin-top:10px; font-size:13px;">
                             ℹ️ <strong>Remote mode:</strong> the Master's content must also exist on this remote - recommend using <strong>Config → Export/Import</strong>.
                         </div>
                         <div id="master_sync_box" style="display:none; margin-top:12px;">
@@ -5500,10 +5667,10 @@ def index():
                             <div id="admin_no_gv_warning" style="{{ '' if (config.get('admin_phone','') and not admin_gv_linked) else 'display:none;' }} background:#fdecea; border:1px solid #f44336; color:#b71c1c; border-radius:6px; padding:10px 14px; margin-bottom:10px; font-size:13px;">
                                 🔴 <strong>No Google Voice account linked.</strong> Enter and test your Gmail address and App Password above first. Until a Google Voice account is connected there is no number to text, so live approvals cannot be set up.
                             </div>
-                            <div id="admin_bootstrap_banner" style="{{ '' if (config.get('admin_phone','') and not admin_ctx_seeded and admin_gv_linked) else 'display:none;' }} background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:6px; padding:10px 14px; margin-bottom:10px; font-size:13px;">
+                            <div id="admin_bootstrap_banner" style="{{ '' if (config.get('admin_phone','') and not admin_ctx_seeded and admin_gv_linked) else 'display:none;' }} background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn-fg); border-radius:6px; padding:10px 14px; margin-bottom:10px; font-size:13px;">
                                 ⚠️ <strong>Action needed:</strong> from the admin phone (<span id="admin_banner_num">{{ config.get('admin_phone','') }}</span>), text the word <strong>admin</strong> to your Google Voice number to connect. You will not receive approval requests until you do. The word "admin" is never shown on the display.
                             </div>
-                            <div id="admin_connected_note" style="{{ '' if (config.get('admin_phone','') and admin_ctx_seeded) else 'display:none;' }} background:#e8f5e9; border:1px solid #66bb6a; color:#2e7d32; border-radius:6px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
+                            <div id="admin_connected_note" style="{{ '' if (config.get('admin_phone','') and admin_ctx_seeded) else 'display:none;' }} background:var(--ok-bg); border:1px solid #66bb6a; color:#2e7d32; border-radius:6px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
                                 ✅ Admin phone connected - live approvals are active.
                             </div>
                             <div id="admin_thread_warning" style="{{ '' if (config.get('admin_phone','') and admin_gv_linked) else 'display:none;' }} background:#fdecea; border:1px solid #f44336; color:#b71c1c; border-radius:6px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
@@ -5533,34 +5700,34 @@ def index():
                             <select id="default_playlist" style="display:none;">
                                 <option value="">-- Select content --</option>
                             </select>
-                            <div id="waiting_content_list_box" style="border:1px solid #ddd; border-radius:5px; padding:10px; background:#fff;">
+                            <div id="waiting_content_list_box" style="border:1px solid var(--border); border-radius:5px; padding:10px; background:var(--card-bg);">
                                 <div id="waiting_content_items"></div>
                                 <button type="button" onclick="openManageWaitingModal(this)" style="margin-top:8px; font-size:13px; padding:6px 14px; cursor:pointer; background:#1976d2; color:#fff; border:none; border-radius:4px;">🗂️ Add / Arrange Waiting Content</button>
-                                <div id="waiting_mode_row" style="display:none; margin-top:12px; padding-top:10px; border-top:1px solid #eee;">
-                                    <span style="font-size:13px; color:#555; margin-right:10px;">When a sequence ends, play:</span>
-                                    <label style="margin-right:14px; cursor:pointer; color:#333; font-size:13px;"><input type="radio" name="waiting_mode" value="roundrobin" onchange="onWaitingModeChange('roundrobin')" style="width:auto;margin:0 5px 0 0;vertical-align:middle;">Round Robin (in order)</label>
-                                    <label style="cursor:pointer; color:#333; font-size:13px;"><input type="radio" name="waiting_mode" value="random" onchange="onWaitingModeChange('random')" style="width:auto;margin:0 5px 0 0;vertical-align:middle;">Random</label>
+                                <div id="waiting_mode_row" style="display:none; margin-top:12px; padding-top:10px; border-top:1px solid var(--border);">
+                                    <span style="font-size:13px; color:var(--fg-muted); margin-right:10px;">When a sequence ends, play:</span>
+                                    <label style="margin-right:14px; cursor:pointer; color:var(--fg); font-size:13px;"><input type="radio" name="waiting_mode" value="roundrobin" onchange="onWaitingModeChange('roundrobin')" style="width:auto;margin:0 5px 0 0;vertical-align:middle;">Round Robin (in order)</label>
+                                    <label style="cursor:pointer; color:var(--fg); font-size:13px;"><input type="radio" name="waiting_mode" value="random" onchange="onWaitingModeChange('random')" style="width:auto;margin:0 5px 0 0;vertical-align:middle;">Random</label>
                                 </div>
                             </div>
-                            <div id="waiting_content_none_warning" style="display:none; background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:5px; padding:8px 12px; margin-top:6px; font-size:13px;">
+                            <div id="waiting_content_none_warning" style="display:none; background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn-fg); border-radius:5px; padding:8px 12px; margin-top:6px; font-size:13px;">
                                 ⚠️ No Waiting content selected - required before you can Start the show.
                             </div>
                               </div>
                               <div style="flex:1; min-width:280px;" id="names_config_col">
                             <label>Name Display Content: <span class="help-text" style="font-weight:normal;margin-left:6px;">🎬 Background(s) shown when a name appears. Add one or more - each gets its own text layout on the Display tab.</span></label>
-                            <div id="names_content_remote_note" style="display:none; background:#e3f2fd; border:1px solid #90caf9; color:#0d47a1; border-radius:5px; padding:8px 12px; margin-bottom:6px; font-size:13px;">
+                            <div id="names_content_remote_note" style="display:none; background:var(--note-bg); border:1px solid #90caf9; color:var(--note-fg); border-radius:5px; padding:8px 12px; margin-bottom:6px; font-size:13px;">
                                 ℹ️ This list is <strong>synced from the Master</strong> (only content that also exists on this Pi appears). Pick a content below to set <em>this</em> projector's text layout for it on the Display tab - your overlay model, sizing, and positioning are independent of the Master.
                             </div>
-                            <div id="names_content_list_box" style="border:1px solid #ddd; border-radius:5px; padding:10px; background:#fff;">
+                            <div id="names_content_list_box" style="border:1px solid var(--border); border-radius:5px; padding:10px; background:var(--card-bg);">
                                 <div id="names_content_items"></div>
                                 <button type="button" id="btn_manage_names" onclick="openManageContentModal(this)" style="margin-top:8px; font-size:13px; padding:6px 14px; cursor:pointer; background:#1976d2; color:#fff; border:none; border-radius:4px;">🗂️ Add / Arrange Content</button>
-                                <div id="names_mode_row" style="display:none; margin-top:12px; padding-top:10px; border-top:1px solid #eee;">
-                                    <span style="font-size:13px; color:#555; margin-right:10px;">When a name arrives, pick:</span>
-                                    <label style="margin-right:14px; cursor:pointer; color:#333; font-size:13px;"><input type="radio" name="names_mode" value="roundrobin" onchange="onNamesModeChange('roundrobin')" style="width:auto;margin:0 5px 0 0;vertical-align:middle;">Round Robin</label>
-                                    <label style="cursor:pointer; color:#333; font-size:13px;"><input type="radio" name="names_mode" value="random" onchange="onNamesModeChange('random')" style="width:auto;margin:0 5px 0 0;vertical-align:middle;">Random</label>
+                                <div id="names_mode_row" style="display:none; margin-top:12px; padding-top:10px; border-top:1px solid var(--border);">
+                                    <span style="font-size:13px; color:var(--fg-muted); margin-right:10px;">When a name arrives, pick:</span>
+                                    <label style="margin-right:14px; cursor:pointer; color:var(--fg); font-size:13px;"><input type="radio" name="names_mode" value="roundrobin" onchange="onNamesModeChange('roundrobin')" style="width:auto;margin:0 5px 0 0;vertical-align:middle;">Round Robin</label>
+                                    <label style="cursor:pointer; color:var(--fg); font-size:13px;"><input type="radio" name="names_mode" value="random" onchange="onNamesModeChange('random')" style="width:auto;margin:0 5px 0 0;vertical-align:middle;">Random</label>
                                 </div>
                             </div>
-                            <div id="name_display_none_warning" style="display:none; background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:5px; padding:8px 12px; margin-top:6px; font-size:13px;">
+                            <div id="name_display_none_warning" style="display:none; background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn-fg); border-radius:5px; padding:8px 12px; margin-top:6px; font-size:13px;">
                                 ⚠️ No Names content - names will appear directly over the Waiting content (using the Display-tab text layout).
                             </div>
                               </div>
@@ -5571,7 +5738,7 @@ def index():
                                  a scroll-to-top on open, so it lands in view inside the auto-height FPP iframe
                                  where position:fixed is relative to the full plugin height, not the viewport. -->
                             <div id="manage_content_modal" onclick="if(event.target===this)closeManageContentModal()" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:100000; align-items:flex-start; justify-content:center; padding-top:24px; box-sizing:border-box;">
-                                <div onclick="event.stopPropagation()" style="background:#fff; color:#333; border-radius:8px; padding:22px; width:94%; max-width:740px; box-shadow:0 8px 30px rgba(0,0,0,0.35); max-height:90vh; overflow:auto; box-sizing:border-box;">
+                                <div onclick="event.stopPropagation()" style="background:var(--card-bg); color:var(--fg); border-radius:8px; padding:22px; width:94%; max-width:740px; box-shadow:0 8px 30px rgba(0,0,0,0.35); max-height:90vh; overflow:auto; box-sizing:border-box;">
                                     <h3 style="margin-top:0;">Manage Names Content</h3>
                                     <p class="help-text" style="margin-top:4px;">Select content on the left and click ▶ to add it to your Names list. Reorder the list with ▲ / ▼ (order matters for Round Robin). Remove with ◀.</p>
                                     <div style="display:flex; gap:10px; align-items:stretch;">
@@ -5601,7 +5768,7 @@ def index():
                             <!-- Manage Waiting Content modal - same two-pane picker as Names, but the
                                  right list is the waiting-content rotation (no per-item text layout). -->
                             <div id="manage_waiting_modal" onclick="if(event.target===this)closeManageWaitingModal()" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:100000; align-items:flex-start; justify-content:center; padding-top:24px; box-sizing:border-box;">
-                                <div onclick="event.stopPropagation()" style="background:#fff; color:#333; border-radius:8px; padding:22px; width:94%; max-width:740px; box-shadow:0 8px 30px rgba(0,0,0,0.35); max-height:90vh; overflow:auto; box-sizing:border-box;">
+                                <div onclick="event.stopPropagation()" style="background:var(--card-bg); color:var(--fg); border-radius:8px; padding:22px; width:94%; max-width:740px; box-shadow:0 8px 30px rgba(0,0,0,0.35); max-height:90vh; overflow:auto; box-sizing:border-box;">
                                     <h3 style="margin-top:0;">Manage Waiting Content</h3>
                                     <p class="help-text" style="margin-top:4px;">Select content on the left and click ▶ to add it. With 2+ items the plugin rotates them while idle - each sequence plays its full length, then the next starts seamlessly (no black gap). Reorder with ▲ / ▼ (order matters for Round Robin). Remove with ◀.</p>
                                     <div style="display:flex; gap:10px; align-items:stretch;">
@@ -5650,7 +5817,7 @@ def index():
                             <label>Max Message Length:</label>
                             <input type="number" id="max_length" value="{{ config.max_message_length }}" min="10" max="200">
                         </div>
-                        <div id="max_length_disabled_warning" style="display:none; background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:5px; padding:8px 12px; margin-top:6px; font-size:13px;">
+                        <div id="max_length_disabled_warning" style="display:none; background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn-fg); border-radius:5px; padding:8px 12px; margin-top:6px; font-size:13px;">
                             ⚠️ <strong>Max Message Length is disabled</strong> - whitelist is enabled. Names are validated against the approved list, not by length.
                         </div>
 
@@ -5695,7 +5862,7 @@ def index():
                     <div style="flex:1; min-width:220px;">
                         <div id="format_rules_section">
                             <h3 style="margin-bottom:6px;">Name Format Rules</h3>
-                            <div id="format_rules_disabled_note" style="display:none; background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:5px; padding:8px 12px; margin-bottom:8px; font-size:13px;">
+                            <div id="format_rules_disabled_note" style="display:none; background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn-fg); border-radius:5px; padding:8px 12px; margin-bottom:8px; font-size:13px;">
                                 ⚠️ Name format rules are disabled when the whitelist is active.
                             </div>
                             <div id="format_rules_inputs">
@@ -5913,6 +6080,14 @@ def index():
                     showIf('waiting_config_col', !remote);
                     showIf('names_config_col', !remote);
                     showIf('btn_sync_pos_master', remote);   // remote-only: copy master's layout
+                    // Timing is the Master's (it starts/stops the effect for all projectors and
+                    // pushes the duration), so a remote has no duration control - show a note instead.
+                    showIf('content_duration_row', !remote);
+                    showIf('content_duration_hint', !remote);
+                    // Preview-from-a-remote is a master-only aid; a remote renders on its own overlay.
+                    if (remote) { showIf('preview_remote_row', false); window._previewRemote = null; }
+                    var _cdn = document.getElementById('content_duration_remote_note');
+                    if (_cdn) _cdn.style.display = remote ? 'block' : 'none';
                     // SMS Responses are Google-Voice-only, so for a non-remote the source
                     // (not just the role) decides whether the tab shows. Without this check
                     // this 5s-interval role sync would re-show the tab after updateSourceUI()
@@ -6059,8 +6234,8 @@ def index():
                  that ignores scrolling. Here position:fixed works because a directly
                  opened page is a normal scrolling document. -->
             <div id="export_modal" onclick="if(event.target===this)closeExportModal()" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:100000; align-items:center; justify-content:center;">
-                <div id="export_dialog" style="background:#fff; color:#333; max-width:460px; width:92%; border-radius:8px; padding:22px; box-shadow:0 8px 30px rgba(0,0,0,0.35); max-height:88vh; overflow-y:auto; box-sizing:border-box;">
-                    <h3 style="margin:0 0 6px; color:#333;">Export Config</h3>
+                <div id="export_dialog" style="background:var(--card-bg); color:var(--fg); max-width:460px; width:92%; border-radius:8px; padding:22px; box-shadow:0 8px 30px rgba(0,0,0,0.35); max-height:88vh; overflow-y:auto; box-sizing:border-box;">
+                    <h3 style="margin:0 0 6px; color:var(--fg);">Export Config</h3>
                     <p class="help-text" style="margin:0 0 14px;">Choose what to include. Only the content <strong>this plugin is set to use</strong> is exported - never all of FPP's files. <strong>Credentials are never included.</strong></p>
                     <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 12px;">
                         <input type="checkbox" id="exp_settings" checked style="width:auto; margin:3px 0 0;">
@@ -6255,13 +6430,13 @@ def index():
                     <div class="section">
                         <h2>Message Lines</h2>
 
-                        <label style="font-size:11px; color:#888; font-weight:bold;">Use {name} as placeholder for texts in any line. Empty lines are skipped.</label>
+                        <label style="font-size:11px; color:var(--fg-muted); font-weight:bold;">Use {name} as placeholder for texts in any line. Empty lines are skipped.</label>
                         <style>
                             .line-card { background:#3a3a3a; border:1px solid #555; border-radius:5px; padding:8px 8px 6px; margin-bottom:6px; }
                             .line-row { display:flex; align-items:center; gap:6px; }
                             .line-row input[type="text"] { margin-bottom:0; padding:6px; }
                             .line-label { width:46px; font-size:12px; color:#aaa; flex-shrink:0; }
-                            .pos-badge { font-size:11px; color:#888; white-space:nowrap; min-width:80px; text-align:right; font-family:monospace; }
+                            .pos-badge { font-size:11px; color:var(--fg-muted); white-space:nowrap; min-width:80px; text-align:right; font-family:monospace; }
                             .reset-line-btn { background:#444; border:none; color:#ccc; padding:2px 7px; font-size:12px; border-radius:3px; cursor:pointer; flex-shrink:0; }
                             .reset-line-btn:hover { background:#666; }
                             .line-color-group { position:relative; display:flex; align-items:center; flex-shrink:0; }
@@ -6272,7 +6447,7 @@ def index():
                             .color-palette-swatches { display:flex; flex-wrap:wrap; gap:4px; }
                             .color-palette-swatch { width:20px; height:20px; border:1px solid #666; border-radius:3px; padding:0; cursor:pointer; }
                             .color-palette-save-btn { margin-top:6px; width:100%; font-size:11px; background:#444; color:#ccc; border:1px dashed #888; border-radius:3px; padding:4px; cursor:pointer; }
-                            .color-palette-empty { font-size:10px; color:#888; text-align:center; padding:4px 0; }
+                            .color-palette-empty { font-size:10px; color:var(--fg-muted); text-align:center; padding:4px 0; }
                             .line-movement-row { margin-top:5px; padding-top:5px; border-top:1px solid #555; }
                             .line-mini-label { font-weight:normal; font-size:12px; color:#aaa; flex-shrink:0; }
                             .line-group-controls { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
@@ -6528,22 +6703,34 @@ def index():
                             <div style="display:flex; gap:8px; margin-top:6px; align-items:center;">
                                 <button type="button" onclick="resetAllLines()" style="background:#555; padding:6px 12px; font-size:12px;">Reset All to Center</button>
                                 <button type="button" id="btn_sync_pos_master" onclick="syncPositionFromMaster(this)" style="display:none; background:#1976d2; color:#fff; padding:6px 12px; font-size:12px;" title="Copy the Master's text layout for this content, scaled to this projector's model">🔗 Sync Position from Master</button>
-                                <span id="pos_display" style="font-size:12px; color:#888;"></span>
-                                <span id="sync_pos_status" style="font-size:12px; color:#888;"></span>
+                                <span id="pos_display" style="font-size:12px; color:var(--fg-muted);"></span>
+                                <span id="sync_pos_status" style="font-size:12px; color:var(--fg-muted);"></span>
                             </div>
 
-                            <div style="margin-top:10px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                            <div id="content_duration_row" style="margin-top:10px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
                                 <label style="margin:0;">Display Duration (seconds):</label>
                                 <input type="number" id="content_duration" min="1" max="600" style="width:90px; margin:0;" onchange="onContentDurationChange()">
                                 <span class="help-text" id="content_duration_scope" style="margin:0;"></span>
                             </div>
-                            <p class="help-text" style="margin:6px 0 0;">💡 Scrolling lines set to "Fit to time" use this as their scroll window.</p>
+                            <p class="help-text" id="content_duration_hint" style="margin:6px 0 0;">💡 Scrolling lines set to "Fit to time" use this as their scroll window.</p>
+                            <!-- Remote: timing is the Master's - it starts/stops the effect and pushes the
+                                 duration - so a remote has no duration control of its own. -->
+                            <p class="help-text" id="content_duration_remote_note" style="display:none; margin:6px 0 0;">⏱ Display duration is controlled by the Master (it starts and stops the effect for every projector). Scrolling lines set to "Fit to time" use the Master's duration as their scroll window.</p>
 
                             <!-- Canvas background preview (FSEQ / video / image) -->
                             <div style="margin-top:10px; padding:10px; background:#616161; border:1px solid #777; border-radius:4px;">
                                 <span style="font-size:13px; font-weight:bold; color:#eee;">Background Preview</span>
                                 <span id="fseq_scrub_hint" style="font-weight:normal; font-size:11px; color:#bbb; margin-left:6px;">Use scroll bar to move preview.</span>
                                 <div id="fseq_preview_controls" style="margin-top:8px;">
+
+                                    <!-- Master with no local projector: preview using a synced remote's
+                                         overlay (its real size + its rendered background). Shown only on a
+                                         master that has synced remotes; defaults to the largest overlay. -->
+                                    <div id="preview_remote_row" style="display:none; margin-bottom:8px; padding:8px; background:#3a3a3a; border:1px solid #555; border-radius:4px;">
+                                        <label style="display:block; margin:0 0 4px; font-size:12px; color:#eee;">🖥️ Preview from projector:</label>
+                                        <select id="preview_remote_select" onchange="onPreviewRemoteChange()" style="width:100%;"></select>
+                                        <p class="help-text" id="preview_remote_note" style="margin:4px 0 0; color:#bbb;"></p>
+                                    </div>
 
                                     <!-- Per-content editor: pick which Names content's text you are
                                          arranging/previewing. Shown only when >1 content is configured. -->
@@ -6558,9 +6745,9 @@ def index():
                                                    style="flex:1;" oninput="fseqScrub(this.value)">
                                             <button type="button" onclick="clearFseqPreview()" style="padding:4px 8px; font-size:11px; background:#555; color:#fff; border:none; border-radius:3px; cursor:pointer;">Clear</button>
                                         </div>
-                                        <div id="fseq_status" style="font-size:11px; color:#888; margin-top:4px; min-height:16px;"></div>
+                                        <div id="fseq_status" style="font-size:11px; color:var(--fg-muted); margin-top:4px; min-height:16px;"></div>
                                     </div>
-                                    <div id="fseq_load_status" style="font-size:11px; color:#888; margin-top:4px; min-height:16px;"></div>
+                                    <div id="fseq_load_status" style="font-size:11px; color:var(--fg-muted); margin-top:4px; min-height:16px;"></div>
                                 </div>
                             </div>
                         </div>
@@ -6597,7 +6784,7 @@ def index():
                 <p class="help-text">💡 Enable a response for each event type individually. Only one response is ever sent per incoming message.</p>
                 <!-- Twilio-specific delivery warnings - hidden when Google Voice is the source -->
                 <div id="twilio_sms_warnings">
-                    <div style="background:#fff3cd; border:1px solid #ffc107; color:#856404; border-radius:5px; padding:10px 14px; margin:10px 0; font-size:13px;">
+                    <div style="background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn-fg); border-radius:5px; padding:10px 14px; margin:10px 0; font-size:13px;">
                         ⚠️ <strong>Message &amp; data rates may apply.</strong>
                     </div>
                     <div style="background:#f8d7da; border:2px solid #f5c6cb; color:#721c24; border-radius:6px; padding:12px 16px; margin:10px 0; font-size:14px; font-weight:bold;">
@@ -6610,17 +6797,17 @@ def index():
                 </div>
 
                 <style>
-                    .resp-row { border: 1px solid #ddd; border-radius: 6px; padding: 12px 14px; margin-bottom: 10px; background: #fafafa; }
-                    .resp-row.enabled { background: #f0f7ff; border-color: #90caf9; }
-                    .resp-row.locked { pointer-events: none; background: #f0f0f0; border-color: #ccc; }
+                    .resp-row { border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; margin-bottom: 10px; background: var(--section-bg); }
+                    .resp-row.enabled { background: var(--note-bg); border-color: var(--note-border); }
+                    .resp-row.locked { pointer-events: none; background: var(--tab-bg); border-color: var(--border-strong); }
                     .resp-row.locked .resp-toggle { opacity: 0.4; }
                     .resp-toggle { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-weight: bold; font-size: 14px; }
                     .resp-row textarea { opacity: 0.4; pointer-events: none; transition: opacity .2s; }
                     .resp-row.locked textarea { opacity: 0.4; }
                     .resp-row.enabled textarea { opacity: 1; pointer-events: auto; }
-                    .reset-default-btn { margin-top: 4px; background: #eee; color: #333; border: 1px solid #ccc; border-radius: 4px; padding: 3px 10px; font-size: 12px; cursor: pointer; opacity: 0.4; pointer-events: none; transition: opacity .2s; }
+                    .reset-default-btn { margin-top: 4px; background: var(--tab-bg); color: var(--fg); border: 1px solid var(--border-strong); border-radius: 4px; padding: 3px 10px; font-size: 12px; cursor: pointer; opacity: 0.4; pointer-events: none; transition: opacity .2s; }
                     .resp-row.enabled .reset-default-btn { opacity: 1; pointer-events: auto; }
-                    .resp-locked-note { font-size: 13px; color: #856404; background: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; padding: 7px 10px; margin: 4px 0 6px; }
+                    .resp-locked-note { font-size: 13px; color: var(--warn-fg); background: var(--warn-bg); border: 1px solid var(--warn-border); border-radius: 4px; padding: 7px 10px; margin: 4px 0 6px; }
                 </style>
 
                 <script>
@@ -6823,7 +7010,7 @@ def index():
                         if (!el || !wl) return;
                         if (wl.checked) {
                             el.textContent = 'Whitelist is On';
-                            el.style.background = '#e8f5e9'; el.style.color = '#2e7d32';
+                            el.style.background = 'var(--ok-bg)'; el.style.color = '#2e7d32';
                         } else {
                             el.textContent = 'Whitelist is Off';
                             el.style.background = '#fdecea'; el.style.color = '#b71c1c';
@@ -6942,15 +7129,29 @@ def index():
             // whether a click should Start (activate) or Stop (deactivate).
             var _pluginLive = false;
 
-            function pluginToggle() {
+            function pluginToggle(force) {
                 var btn = document.getElementById('btn_plugin_toggle');
                 var goingLive = !_pluginLive;
                 var url = goingLive ? '/api/activate' : '/api/deactivate';
+                if (goingLive && force) url += '?force=1';
                 btn.disabled = true; btn.textContent = '...';
                 fetch(url, {method:'POST'})
                 .then(r => r.json())
                 .then(function(d) {
-                    if (goingLive && d.success === false) { alert('Start failed: ' + (d.error || 'Unknown error')); }
+                    if (goingLive && d.success === false) {
+                        // "Nothing to render on" (no overlay + no remotes): warn, but let the
+                        // user proceed - re-send with force once they confirm.
+                        if (d.confirm_required) {
+                            btn.disabled = false;
+                            if (confirm((d.error || 'Nothing is set up to display text.') + '\\n\\nStart anyway?')) {
+                                pluginToggle(true);
+                            } else {
+                                updateLiveStatus();
+                            }
+                            return;
+                        }
+                        alert('Start failed: ' + (d.error || 'Unknown error'));
+                    }
                     updateLiveStatus();
                 })
                 .catch(function() { alert((goingLive ? 'Start' : 'Stop') + ' request failed.'); })
@@ -7004,6 +7205,102 @@ def index():
                 }).catch(() => {});
             }
 
+            // Master only: show how many plugin remotes are currently connected (where pushed
+            // names render), and flag the dead-end case - no overlay model here AND no remotes,
+            // so text has nowhere to display.
+            function updateRemotesIndicator() {
+                var el = document.getElementById('remotes_indicator');
+                if (!el) return;
+                var roleEl = document.getElementById('plugin_role');
+                if (roleEl && roleEl.value === 'remote') { el.style.display = 'none'; return; }
+                fetch('/api/tml/remotes').then(function(r){ return r.json(); }).then(function(d){
+                    if (!d || d.role !== 'master') { el.style.display = 'none'; return; }
+                    updatePreviewRemotes(d.remotes || [], (d.overlay_model || '').trim());
+                    el.style.display = 'block';
+                    if (d.count > 0) {
+                        var names = (d.remotes || []).map(function(x){ return x.name; }).filter(Boolean).join(', ');
+                        el.style.background = '#1b3a24'; el.style.color = '#a5d6a7'; el.style.border = '1px solid #2e5a3a';
+                        el.innerHTML = '🔗 <strong>' + d.count + ' remote' + (d.count === 1 ? '' : 's') +
+                                       ' connected</strong>' + (names ? ' — ' + names : '');
+                    } else if (!(d.overlay_model || '').trim()) {
+                        // Dead end: nothing renders anywhere.
+                        el.style.background = '#4a2c00'; el.style.color = '#ffcc80'; el.style.border = '1px solid #a66a00';
+                        el.innerHTML = '⚠ <strong>No remotes connected and no overlay model selected</strong> — ' +
+                                       'text has nowhere to display. Select an overlay model below, or connect a remote projector.';
+                    } else {
+                        // Fine: this master renders locally on its own overlay model.
+                        el.style.background = '#23262b'; el.style.color = '#aab2bd'; el.style.border = '1px solid #3a3f47';
+                        el.innerHTML = 'ℹ No remotes connected — this master renders text locally on its overlay model (“' +
+                                       (d.overlay_model || '') + '”).';
+                    }
+                }).catch(function(){});
+            }
+
+            // Master "preview from a projector": populate the selector from the synced-remote list
+            // (with overlay sizes), defaulting to the LARGEST overlay - it's easier to scale a
+            // layout down to smaller remotes than up. The selector is hidden when there are no
+            // synced remotes with usable dimensions.
+            window._previewRemote = null;            // {address,name,w,h} or null (= this box)
+            window._previewRemotesList = [];
+            function updatePreviewRemotes(remotes) {
+                var row = document.getElementById('preview_remote_row');
+                var sel = document.getElementById('preview_remote_select');
+                var note = document.getElementById('preview_remote_note');
+                if (!row || !sel) return;
+                var usable = (remotes || []).filter(function(r){ return r.model_w > 0 && r.model_h > 0; });
+                window._previewRemotesList = usable;
+                if (usable.length === 0) {
+                    // No synced remote with a known overlay size → hide and fall back to local/assumed.
+                    if (row.style.display !== 'none') { row.style.display = 'none'; window._previewRemote = null; }
+                    return;
+                }
+                // Largest overlay by pixel area.
+                var largest = usable.slice().sort(function(a,b){ return (b.model_w*b.model_h)-(a.model_w*a.model_h); })[0];
+                var prev = sel.value;
+                sel.innerHTML = '';
+                var optThis = document.createElement('option');
+                optThis.value = ''; optThis.textContent = 'This box (assumed 16:9)';
+                sel.appendChild(optThis);
+                usable.forEach(function(r){
+                    var o = document.createElement('option');
+                    o.value = r.address;
+                    o.textContent = r.name + ' (' + r.model_w + '×' + r.model_h + ')' + (r === largest ? ' — largest' : '');
+                    sel.appendChild(o);
+                });
+                // Keep the user's choice if still present; otherwise default to the largest.
+                var stillThere = usable.some(function(r){ return r.address === prev; });
+                sel.value = (prev && (prev === '' || stillThere)) ? prev : largest.address;
+                row.style.display = 'block';
+                if (note) note.textContent = 'Shows what that projector will display, at its real size, using its overlay.';
+                // Apply the (possibly new default) selection once, on first populate.
+                if (!window._previewRemoteInit) { window._previewRemoteInit = true; onPreviewRemoteChange(); }
+            }
+
+            function onPreviewRemoteChange() {
+                var sel = document.getElementById('preview_remote_select');
+                if (!sel) return;
+                var r = (window._previewRemotesList || []).filter(function(x){ return x.address === sel.value; })[0];
+                if (r) {
+                    window._previewRemote = {address: r.address, name: r.name, w: r.model_w, h: r.model_h};
+                    window._canvasModelW = r.model_w;
+                    window._canvasModelH = r.model_h;
+                } else {
+                    // "This box" → preview THIS instance's own projection: restore its overlay
+                    // model dimensions (or the assumed 480×270 if it has none) so the preview's
+                    // coordinate space matches what this box actually renders. Without this it
+                    // would keep the last-selected remote's size and mis-place everything.
+                    window._previewRemote = null;
+                    window._canvasModelW = parseInt(document.getElementById('overlay_model_width').value)  || 480;
+                    window._canvasModelH = parseInt(document.getElementById('overlay_model_height').value) || 270;
+                }
+                // Re-shape the canvas to the chosen size, then redraw the preview.
+                var canvas = document.getElementById('matrix_canvas');
+                if (canvas && window._canvasModelW > 0 && window._canvasModelH > 0) {
+                    canvas.height = Math.round(canvas.width * window._canvasModelH / window._canvasModelW);
+                }
+                if (typeof window.loadBgPreview === 'function') window.loadBgPreview();
+            }
+
             // Resolves a line's movement ('Center'|'L2R'|'R2L'|'T2B'|'B2T'), defaulting to Center
             function getLineMovement(i) {
                 return (window._lineMovements && window._lineMovements[i]) || 'Center';
@@ -7055,66 +7352,24 @@ def index():
                 window._lineMovements = window._lineMovements || ['Center','Center','Center','Center'];
                 var newMovement = el.value;
                 window._lineMovements[i] = newMovement;
-                // T2B/B2T reads much better with the text itself rotated to match its
-                // vertical travel (a single horizontal line moving straight up/down is an
-                // unusual look) -- default to that unless the line already has an explicit
-                // orientation, so switching to T2B/B2T "just works" without an extra step.
-                if ((newMovement === 'T2B' || newMovement === 'B2T') && getLineOrientation(i) === 'horizontal') {
-                    var orientSel = document.getElementById('line_' + (i + 1) + '_orientation');
-                    if (orientSel) { orientSel.value = 'vertical_rotated'; onLineOrientationChange(i); }
-                }
+                // Changing the movement must NEVER move or resize the box - the box stays
+                // exactly where/what it is; only the way the text travels changes. (We used to
+                // auto-switch orientation here, which swapped the box's W/H; that's gone.)
                 updateLineSpeedRowVisibility(i);
                 updateLineOrientationRowVisibility(i);
                 if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
                 if (typeof saveConfig === 'function') saveConfig();
             }
 
-            // Per-line Orientation select. Swaps the box's W/H when crossing the
-            // horizontal/vertical boundary (either direction) so switching to vertical
-            // starts from a sensible portrait-shaped box instead of a leftover wide one.
+            // Per-line Orientation select. Changing orientation must NEVER move or resize the
+            // box - it only changes how the text is drawn inside the box (horizontal, rotated,
+            // or stacked). The box stays exactly where/what the user set it. (We used to swap
+            // the box's W/H here; that auto-mutation is gone.)
             function onLineOrientationChange(i) {
                 var el = document.getElementById('line_' + (i + 1) + '_orientation');
                 if (!el) return;
                 window._lineOrientations = window._lineOrientations || ['horizontal','horizontal','horizontal','horizontal'];
-                var prev = getLineOrientation(i);
-                var next = el.value;
-                if (isVerticalOrientation(prev) !== isVerticalOrientation(next)) {
-                    var b = window._lineBoxes && window._lineBoxes[i];
-                    // _lineBoxes are stored in MODEL pixel space (window._canvasModelW/H),
-                    // not the preview canvas's own raster size -- matrix_canvas.width is
-                    // always a fixed 640px-wide bitmap scaled to the model's aspect ratio,
-                    // a completely different number from the model's real width/height
-                    // whenever the model isn't 640px wide. Comparing/assigning against the
-                    // canvas element here compared box coordinates against the wrong
-                    // coordinate space and could inflate the box's model-space size well
-                    // past the model's actual extent.
-                    var modelW = window._canvasModelW, modelH = window._canvasModelH;
-                    if (b && modelW && modelH) {
-                        // A plain w<->h swap is wrong when the box was sized to span the
-                        // full overlay along its old axis -- model width and height are
-                        // rarely equal, so reusing the raw old number leaves the new axis
-                        // either short of, or overflowing, the overlay's actual extent.
-                        // Detect "was full span" before swapping and, if so, snap the new
-                        // axis to the overlay's real size on that axis instead.
-                        var wasFullW = b.w >= modelW - 2;
-                        var wasFullH = b.h >= modelH - 2;
-                        if (wasFullW && wasFullH) {
-                            // Box already covered the entire model in both dimensions --
-                            // there's no meaningful "shape" to transpose (the model itself
-                            // usually isn't square), so keep it covering the entire model
-                            // after the flip too instead of collapsing one axis down to the
-                            // other's old (unrelated) size.
-                            b.w = modelW; b.h = modelH;
-                        } else {
-                            var t = b.w; b.w = b.h; b.h = t;
-                            if (isVerticalOrientation(next) && wasFullW) b.h = modelH;
-                            else if (!isVerticalOrientation(next) && wasFullH) b.w = modelW;
-                        }
-                    } else if (b) {
-                        var t2 = b.w; b.w = b.h; b.h = t2;
-                    }
-                }
-                window._lineOrientations[i] = next;
+                window._lineOrientations[i] = el.value;
                 if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
                 if (typeof saveConfig === 'function') saveConfig();
             }
@@ -7208,8 +7463,10 @@ def index():
                 var ctx = canvas.getContext('2d');
                 if (!ctx) return;
 
-                window._canvasModelW = parseInt(document.getElementById('overlay_model_width').value) || 640;
-                window._canvasModelH = parseInt(document.getElementById('overlay_model_height').value) || 360;
+                // No overlay model (valid on a master whose projector is a remote) → assume a
+                // 16:9 preview at 480×270 so text positioning still works.
+                window._canvasModelW = parseInt(document.getElementById('overlay_model_width').value) || 480;
+                window._canvasModelH = parseInt(document.getElementById('overlay_model_height').value) || 270;
                 canvas.width  = 640;
                 canvas.height = Math.round(640 * window._canvasModelH / window._canvasModelW);
 
@@ -7308,12 +7565,19 @@ def index():
                         var mid = Math.floor((lo + hi) / 2);
                         ctx.font = mid + 'px "' + fontName + '", sans-serif';
                         var metrics = ctx.measureText(text);
-                        var w = metrics.width;
                         var ascent = metrics.actualBoundingBoxAscent || mid * 0.8;
                         var descent = metrics.actualBoundingBoxDescent || mid * 0.2;
+                        // INK width (actual glyph extent), matching the device's PIL textbbox.
+                        // The advance width (metrics.width) includes side bearings and disagrees
+                        // between the browser and PIL for decorative fonts - using it left empty
+                        // space in the box and mis-sized the text vs the projector.
+                        var w = (metrics.actualBoundingBoxRight != null && metrics.actualBoundingBoxLeft != null)
+                                ? (metrics.actualBoundingBoxRight + metrics.actualBoundingBoxLeft)
+                                : metrics.width;
                         var h = ascent + descent;
                         if (w <= boxW && h <= boxH) {
-                            best = { size: mid, ascent: ascent, descent: descent };
+                            best = { size: mid, ascent: ascent, descent: descent,
+                                     inkW: w, left: (metrics.actualBoundingBoxLeft || 0) };
                             lo = mid + 1;
                         } else {
                             hi = mid - 1;
@@ -7414,20 +7678,22 @@ def index():
                     }
                 }
 
-                // Returns the 8 resize handle points (4 corners + 4 edge midpoints) for a
-                // box rect, each tagged with its handle key and CSS resize cursor.
+                // Returns the 8 resize handle points (4 corners + 4 edge midpoints) for a box
+                // rect, each tagged with its handle key and CSS resize cursor. The box is a
+                // user-controlled MAX bounding box (text auto-fits to fill it); every line gets
+                // the full set of handles so width and height can be set freely, like resizing an
+                // image in Word/PowerPoint. Corners move two edges, edge handles move one.
                 var HANDLE_SIZE = 8;
                 function getHandlePoints(r) {
-                    var midX = r.x + r.w / 2, midY = r.y + r.h / 2;
                     return {
-                        nw: {x: r.x,       y: r.y,       cursor: 'nwse-resize'},
-                        se: {x: r.x + r.w, y: r.y + r.h, cursor: 'nwse-resize'},
-                        ne: {x: r.x + r.w, y: r.y,       cursor: 'nesw-resize'},
-                        sw: {x: r.x,       y: r.y + r.h, cursor: 'nesw-resize'},
-                        n:  {x: midX,      y: r.y,       cursor: 'ns-resize'},
-                        s:  {x: midX,      y: r.y + r.h, cursor: 'ns-resize'},
-                        e:  {x: r.x + r.w, y: midY,      cursor: 'ew-resize'},
-                        w:  {x: r.x,       y: midY,      cursor: 'ew-resize'}
+                        nw: {x: r.x,           y: r.y,           cursor: 'nwse-resize'},
+                        se: {x: r.x + r.w,     y: r.y + r.h,     cursor: 'nwse-resize'},
+                        ne: {x: r.x + r.w,     y: r.y,           cursor: 'nesw-resize'},
+                        sw: {x: r.x,           y: r.y + r.h,     cursor: 'nesw-resize'},
+                        n:  {x: r.x + r.w / 2, y: r.y,           cursor: 'ns-resize'},
+                        s:  {x: r.x + r.w / 2, y: r.y + r.h,     cursor: 'ns-resize'},
+                        e:  {x: r.x + r.w,     y: r.y + r.h / 2, cursor: 'ew-resize'},
+                        w:  {x: r.x,           y: r.y + r.h / 2, cursor: 'ew-resize'}
                     };
                 }
 
@@ -7454,8 +7720,8 @@ def index():
                 }
 
                 function renderCanvasPreview() {
-                    var mw = window._canvasModelW || 640;
-                    var mh = window._canvasModelH || 360;
+                    var mw = window._canvasModelW || 480;
+                    var mh = window._canvasModelH || 270;
 
                     // Kick off loading of every line's font (no-op if already loaded/loading).
                     // ensureFontLoaded repaints when a font finishes, so a preview drawn before
@@ -7491,6 +7757,22 @@ def index():
                     ctx.textBaseline = 'top';
 
                     lineRects = [null, null, null, null];
+
+                    // A box can never be larger than the model (the preview area). Heal any box
+                    // left oversized by older logic (e.g. a W/H swap that pushed a dimension past
+                    // the model edge) and clamp it back inside, persisting once if anything
+                    // changed so the device uses the same box. Steady state: no change, no save.
+                    var _clampChanged = false;
+                    for (var cbi = 0; cbi < 4; cbi++) {
+                        var cb = window._lineBoxes[cbi]; if (!cb) continue;
+                        if (cb.w > mw) { cb.w = mw; _clampChanged = true; }
+                        if (cb.h > mh) { cb.h = mh; _clampChanged = true; }
+                        if (cb.x !== -1 && cb.x < 0) { cb.x = 0; _clampChanged = true; }
+                        if (cb.y !== -1 && cb.y < 0) { cb.y = 0; _clampChanged = true; }
+                        if (cb.x !== -1 && cb.x + cb.w > mw) { cb.x = Math.max(0, mw - cb.w); _clampChanged = true; }
+                        if (cb.y !== -1 && cb.y + cb.h > mh) { cb.y = Math.max(0, mh - cb.h); _clampChanged = true; }
+                    }
+                    if (_clampChanged && typeof saveConfig === 'function') saveConfig();
 
                     // Precompute each non-empty line's scaled box height for auto-stacking
                     var boxHeights = [0, 0, 0, 0], totalStackHeight = 0;
@@ -7739,9 +8021,12 @@ def index():
                         } else {
                             var fitH = fitTextSize(lineText, fontName, boxW, boxH);
                             ctx.font = fitH.size + 'px "' + fontName + '", sans-serif';
-                            var textWH = ctx.measureText(lineText).width;
+                            var inkWH = fitH.inkW != null ? fitH.inkW : ctx.measureText(lineText).width;
                             var textHH = fitH.ascent + fitH.descent;
-                            var drawXH = boxX + Math.max(0, (boxW - textWH) / 2);
+                            // Center the INK in the box (shift by the left side-bearing so the
+                            // visible glyphs, not the advance box, are centered - matches the
+                            // device, which centers the ink strip).
+                            var drawXH = boxX + Math.max(0, (boxW - inkWH) / 2) + (fitH.left || 0);
                             var drawBaselineH = boxY + Math.max(0, (boxH - textHH) / 2) + fitH.ascent;
                             ctx.textBaseline = 'alphabetic';
                             ctx.fillStyle = getLineColor(i);
@@ -7802,11 +8087,16 @@ def index():
                     var r = lineRects[selectedLine];
                     if (!r) return null;
                     var pts = getHandlePoints(r);
-                    var PAD = 9;
-                    // Corners first so they win over edges on small boxes where zones overlap
+                    // Keep grab zones tight to the handle squares so the box keeps a draggable
+                    // interior for moving it (a handle is resize; the middle is move). On a small
+                    // box, cap the zone to a third of each side so the center stays grabbable
+                    // instead of the handles swallowing the whole box.
+                    var PAD = Math.max(4, Math.min(8, Math.floor(Math.min(r.w, r.h) / 3)));
+                    // Corners first so they win over edges on small boxes where zones overlap.
                     var order = ['nw', 'ne', 'sw', 'se', 'n', 's', 'e', 'w'];
                     for (var idx = 0; idx < order.length; idx++) {
                         var key = order[idx], p = pts[key];
+                        if (!p) continue;
                         if (Math.abs(cx - p.x) <= PAD && Math.abs(cy - p.y) <= PAD) return key;
                     }
                     return null;
@@ -7857,6 +8147,10 @@ def index():
                         var cxClamped = Math.max(0, Math.min(canvas.width,  c.cx));
                         var cyClamped = Math.max(0, Math.min(canvas.height, c.cy));
                         var mx = cxClamped / modelScaleX, my = cyClamped / modelScaleY;
+                        // The box is a user-controlled MAX bounding box: each handle moves its own
+                        // edge(s) freely so width and height are independent (corners move two
+                        // edges, edge handles move one), like resizing an image. Text auto-fits to
+                        // fill the box - the box never changes on its own.
                         var hasW = resizeHandle.indexOf('w') >= 0, hasE = resizeHandle.indexOf('e') >= 0;
                         var hasN = resizeHandle.indexOf('n') >= 0, hasS = resizeHandle.indexOf('s') >= 0;
                         var newLeft   = hasW ? Math.min(mx, resizeFixed.right - MIN_SIZE)  : resizeFixed.left;
@@ -7896,6 +8190,7 @@ def index():
                     if (dragging || resizing) {
                         dragging = false; resizing = false; resizeHandle = null; resizeFixed = null;
                         canvas.style.cursor = hoveredLine >= 0 ? 'grab' : 'default';
+                        // The box stays exactly as the user left it - no snapping to the text.
                         saveConfig();
                     }
                 });
@@ -8093,9 +8388,9 @@ def index():
                             lst.forEach(function(it, i){
                                 var row=document.createElement('div');
                                 var isSel=(i===window._namesSelectedIndex);
-                                row.style.cssText='display:flex;align-items:center;gap:8px;padding:5px 6px;border-bottom:1px solid #eee;border-radius:3px;'+(isSel?'background:#e3f2fd;':'');
+                                row.style.cssText='display:flex;align-items:center;gap:8px;padding:5px 6px;border-bottom:1px solid var(--border);border-radius:3px;'+(isSel?'background:var(--note-bg);':'');
                                 var label=document.createElement('span');
-                                label.style.cssText='flex:1;font-size:13px;color:#333;cursor:pointer;';
+                                label.style.cssText='flex:1;font-size:13px;color:var(--fg);cursor:pointer;';
                                 label.textContent=(i+1)+'. '+(it.content||'(none)');
                                 label.title='Click to edit this content’s text on the Display tab';
                                 label.onclick=function(){ selectNamesItem(i); };
@@ -8387,9 +8682,9 @@ def index():
                         } else {
                             lst.forEach(function(it, i){
                                 var row=document.createElement('div');
-                                row.style.cssText='display:flex;align-items:center;gap:8px;padding:5px 6px;border-bottom:1px solid #eee;border-radius:3px;';
+                                row.style.cssText='display:flex;align-items:center;gap:8px;padding:5px 6px;border-bottom:1px solid var(--border);border-radius:3px;';
                                 var label=document.createElement('span');
-                                label.style.cssText='flex:1;font-size:13px;color:#333;';
+                                label.style.cssText='flex:1;font-size:13px;color:var(--fg);';
                                 var miss=_waitingIsMissing(it.content);
                                 label.textContent=(i+1)+'. '+(it.content||'(none)')+(miss?'  ⚠ missing':'');
                                 if (miss) label.style.color='#c62828';
@@ -8398,7 +8693,7 @@ def index():
                                 // no natural length, so expose an editable seconds field (default 30).
                                 if ((it.content||'').indexOf('img:')===0) {
                                     var dwrap=document.createElement('span');
-                                    dwrap.style.cssText='font-size:12px;color:#555;display:flex;align-items:center;gap:4px;';
+                                    dwrap.style.cssText='font-size:12px;color:var(--fg-muted);display:flex;align-items:center;gap:4px;';
                                     var dnum=document.createElement('input');
                                     dnum.type='number'; dnum.min='1'; dnum.max='3600';
                                     dnum.value=parseInt(it.display_duration)||30;
@@ -8607,12 +8902,59 @@ def index():
                     _contentType = ct.type;
                     _contentFile = ct.file;
                     _fseqSeq     = (ct.type === 'seq') ? ct.file : null;
+                    window._previewAssumedSize = false;   // reset; set true only in the no-model branch
 
                     var loadEl = document.getElementById('fseq_load_status');
                     var scrubHint = document.getElementById('fseq_scrub_hint');
                     loadEl.textContent = 'Loading\u2026';
                     loadEl.style.color = '#aaa';
                     if (scrubHint) scrubHint.style.display = (ct.type === 'img') ? 'none' : '';
+
+                    // No overlay model selected? That is valid on a master whose projector is a
+                    // remote - there are no real model dimensions here. Rather than erroring on the
+                    // background fetch, assume a 16:9 preview (480\u00d7270) so text positioning still
+                    // works, and tell the user the size is assumed. (The exact-size preview with
+                    // the live background returns once a model is selected.)
+                    if (!window._previewRemote && !((document.getElementById('overlay_model_name') || {}).value || '')) {
+                        window._fseqBgImage = null;
+                        // Only FSEQ truly needs the model (to map channels \u2192 pixels). Images and
+                        // videos just get resized server-side, so they can still render at the
+                        // assumed size. The flag below tells the scrubber to skip the background
+                        // fetch for FSEQ only (text-scroll preview), not for video.
+                        window._previewAssumedSize = (ct.type === 'seq');
+                        loadEl.innerHTML = '\u26a0 No overlay model selected \u2014 preview at an assumed 16:9 size (480\u00d7270). '
+                                         + 'Select an overlay model for an exact-size, channel-accurate preview.';
+                        loadEl.style.color = '#ff9800';
+                        if (ct.type === 'seq') {
+                            // Can't render FSEQ pixels without the model's channel map \u2192 show the
+                            // text layout on black, with the scrubber driving the scroll preview.
+                            if (scrubHint) scrubHint.style.display = '';
+                            var _cap = Math.max(1, _previewCapSeconds());
+                            var _sc = document.getElementById('fseq_scrubber');
+                            _sc.max = _cap; _sc.value = 0; window._scrubSeconds = 0;
+                            document.getElementById('fseq_scrubber_row').style.display = '';
+                            document.getElementById('fseq_time_display').textContent = '0:00 / ' + fmtTime(_cap * 1000);
+                            var _st = document.getElementById('fseq_status');
+                            if (_st) _st.textContent = 'Text preview only \u2014 select an overlay model to preview the sequence background';
+                        } else if (ct.type === 'vid') {
+                            // Video frames resize fine without a model - show them + scrubber.
+                            if (scrubHint) scrubHint.style.display = '';
+                            var _cap2 = Math.max(1, _previewCapSeconds());
+                            var _sc2 = document.getElementById('fseq_scrubber');
+                            _sc2.max = _cap2; _sc2.value = 0; window._scrubSeconds = 0;
+                            document.getElementById('fseq_scrubber_row').style.display = '';
+                            document.getElementById('fseq_time_display').textContent = '0:00';
+                            doMediaFetch(0);
+                        } else {
+                            // Image - render once at the assumed size, no scrubber.
+                            if (scrubHint) scrubHint.style.display = 'none';
+                            document.getElementById('fseq_scrubber_row').style.display = 'none';
+                            window._scrubSeconds = 0;
+                            doMediaFetch(0);
+                        }
+                        if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
+                        return;
+                    }
 
                     if (ct.type === 'seq') {
                         // ---- FSEQ: fetch info then show scrubber ----
@@ -8627,7 +8969,11 @@ def index():
                                     return;
                                 }
                                 _fseqMeta = data;
-                                if (data.detected_start_channel) {
+                                if (window._previewRemote) {
+                                    loadEl.textContent = '🖥️ Preview from ' + window._previewRemote.name +
+                                                         ' (' + window._previewRemote.w + '\u00d7' + window._previewRemote.h + ')';
+                                    loadEl.style.color = '#a5d6a7';
+                                } else if (data.detected_start_channel) {
                                     loadEl.textContent = '';
                                 } else {
                                     loadEl.textContent = '\u26a0 Overlay model not found \u2014 verify model name in settings';
@@ -8695,6 +9041,14 @@ def index():
                         Math.round(sec * _fseqMeta.fps),
                         _fseqMeta.frame_count - 1
                     );
+                    // Preview-from-remote: let the chosen remote render the frame with its own
+                    // overlay (channel-accurate), proxied through this master.
+                    if (window._previewRemote) {
+                        _loadImageUrl('/api/tml/remote-frame?remote=' + encodeURIComponent(window._previewRemote.address)
+                            + '&content=' + encodeURIComponent('seq:' + _fseqSeq)
+                            + '&frame='   + frameIdx);
+                        return;
+                    }
                     var mw    = document.getElementById('overlay_model_width').value  || 0;
                     var mh    = document.getElementById('overlay_model_height').value || 0;
                     var model = document.getElementById('overlay_model_name').value   || '';
@@ -8716,8 +9070,17 @@ def index():
 
                 function doMediaFetch(seconds) {
                     if (!_contentType || !_contentFile || _contentType === 'seq') return;
-                    var mw = document.getElementById('overlay_model_width').value  || 0;
-                    var mh = document.getElementById('overlay_model_height').value || 0;
+                    // Preview-from-remote: render on the chosen remote (its overlay size), proxied here.
+                    if (window._previewRemote) {
+                        _loadImageUrl('/api/tml/remote-frame?remote=' + encodeURIComponent(window._previewRemote.address)
+                            + '&content=' + encodeURIComponent(_contentType + ':' + _contentFile)
+                            + '&time='    + Math.floor(seconds));
+                        return;
+                    }
+                    // Images/videos just get resized to these dims server-side (no model needed),
+                    // so when no overlay model is set, fall back to the assumed 16:9 preview size.
+                    var mw = parseInt(document.getElementById('overlay_model_width').value)  || window._canvasModelW || 480;
+                    var mh = parseInt(document.getElementById('overlay_model_height').value) || window._canvasModelH || 270;
                     var url = '/api/media/preview'
                         + '?type='   + _contentType
                         + '&file='   + encodeURIComponent(_contentFile)
@@ -8758,6 +9121,14 @@ def index():
                     window._scrubSeconds = parseFloat(seconds) || 0;
                     if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
                     var loadEl = document.getElementById('fseq_load_status');
+                    if (window._previewAssumedSize) {
+                        // No overlay model → no background frame to fetch; just move the readout
+                        // along the duration window while the scroll preview updates above.
+                        var _cap = Math.max(1, _previewCapSeconds());
+                        document.getElementById('fseq_time_display').textContent =
+                            fmtTime(parseInt(seconds) * 1000) + ' / ' + fmtTime(_cap * 1000);
+                        return;
+                    }
                     if (_contentType === 'seq') {
                         if (!_fseqMeta) return;
                         document.getElementById('fseq_time_display').textContent =
@@ -8838,12 +9209,22 @@ def index():
                     var serverIds = d.names_content_list.map(function(it){ return it.content || ''; });
                     var cur = window._namesContentList || [];
                     var localIds = cur.map(function(it){ return it.content || ''; });
-                    if (JSON.stringify(serverIds) === JSON.stringify(localIds)) return;  // no membership change
+                    // Signature covers both MEMBERSHIP and the master's per-content duration, so a
+                    // duration-only change (the master updated Display Duration) still refreshes the
+                    // preview scrubber here, not just add/remove/reorder.
+                    var sig = function(l){ return JSON.stringify(l.map(function(it){ return [it.content||'', it.display_duration||0]; })); };
+                    if (sig(d.names_content_list) === sig(cur)) return;  // nothing relevant changed
+                    var membershipChanged = JSON.stringify(serverIds) !== JSON.stringify(localIds);
                     var prevSelId = (cur[window._namesSelectedIndex] || {}).content || null;
                     var byId = {}; cur.forEach(function(it){ if (it.content) byId[it.content] = it; });
-                    // Rebuild in server order, keeping the local item (with any in-progress
-                    // layout edits) for surviving ids; use the server item for new ids.
-                    window._namesContentList = d.names_content_list.map(function(it){ return byId[it.content] || it; });
+                    // Rebuild in server order, keeping the local item (with any in-progress layout
+                    // edits) for surviving ids but always adopting the master's duration; use the
+                    // server item for new ids.
+                    window._namesContentList = d.names_content_list.map(function(it){
+                        var local = byId[it.content];
+                        if (local) { local.display_duration = it.display_duration; return local; }
+                        return it;
+                    });
                     var lst = window._namesContentList;
                     var newIdx = -1;
                     if (prevSelId) { for (var i = 0; i < lst.length; i++) { if (lst[i].content === prevSelId) { newIdx = i; break; } } }
@@ -8851,15 +9232,18 @@ def index():
                     var selectionChanged = (newIdx < 0) || !prevSelId || (lst[newIdx] && lst[newIdx].content !== prevSelId);
                     window._namesSelectedIndex = newIdx;
                     if (typeof window.renderNamesList === 'function') window.renderNamesList();
-                    // Only reset the editor if the selected content actually changed (so edits
-                    // to a surviving selected item are not stomped).
-                    if (selectionChanged && newIdx >= 0 && typeof applyLayoutToEditor === 'function') applyLayoutToEditor(lst[newIdx]);
+                    // Only reset the editor if the selected content actually changed (so edits to a
+                    // surviving selected item are not stomped). A duration-only change keeps the
+                    // layout but still needs the preview re-run below so the scrubber re-caps.
+                    if (membershipChanged && selectionChanged && newIdx >= 0 && typeof applyLayoutToEditor === 'function') applyLayoutToEditor(lst[newIdx]);
                     if (typeof window.toggleFseqPreview === 'function') window.toggleFseqPreview();
                 }).catch(function(){});
             }
             setInterval(refreshRemoteNamesContent, 10000);
             _init('liveStatus', updateLiveStatus);
             setInterval(updateLiveStatus, 5000);
+            _init('remotesIndicator', updateRemotesIndicator);
+            setInterval(updateRemotesIndicator, 15000);
             for (var _li = 0; _li < 4; _li++) { updateLineSpeedRowVisibility(_li); updateLineOrientationRowVisibility(_li); }
             initValignButtons();
             (function() {
@@ -9267,7 +9651,7 @@ var _saveTimer = null;
 
             function testConnection() {
                 const result = document.getElementById('twilio_test_result');
-                result.innerHTML = '<span style="color:#555;">Testing...</span>';
+                result.innerHTML = '<span style="color:var(--fg-muted);">Testing...</span>';
                 fetch('/api/test')
                 .then(r => r.json())
                 .then(data => {
@@ -9321,7 +9705,7 @@ var _saveTimer = null;
 
             function testGoogleVoice() {
                 var result = document.getElementById('gv_test_result');
-                result.innerHTML = '<span style="color:#555;">Saving &amp; testing...</span>';
+                result.innerHTML = '<span style="color:var(--fg-muted);">Saving &amp; testing...</span>';
                 // Save first so the server tests the latest credentials, then test.
                 saveConfig();
                 setTimeout(function() {
@@ -9584,6 +9968,9 @@ def update_config():
             # Switched to master: a poller will be (re)started by start_polling_if_needed below.
             if is_remote():
                 polling_generation += 1
+            # Show the Start/Stop scheduler scripts for a master, hide them for a remote (the
+            # master drives a remote - running them there does nothing).
+            sync_scheduler_scripts()
 
         # Normalize phone number to E.164 (strip spaces, dashes, parens - keep + and digits)
         if config.get('twilio_phone_number'):
@@ -10425,39 +10812,21 @@ def fseq_info():
     except Exception as e:
         return _client_error("fseq_info", e, 500)
 
-@app.route('/api/fseq/frame')
-def fseq_frame():
-    """Return a single FSEQ frame as a PNG image for the canvas background preview."""
-    if not PIL_AVAILABLE:
-        return jsonify({'error': 'Pillow not installed - run fpp_install.sh'}), 503
-
-    seq        = request.args.get('sequence', '').strip()
-    frame_idx  = max(0, int(request.args.get('frame', 0)))
-    model_name = request.args.get('model', config.get('overlay_model_name', ''))
-    width      = int(request.args.get('width',  config.get('overlay_model_width',  0)))
-    height     = int(request.args.get('height', config.get('overlay_model_height', 0)))
-    start_ch_override  = request.args.get('start_channel', '').strip()
-    ch_count_override  = request.args.get('channel_count', '').strip()
-
+def _render_fseq_frame_png(seq, frame_idx, model_name, width, height,
+                           start_ch_override='', ch_count_override=''):
+    """Render one FSEQ frame to PNG bytes using the given model/dims. Returns
+    (png_bytes, None) on success or (None, (error_message, http_status)) on failure.
+    Shared by the local preview route and the remote-render endpoint."""
     if not seq:
-        return jsonify({'error': 'No sequence specified'}), 400
+        return None, ('No sequence specified', 400)
     if width <= 0 or height <= 0:
-        # The page sends width/height from hidden inputs that are 0 when the model
-        # dims were resolved server-side but never written back to the form. Resolve
-        # the model's real pixel size (fetched live from FPP and cached) before 400ing.
-        rw, rh = _overlay_model_dims()
-        width  = width  if width  > 0 else rw
-        height = height if height > 0 else rh
-    if width <= 0 or height <= 0:
-        return jsonify({'error': 'Overlay model dimensions unknown - select a model first'}), 400
-
+        return None, ('Overlay model dimensions unknown - select a model first', 400)
     name = seq.removeprefix('seq:').removesuffix('.fseq')
     name = os.path.basename(name)   # no path traversal - keep filename only
     filepath = os.path.join(FSEQ_SEQUENCE_PATH, name + '.fseq')
     if not os.path.exists(filepath):
-        return jsonify({'error': f'Sequence not found: {name}.fseq'}), 404
+        return None, (f'Sequence not found: {name}.fseq', 404)
 
-    # Determine start channel and channel count from FPP model info
     if start_ch_override:
         start_ch_1 = int(start_ch_override)
         ch_count   = int(ch_count_override) if ch_count_override else width * height * 3
@@ -10467,123 +10836,141 @@ def fseq_frame():
         ch_count = ch_count_fpp if ch_count_fpp else width * height * 3
 
     if not start_ch_1:
-        # Overlay models that render on top of a matrix report StartChannel 0, and
-        # some models can't be resolved at all. Rather than failing the preview with
-        # a 400, assume a model-specific / zero-based export and read from the first
-        # channel (frame byte 0). A full-layout export may be offset, but a
-        # best-effort preview beats a hard error.
+        # Overlay-on-matrix models report StartChannel 0, and some can't be resolved;
+        # read from channel 1 rather than failing the preview outright.
         start_ch_1 = 1
-        logging.info(
-            f"FSEQ preview: start channel for model '{model_name}' unknown/zero; "
-            "defaulting to channel 1 (frame byte 0)"
-        )
 
-    try:
-        hdr          = parse_fseq_header(filepath)
-        frame_idx    = min(frame_idx, hdr['frame_count'] - 1)
-        start_ch     = start_ch_1 - 1   # convert to 0-indexed
-        num_pixels   = width * height
-        # bytes_per_pixel: 3 for RGB, 4 for RGBW - derived from actual channel count
-        bpp          = max(3, ch_count // num_pixels) if num_pixels > 0 else 3
+    hdr        = parse_fseq_header(filepath)
+    frame_idx  = min(max(0, frame_idx), hdr['frame_count'] - 1)
+    start_ch   = start_ch_1 - 1   # 0-indexed
+    num_pixels = width * height
+    bpp        = max(3, ch_count // num_pixels) if num_pixels > 0 else 3
+    raw        = read_fseq_frame(hdr, frame_idx, start_ch, ch_count)
 
-        raw = read_fseq_frame(hdr, frame_idx, start_ch, ch_count)
+    img = Image.new('RGB', (width, height))
+    pixels = []
+    for i in range(num_pixels):
+        b = i * bpp
+        if b + 2 < len(raw):
+            pixels.append((raw[b], raw[b + 1], raw[b + 2]))
+        else:
+            pixels.append((0, 0, 0))
+    img.putdata(pixels)
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    return buf.getvalue(), None
 
-        logging.info(
-            f"FSEQ preview: model={model_name} start_ch={start_ch_1} "
-            f"ch_count={ch_count} bpp={bpp} frame={frame_idx} "
-            f"first_px=({raw[0] if raw else '?'},{raw[1] if len(raw)>1 else '?'},"
-            f"{raw[2] if len(raw)>2 else '?'})"
-        )
 
-        img = Image.new('RGB', (width, height))
-        pixels = []
-        for i in range(num_pixels):
-            b = i * bpp
-            if b + 2 < len(raw):
-                pixels.append((raw[b], raw[b + 1], raw[b + 2]))
+def _render_media_png(media_type, filename, time_sec, width, height):
+    """Render an image/video frame to PNG bytes, resized to width x height. Returns
+    (png_bytes, None) or (None, (error_message, http_status))."""
+    if media_type not in ('img', 'vid') or not filename:
+        return None, ('Requires type=img|vid and a file', 400)
+    if width <= 0 or height <= 0:
+        return None, ('Overlay model dimensions unknown - select a model first', 400)
+    filename = os.path.basename(filename)   # no path traversal
+    if media_type == 'img':
+        img_path = os.path.join(FPP_IMAGES_PATH, filename)
+        if not os.path.exists(img_path):
+            return None, (f'Image not found: {filename}', 404)
+        img = Image.open(img_path).convert('RGB').resize((width, height), Image.LANCZOS)
+    else:  # vid
+        vid_path = os.path.join(FPP_VIDEOS_PATH, filename)
+        if not os.path.exists(vid_path):
+            return None, (f'Video not found: {filename}', 404)
+        import subprocess as _sp
+        try:
+            result = _sp.run(['ffmpeg', '-ss', str(time_sec), '-i', vid_path,
+                              '-vframes', '1', '-f', 'image2pipe', '-vcodec', 'png', '-'],
+                             capture_output=True, timeout=10)
+            if result.returncode == 0 and result.stdout:
+                img = Image.open(io.BytesIO(result.stdout)).convert('RGB').resize((width, height), Image.LANCZOS)
             else:
-                pixels.append((0, 0, 0))
-        img.putdata(pixels)
+                img = Image.new('RGB', (width, height), (32, 32, 32))
+        except (FileNotFoundError, _sp.TimeoutExpired):
+            img = Image.new('RGB', (width, height), (32, 32, 32))
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    return buf.getvalue(), None
 
-        buf = io.BytesIO()
-        img.save(buf, format='PNG')
-        buf.seek(0)
-        return Response(buf.read(), mimetype='image/png',
-                        headers={'Cache-Control': 'no-store'})
+
+@app.route('/api/fseq/frame')
+def fseq_frame():
+    """Return a single FSEQ frame as a PNG image for the canvas background preview."""
+    if not PIL_AVAILABLE:
+        return jsonify({'error': 'Pillow not installed - run fpp_install.sh'}), 503
+    seq        = request.args.get('sequence', '').strip()
+    frame_idx  = max(0, int(request.args.get('frame', 0)))
+    model_name = request.args.get('model', config.get('overlay_model_name', ''))
+    width      = int(request.args.get('width',  config.get('overlay_model_width',  0)))
+    height     = int(request.args.get('height', config.get('overlay_model_height', 0)))
+    if width <= 0 or height <= 0:
+        rw, rh = _overlay_model_dims()   # resolve the model's real size live if the form sent 0
+        width  = width  if width  > 0 else rw
+        height = height if height > 0 else rh
+    try:
+        png, err = _render_fseq_frame_png(seq, frame_idx, model_name, width, height,
+                                          request.args.get('start_channel', '').strip(),
+                                          request.args.get('channel_count', '').strip())
+        if err:
+            return jsonify({'error': err[0]}), err[1]
+        return Response(png, mimetype='image/png', headers={'Cache-Control': 'no-store'})
     except Exception as e:
         logging.error(f"FSEQ frame error: {e}")
         return _client_error("fseq_frame", e, 500)
 
+
 @app.route('/api/media/preview')
 def media_preview():
-    """Return a canvas-preview PNG for an image or video file.
-    ?type=img&file=filename.jpg - resize image to model dims and return as PNG.
-    ?type=vid&file=filename.mp4&time=0 - extract a frame at `time` seconds via ffmpeg,
-        resize to model dims, return as PNG.  Falls back to a black frame if ffmpeg
-        is unavailable or extraction fails."""
+    """Return a canvas-preview PNG for an image or video file, resized to the model dims."""
     if not PIL_AVAILABLE:
         return jsonify({'error': 'Pillow not installed - run fpp_install.sh'}), 503
-
-    media_type = request.args.get('type', '').strip()   # 'img' or 'vid'
+    media_type = request.args.get('type', '').strip()
     filename   = request.args.get('file', '').strip()
     time_sec   = max(0.0, float(request.args.get('time', 0)))
     width  = int(request.args.get('width',  config.get('overlay_model_width',  0)))
     height = int(request.args.get('height', config.get('overlay_model_height', 0)))
-
-    if not filename or media_type not in ('img', 'vid'):
-        return jsonify({'error': 'Requires ?type=img|vid&file=filename'}), 400
     if width <= 0 or height <= 0:
-        # Fall back to the model's real size when the page's hidden inputs are 0
-        # (same reason as /api/fseq/frame).
         rw, rh = _overlay_model_dims()
         width  = width  if width  > 0 else rw
         height = height if height > 0 else rh
-    if width <= 0 or height <= 0:
-        return jsonify({'error': 'Overlay model dimensions unknown - select a model first'}), 400
-
-    # Security: no path traversal - strip all directory components
-    filename = os.path.basename(filename)
-
     try:
-        if media_type == 'img':
-            img_path = os.path.join(FPP_IMAGES_PATH, filename)
-            if not os.path.exists(img_path):
-                return jsonify({'error': f'Image not found: {filename}'}), 404
-            img = Image.open(img_path).convert('RGB')
-            img = img.resize((width, height), Image.LANCZOS)
-
-        else:  # vid
-            vid_path = os.path.join(FPP_VIDEOS_PATH, filename)
-            if not os.path.exists(vid_path):
-                return jsonify({'error': f'Video not found: {filename}'}), 404
-            # Try ffmpeg to extract a single frame at the requested timestamp
-            import subprocess as _sp
-            try:
-                result = _sp.run(
-                    [
-                        'ffmpeg', '-ss', str(time_sec), '-i', vid_path,
-                        '-vframes', '1', '-f', 'image2pipe',
-                        '-vcodec', 'png', '-'
-                    ],
-                    capture_output=True, timeout=10
-                )
-                if result.returncode == 0 and result.stdout:
-                    img = Image.open(io.BytesIO(result.stdout)).convert('RGB')
-                    img = img.resize((width, height), Image.LANCZOS)
-                else:
-                    # ffmpeg failed - return a dark grey placeholder
-                    img = Image.new('RGB', (width, height), (32, 32, 32))
-            except (FileNotFoundError, _sp.TimeoutExpired):
-                # ffmpeg not installed on this system - return placeholder
-                img = Image.new('RGB', (width, height), (32, 32, 32))
-
-        buf = io.BytesIO()
-        img.save(buf, format='PNG')
-        buf.seek(0)
-        return Response(buf.read(), mimetype='image/png',
-                        headers={'Cache-Control': 'no-store'})
+        png, err = _render_media_png(media_type, filename, time_sec, width, height)
+        if err:
+            return jsonify({'error': err[0]}), err[1]
+        return Response(png, mimetype='image/png', headers={'Cache-Control': 'no-store'})
     except Exception as e:
         return _client_error("media_preview", e, 500)
+
+
+@app.route('/api/tml/render-frame')
+def api_tml_render_frame():
+    """Render a background preview frame for the given content id using THIS box's OWN overlay
+    model + dimensions, returned as PNG. Lets a master mirror what this projector will show.
+    Trusted-peer accessible (no token) - gated by the before_request MultiSync peer allowlist."""
+    if not PIL_AVAILABLE:
+        return jsonify({'error': 'Pillow not installed'}), 503
+    content   = request.args.get('content', '').strip()
+    frame_idx = max(0, int(request.args.get('frame', 0) or 0))
+    time_sec  = max(0.0, float(request.args.get('time', 0) or 0))
+    model     = config.get('overlay_model_name', '') or ''
+    width, height = _overlay_model_dims()
+    if width <= 0 or height <= 0:
+        return jsonify({'error': 'This box has no overlay model dimensions'}), 400
+    try:
+        if content.startswith('seq:'):
+            png, err = _render_fseq_frame_png(content, frame_idx, model, width, height)
+        elif content.startswith('img:'):
+            png, err = _render_media_png('img', content[4:], 0, width, height)
+        elif content.startswith('vid:'):
+            png, err = _render_media_png('vid', content[4:], time_sec, width, height)
+        else:
+            return jsonify({'error': 'Unsupported content type'}), 400
+        if err:
+            return jsonify({'error': err[0]}), err[1]
+        return Response(png, mimetype='image/png', headers={'Cache-Control': 'no-store'})
+    except Exception as e:
+        return _client_error("api_tml_render_frame", e, 500)
 
 
 @app.route('/api/test')
@@ -11033,28 +11420,72 @@ def view_whitelist():
     <html>
     <head>
         <title>Name Whitelist</title>
+        <script>
+            /* Match FPP's theme: apply ?theme= / browser pref before paint, then honor the
+               parent FPP page's forwarded theme (this page loads in the same iframe). */
+            (function(){ try { var p=new URLSearchParams(location.search).get('theme');
+              var dark=p?(p==='dark'):(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches);
+              document.documentElement.setAttribute('data-theme',dark?'dark':'light'); } catch(e){}
+              window.addEventListener('message',function(e){ if(e.data&&e.data.type==='tml_theme'&&(e.data.theme==='dark'||e.data.theme==='light'))
+                document.documentElement.setAttribute('data-theme',e.data.theme); }); })();
+        </script>
         <style>
-            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #ffffff; color: #333; }
+            :root {
+              --bg:#ffffff; --fg:#333333; --fg-muted:#666666;
+              --card-bg:#ffffff; --section-bg:#f8f8f8;
+              --border:#dddddd; --border-strong:#cccccc; --input-bg:#ffffff;
+              --warn-bg:#fff3cd; --warn-fg:#856404; --warn-border:#ffc107;
+              --note-bg:#e3f2fd; --note-fg:#0d47a1; --note-border:#90caf9;
+              --tab-bg:#f0f0f0; --tab-fg:#555555; --tab-hover:#e8e8e8;
+              --queue-bg:#f3e5f5; --queue-border:#ce93d8;
+              --ok-bg:#e8f5e9; --ok-border:#c8e6c9;
+              --row-alt:#f5f5f5; --shadow:rgba(0,0,0,0.35);
+            }
+            :root[data-theme="dark"] {
+              --bg:#1e2127; --fg:#e6e6e6; --fg-muted:#a0a6b0;
+              --card-bg:#262a31; --section-bg:#23262d;
+              --border:#3a3f47; --border-strong:#4a5059; --input-bg:#2d323a;
+              --warn-bg:#4a3c0a; --warn-fg:#ffd98a; --warn-border:#8a6d00;
+              --note-bg:#0e2a40; --note-fg:#9fd0ff; --note-border:#2b5c82;
+              --tab-bg:#2a2e35; --tab-fg:#b8bec8; --tab-hover:#343941;
+              --queue-bg:#33263a; --queue-border:#6a4a78;
+              --ok-bg:#16341c; --ok-border:#2d5a37;
+              --row-alt:#262a31; --shadow:rgba(0,0,0,0.6);
+            }
+            @media (prefers-color-scheme: dark) {
+              :root:not([data-theme="light"]) {
+                --bg:#1e2127; --fg:#e6e6e6; --fg-muted:#a0a6b0;
+                --card-bg:#262a31; --section-bg:#23262d;
+                --border:#3a3f47; --border-strong:#4a5059; --input-bg:#2d323a;
+                --warn-bg:#4a3c0a; --warn-fg:#ffd98a; --warn-border:#8a6d00;
+                --note-bg:#0e2a40; --note-fg:#9fd0ff; --note-border:#2b5c82;
+                --tab-bg:#2a2e35; --tab-fg:#b8bec8; --tab-hover:#343941;
+                --queue-bg:#33263a; --queue-border:#6a4a78;
+                --ok-bg:#16341c; --ok-border:#2d5a37;
+                --row-alt:#262a31; --shadow:rgba(0,0,0,0.6);
+              }
+            }
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: var(--bg); color: var(--fg); }
             h1 { color: #4CAF50; }
             table { width: 100%; border-collapse: collapse; margin: 10px 0; }
-            th, td { border: 1px solid #ddd; padding: 8px 10px; text-align: left; }
+            th, td { border: 1px solid var(--border); padding: 8px 10px; text-align: left; }
             th { background: #4CAF50; color: white; }
-            tr:nth-child(even) { background: #f5f5f5; }
+            tr:nth-child(even) { background: var(--row-alt); }
             button { background: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin: 5px 5px 5px 0; }
             button:hover { background: #45a049; }
             .remove-btn { background: #f44336; padding: 4px 10px; font-size: 12px; margin: 0; }
             .remove-btn:hover { background: #d32f2f; }
             .add-btn { background: #2196F3; }
             .add-btn:hover { background: #0b7dda; }
-            .info { background: #e8f5e9; padding: 10px; border-radius: 5px; margin: 10px 0; font-size: 14px; border: 1px solid #c8e6c9; }
+            .info { background: var(--ok-bg); padding: 10px; border-radius: 5px; margin: 10px 0; font-size: 14px; border: 1px solid var(--ok-border); }
             .add-row { display: flex; gap: 10px; margin: 12px 0; }
-            .add-row input { flex: 1; padding: 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
+            .add-row input { flex: 1; padding: 10px; border: 1px solid var(--border-strong); border-radius: 4px; font-size: 14px; }
             .search-row { display: flex; gap: 10px; margin: 12px 0; }
             .search-row input { flex: 1; padding: 10px; border: 2px solid #4CAF50; border-radius: 4px; font-size: 14px; }
-            .hint { color: #888; font-size: 13px; margin: 6px 0; }
+            .hint { color: var(--fg-muted); font-size: 13px; margin: 6px 0; }
             .error { color: #f44336; font-size: 13px; }
             .success { color: #4CAF50; font-size: 13px; }
-            .empty { background: #f5f5f5; padding: 30px; text-align: center; border-radius: 5px; margin: 20px 0; }
+            .empty { background: var(--row-alt); padding: 30px; text-align: center; border-radius: 5px; margin: 20px 0; }
         </style>
     </head>
     <body><script>if('scrollRestoration'in history)history.scrollRestoration='manual';function _toTop(){window.scrollTo(0,0);document.documentElement.scrollTop=0;document.body.scrollTop=0;try{window.parent.postMessage({type:'scrollTop'},'*');}catch(e){}}_toTop();document.addEventListener('DOMContentLoaded',_toTop);window.addEventListener('load',_toTop);</script>
@@ -11063,12 +11494,12 @@ def view_whitelist():
             Only names on this list are accepted when the whitelist is enabled. &nbsp;|&nbsp; <strong id="count">Loading...</strong>
         </div>
         {% if not config.get('use_whitelist', False) %}
-        <div style="background:#fff3cd; border:1px solid #ffc107; color:#856404; padding:10px 14px; border-radius:5px; margin:10px 0; font-size:14px; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+        <div style="background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn-fg); padding:10px 14px; border-radius:5px; margin:10px 0; font-size:14px; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
             <span>⚠️ <strong>Whitelist is not enabled</strong> - All names will be shown regardless of this list.</span>
             <button onclick="toggleSetting('use_whitelist', true)" style="background:#4CAF50; color:white; border:none; padding:6px 14px; border-radius:4px; cursor:pointer; font-size:13px; white-space:nowrap;">✓ Enable Whitelist</button>
         </div>
         {% else %}
-        <div style="background:#e8f5e9; border:1px solid #a5d6a7; color:#2e7d32; padding:10px 14px; border-radius:5px; margin:10px 0; font-size:14px; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+        <div style="background:var(--ok-bg); border:1px solid #a5d6a7; color:#2e7d32; padding:10px 14px; border-radius:5px; margin:10px 0; font-size:14px; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
             <span>✅ <strong>Whitelist is enabled</strong></span>
             <button onclick="toggleSetting('use_whitelist', false)" style="background:#f44336; color:white; border:none; padding:6px 14px; border-radius:4px; cursor:pointer; font-size:13px; white-space:nowrap;">✗ Disable Whitelist</button>
         </div>
@@ -11247,13 +11678,57 @@ def view_blacklist_page():
     <html>
     <head>
         <title>Profanity Filter - Blacklist</title>
+        <script>
+            /* Match FPP's theme: apply ?theme= / browser pref before paint, then honor the
+               parent FPP page's forwarded theme (this page loads in the same iframe). */
+            (function(){ try { var p=new URLSearchParams(location.search).get('theme');
+              var dark=p?(p==='dark'):(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches);
+              document.documentElement.setAttribute('data-theme',dark?'dark':'light'); } catch(e){}
+              window.addEventListener('message',function(e){ if(e.data&&e.data.type==='tml_theme'&&(e.data.theme==='dark'||e.data.theme==='light'))
+                document.documentElement.setAttribute('data-theme',e.data.theme); }); })();
+        </script>
         <style>
-            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #ffffff; color: #333; }
+            :root {
+              --bg:#ffffff; --fg:#333333; --fg-muted:#666666;
+              --card-bg:#ffffff; --section-bg:#f8f8f8;
+              --border:#dddddd; --border-strong:#cccccc; --input-bg:#ffffff;
+              --warn-bg:#fff3cd; --warn-fg:#856404; --warn-border:#ffc107;
+              --note-bg:#e3f2fd; --note-fg:#0d47a1; --note-border:#90caf9;
+              --tab-bg:#f0f0f0; --tab-fg:#555555; --tab-hover:#e8e8e8;
+              --queue-bg:#f3e5f5; --queue-border:#ce93d8;
+              --ok-bg:#e8f5e9; --ok-border:#c8e6c9;
+              --row-alt:#f5f5f5; --shadow:rgba(0,0,0,0.35);
+            }
+            :root[data-theme="dark"] {
+              --bg:#1e2127; --fg:#e6e6e6; --fg-muted:#a0a6b0;
+              --card-bg:#262a31; --section-bg:#23262d;
+              --border:#3a3f47; --border-strong:#4a5059; --input-bg:#2d323a;
+              --warn-bg:#4a3c0a; --warn-fg:#ffd98a; --warn-border:#8a6d00;
+              --note-bg:#0e2a40; --note-fg:#9fd0ff; --note-border:#2b5c82;
+              --tab-bg:#2a2e35; --tab-fg:#b8bec8; --tab-hover:#343941;
+              --queue-bg:#33263a; --queue-border:#6a4a78;
+              --ok-bg:#16341c; --ok-border:#2d5a37;
+              --row-alt:#262a31; --shadow:rgba(0,0,0,0.6);
+            }
+            @media (prefers-color-scheme: dark) {
+              :root:not([data-theme="light"]) {
+                --bg:#1e2127; --fg:#e6e6e6; --fg-muted:#a0a6b0;
+                --card-bg:#262a31; --section-bg:#23262d;
+                --border:#3a3f47; --border-strong:#4a5059; --input-bg:#2d323a;
+                --warn-bg:#4a3c0a; --warn-fg:#ffd98a; --warn-border:#8a6d00;
+                --note-bg:#0e2a40; --note-fg:#9fd0ff; --note-border:#2b5c82;
+                --tab-bg:#2a2e35; --tab-fg:#b8bec8; --tab-hover:#343941;
+                --queue-bg:#33263a; --queue-border:#6a4a78;
+                --ok-bg:#16341c; --ok-border:#2d5a37;
+                --row-alt:#262a31; --shadow:rgba(0,0,0,0.6);
+              }
+            }
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: var(--bg); color: var(--fg); }
             h1 { color: #f44336; }
             table { width: 100%; border-collapse: collapse; margin: 10px 0; }
-            th, td { border: 1px solid #ddd; padding: 8px 10px; text-align: left; }
+            th, td { border: 1px solid var(--border); padding: 8px 10px; text-align: left; }
             th { background: #f44336; color: white; }
-            tr:nth-child(even) { background: #f5f5f5; }
+            tr:nth-child(even) { background: var(--row-alt); }
             button { background: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin: 5px 5px 5px 0; }
             button:hover { background: #45a049; }
             .remove-btn { background: #f44336; padding: 4px 10px; font-size: 12px; margin: 0; }
@@ -11262,13 +11737,13 @@ def view_blacklist_page():
             .add-btn:hover { background: #0b7dda; }
             .info { background: #fce4e4; padding: 10px; border-radius: 5px; margin: 10px 0; font-size: 14px; border: 1px solid #f5c6c6; }
             .add-row { display: flex; gap: 10px; margin: 12px 0; }
-            .add-row input { flex: 1; padding: 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
+            .add-row input { flex: 1; padding: 10px; border: 1px solid var(--border-strong); border-radius: 4px; font-size: 14px; }
             .search-row { display: flex; gap: 10px; margin: 12px 0; }
             .search-row input { flex: 1; padding: 10px; border: 2px solid #f44336; border-radius: 4px; font-size: 14px; }
-            .hint { color: #888; font-size: 13px; margin: 6px 0; }
+            .hint { color: var(--fg-muted); font-size: 13px; margin: 6px 0; }
             .error { color: #f44336; font-size: 13px; }
             .success { color: #4CAF50; font-size: 13px; }
-            .empty { background: #f5f5f5; padding: 30px; text-align: center; border-radius: 5px; margin: 20px 0; }
+            .empty { background: var(--row-alt); padding: 30px; text-align: center; border-radius: 5px; margin: 20px 0; }
         </style>
     </head>
     <body><script>if('scrollRestoration'in history)history.scrollRestoration='manual';function _toTop(){window.scrollTo(0,0);document.documentElement.scrollTop=0;document.body.scrollTop=0;try{window.parent.postMessage({type:'scrollTop'},'*');}catch(e){}}_toTop();document.addEventListener('DOMContentLoaded',_toTop);window.addEventListener('load',_toTop);</script>
@@ -11277,12 +11752,12 @@ def view_blacklist_page():
             ℹ️ Messages containing any word on this list are rejected by the profanity filter. &nbsp;|&nbsp; <strong id="count">Loading...</strong>
         </div>
         {% if not config.get('profanity_filter', True) %}
-        <div style="background:#fff3cd; border:1px solid #ffc107; color:#856404; padding:10px 14px; border-radius:5px; margin:10px 0; font-size:14px; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+        <div style="background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn-fg); padding:10px 14px; border-radius:5px; margin:10px 0; font-size:14px; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
             <span>⚠️ <strong>Blacklist is not enabled</strong> - Words on this list will still be shown.</span>
             <button onclick="toggleSetting('profanity_filter', true)" style="background:#4CAF50; color:white; border:none; padding:6px 14px; border-radius:4px; cursor:pointer; font-size:13px; white-space:nowrap;">✓ Enable Profanity Filter</button>
         </div>
         {% else %}
-        <div style="background:#e8f5e9; border:1px solid #a5d6a7; color:#2e7d32; padding:10px 14px; border-radius:5px; margin:10px 0; font-size:14px; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+        <div style="background:var(--ok-bg); border:1px solid #a5d6a7; color:#2e7d32; padding:10px 14px; border-radius:5px; margin:10px 0; font-size:14px; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
             <span>✅ <strong>Profanity Filter is enabled</strong></span>
             <button onclick="toggleSetting('profanity_filter', false)" style="background:#f44336; color:white; border:none; padding:6px 14px; border-radius:4px; cursor:pointer; font-size:13px; white-space:nowrap;">✗ Disable Profanity Filter</button>
         </div>
@@ -11462,17 +11937,61 @@ def view_blocklist():
     <html>
     <head>
         <title>Blocked Phone Numbers</title>
+        <script>
+            /* Match FPP's theme: apply ?theme= / browser pref before paint, then honor the
+               parent FPP page's forwarded theme (this page loads in the same iframe). */
+            (function(){ try { var p=new URLSearchParams(location.search).get('theme');
+              var dark=p?(p==='dark'):(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches);
+              document.documentElement.setAttribute('data-theme',dark?'dark':'light'); } catch(e){}
+              window.addEventListener('message',function(e){ if(e.data&&e.data.type==='tml_theme'&&(e.data.theme==='dark'||e.data.theme==='light'))
+                document.documentElement.setAttribute('data-theme',e.data.theme); }); })();
+        </script>
         <style>
-            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #ffffff; color: #333; }
+            :root {
+              --bg:#ffffff; --fg:#333333; --fg-muted:#666666;
+              --card-bg:#ffffff; --section-bg:#f8f8f8;
+              --border:#dddddd; --border-strong:#cccccc; --input-bg:#ffffff;
+              --warn-bg:#fff3cd; --warn-fg:#856404; --warn-border:#ffc107;
+              --note-bg:#e3f2fd; --note-fg:#0d47a1; --note-border:#90caf9;
+              --tab-bg:#f0f0f0; --tab-fg:#555555; --tab-hover:#e8e8e8;
+              --queue-bg:#f3e5f5; --queue-border:#ce93d8;
+              --ok-bg:#e8f5e9; --ok-border:#c8e6c9;
+              --row-alt:#f5f5f5; --shadow:rgba(0,0,0,0.35);
+            }
+            :root[data-theme="dark"] {
+              --bg:#1e2127; --fg:#e6e6e6; --fg-muted:#a0a6b0;
+              --card-bg:#262a31; --section-bg:#23262d;
+              --border:#3a3f47; --border-strong:#4a5059; --input-bg:#2d323a;
+              --warn-bg:#4a3c0a; --warn-fg:#ffd98a; --warn-border:#8a6d00;
+              --note-bg:#0e2a40; --note-fg:#9fd0ff; --note-border:#2b5c82;
+              --tab-bg:#2a2e35; --tab-fg:#b8bec8; --tab-hover:#343941;
+              --queue-bg:#33263a; --queue-border:#6a4a78;
+              --ok-bg:#16341c; --ok-border:#2d5a37;
+              --row-alt:#262a31; --shadow:rgba(0,0,0,0.6);
+            }
+            @media (prefers-color-scheme: dark) {
+              :root:not([data-theme="light"]) {
+                --bg:#1e2127; --fg:#e6e6e6; --fg-muted:#a0a6b0;
+                --card-bg:#262a31; --section-bg:#23262d;
+                --border:#3a3f47; --border-strong:#4a5059; --input-bg:#2d323a;
+                --warn-bg:#4a3c0a; --warn-fg:#ffd98a; --warn-border:#8a6d00;
+                --note-bg:#0e2a40; --note-fg:#9fd0ff; --note-border:#2b5c82;
+                --tab-bg:#2a2e35; --tab-fg:#b8bec8; --tab-hover:#343941;
+                --queue-bg:#33263a; --queue-border:#6a4a78;
+                --ok-bg:#16341c; --ok-border:#2d5a37;
+                --row-alt:#262a31; --shadow:rgba(0,0,0,0.6);
+              }
+            }
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: var(--bg); color: var(--fg); }
             h1 { color: #f44336; }
             table { width: 100%; border-collapse: collapse; margin: 20px 0; }
-            th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
+            th, td { border: 1px solid var(--border); padding: 10px; text-align: left; }
             th { background: #f44336; color: white; }
-            tr:nth-child(even) { background: #f5f5f5; }
+            tr:nth-child(even) { background: var(--row-alt); }
             button { background: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin: 10px 5px 10px 0; }
             .unblock-btn { background: #4CAF50; padding: 5px 10px; font-size: 12px; }
-            .info { background: #ffebee; padding: 10px; border-radius: 5px; margin: 10px 0; font-size: 14px; border: 1px solid #ffcdd2; color: #333; }
-            .no-blocked { background: #f5f5f5; padding: 40px; text-align: center; border-radius: 5px; margin: 20px 0; }
+            .info { background: #ffebee; padding: 10px; border-radius: 5px; margin: 10px 0; font-size: 14px; border: 1px solid #ffcdd2; color: var(--fg); }
+            .no-blocked { background: var(--row-alt); padding: 40px; text-align: center; border-radius: 5px; margin: 20px 0; }
         </style>
     </head>
     <body><script>if('scrollRestoration'in history)history.scrollRestoration='manual';function _toTop(){window.scrollTo(0,0);document.documentElement.scrollTop=0;document.body.scrollTop=0;try{window.parent.postMessage({type:'scrollTop'},'*');}catch(e){}}_toTop();document.addEventListener('DOMContentLoaded',_toTop);window.addEventListener('load',_toTop);</script>
@@ -11533,9 +12052,29 @@ def status_page():
     <html>
     <head>
         <title>Plugin Status</title>
+        <script>
+            /* Match FPP's theme (f-string template → braces doubled). ?theme= / browser pref
+               before paint, then honor the parent FPP page's forwarded theme. */
+            (function(){{ try {{ var p=new URLSearchParams(location.search).get('theme');
+              var dark=p?(p==='dark'):(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches);
+              document.documentElement.setAttribute('data-theme',dark?'dark':'light'); }} catch(e){{}}
+              window.addEventListener('message',function(e){{ if(e.data&&e.data.type==='tml_theme'&&(e.data.theme==='dark'||e.data.theme==='light'))
+                document.documentElement.setAttribute('data-theme',e.data.theme); }}); }})();
+        </script>
         <style>
-            body {{ font-family: monospace; background: #ffffff; color: #333; padding: 20px; }}
-            .section {{ background: #f5f5f5; padding: 15px; margin: 15px 0; border: 1px solid #ddd; }}
+            :root {{
+              --bg:#ffffff; --fg:#333333; --section-bg:#f5f5f5; --border:#dddddd;
+            }}
+            :root[data-theme="dark"] {{
+              --bg:#1e2127; --fg:#e6e6e6; --section-bg:#23262d; --border:#3a3f47;
+            }}
+            @media (prefers-color-scheme: dark) {{
+              :root:not([data-theme="light"]) {{
+                --bg:#1e2127; --fg:#e6e6e6; --section-bg:#23262d; --border:#3a3f47;
+              }}
+            }}
+            body {{ font-family: monospace; background: var(--bg); color: var(--fg); padding: 20px; }}
+            .section {{ background: var(--section-bg); padding: 15px; margin: 15px 0; border: 1px solid var(--border); }}
             .ok {{ color: #4CAF50; }}
             .error {{ color: #f44336; }}
             button {{ background: #4CAF50; color: white; padding: 10px; border: none; cursor: pointer; margin: 5px; }}
@@ -11585,13 +12124,57 @@ def view_messages():
     <html>
     <head>
         <title>Message History & Queue</title>
+        <script>
+            /* Match FPP's theme: apply ?theme= / browser pref before paint, then honor the
+               parent FPP page's forwarded theme (this page loads in the same iframe). */
+            (function(){ try { var p=new URLSearchParams(location.search).get('theme');
+              var dark=p?(p==='dark'):(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches);
+              document.documentElement.setAttribute('data-theme',dark?'dark':'light'); } catch(e){}
+              window.addEventListener('message',function(e){ if(e.data&&e.data.type==='tml_theme'&&(e.data.theme==='dark'||e.data.theme==='light'))
+                document.documentElement.setAttribute('data-theme',e.data.theme); }); })();
+        </script>
         <style>
-            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #ffffff; color: #333; }
+            :root {
+              --bg:#ffffff; --fg:#333333; --fg-muted:#666666;
+              --card-bg:#ffffff; --section-bg:#f8f8f8;
+              --border:#dddddd; --border-strong:#cccccc; --input-bg:#ffffff;
+              --warn-bg:#fff3cd; --warn-fg:#856404; --warn-border:#ffc107;
+              --note-bg:#e3f2fd; --note-fg:#0d47a1; --note-border:#90caf9;
+              --tab-bg:#f0f0f0; --tab-fg:#555555; --tab-hover:#e8e8e8;
+              --queue-bg:#f3e5f5; --queue-border:#ce93d8;
+              --ok-bg:#e8f5e9; --ok-border:#c8e6c9;
+              --row-alt:#f5f5f5; --shadow:rgba(0,0,0,0.35);
+            }
+            :root[data-theme="dark"] {
+              --bg:#1e2127; --fg:#e6e6e6; --fg-muted:#a0a6b0;
+              --card-bg:#262a31; --section-bg:#23262d;
+              --border:#3a3f47; --border-strong:#4a5059; --input-bg:#2d323a;
+              --warn-bg:#4a3c0a; --warn-fg:#ffd98a; --warn-border:#8a6d00;
+              --note-bg:#0e2a40; --note-fg:#9fd0ff; --note-border:#2b5c82;
+              --tab-bg:#2a2e35; --tab-fg:#b8bec8; --tab-hover:#343941;
+              --queue-bg:#33263a; --queue-border:#6a4a78;
+              --ok-bg:#16341c; --ok-border:#2d5a37;
+              --row-alt:#262a31; --shadow:rgba(0,0,0,0.6);
+            }
+            @media (prefers-color-scheme: dark) {
+              :root:not([data-theme="light"]) {
+                --bg:#1e2127; --fg:#e6e6e6; --fg-muted:#a0a6b0;
+                --card-bg:#262a31; --section-bg:#23262d;
+                --border:#3a3f47; --border-strong:#4a5059; --input-bg:#2d323a;
+                --warn-bg:#4a3c0a; --warn-fg:#ffd98a; --warn-border:#8a6d00;
+                --note-bg:#0e2a40; --note-fg:#9fd0ff; --note-border:#2b5c82;
+                --tab-bg:#2a2e35; --tab-fg:#b8bec8; --tab-hover:#343941;
+                --queue-bg:#33263a; --queue-border:#6a4a78;
+                --ok-bg:#16341c; --ok-border:#2d5a37;
+                --row-alt:#262a31; --shadow:rgba(0,0,0,0.6);
+              }
+            }
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: var(--bg); color: var(--fg); }
             h1 { color: #4CAF50; }
             table { width: 100%; border-collapse: collapse; margin: 20px 0; }
-            th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
+            th, td { border: 1px solid var(--border); padding: 10px; text-align: left; }
             th { background: #4CAF50; color: white; }
-            tr:nth-child(even) { background: #f5f5f5; }
+            tr:nth-child(even) { background: var(--row-alt); }
             .displaying { background: #4CAF50 !important; color: white; font-weight: bold; }
             .queued { color: #e65100; }
             .displayed { color: #4CAF50; }
@@ -11599,13 +12182,13 @@ def view_messages():
             .block-btn { background: #f44336; padding: 5px 10px; font-size: 12px; }
             .respond-btn { background: #1976d2; padding: 4px 10px; font-size: 12px; margin: 0 0 0 8px; }
             .clear-btn { background: #f44336; }
-            .info { background: #e3f2fd; padding: 10px; border-radius: 5px; margin: 10px 0; font-size: 14px; border: 1px solid #90caf9; color: #333; }
-            .queue-box { background: #f3e5f5; padding: 20px; border-radius: 5px; margin: 20px 0; border: 1px solid #ce93d8; color: #333; }
+            .info { background: var(--note-bg); padding: 10px; border-radius: 5px; margin: 10px 0; font-size: 14px; border: 1px solid #90caf9; color: var(--fg); }
+            .queue-box { background: #f3e5f5; padding: 20px; border-radius: 5px; margin: 20px 0; border: 1px solid #ce93d8; color: var(--fg); }
             .current-display { background: #4CAF50; padding: 15px; border-radius: 5px; margin: 10px 0; font-size: 18px; font-weight: bold; color: white; }
             .queue-item { background: #f9f9f9; padding: 10px; border-radius: 5px; margin: 5px 0; border-left: 4px solid #FF9800; }
             .tab-bar { display: flex; flex-wrap: wrap; gap: 4px; margin: 16px 0 0; border-bottom: 2px solid #4CAF50; }
-            .tab-btn { padding: 8px 14px; border: 1px solid #ddd; border-bottom: none; background: #f5f5f5; cursor: pointer; border-radius: 4px 4px 0 0; font-size: 13px; color: #555; }
-            .tab-btn:hover { background: #e8f5e9; }
+            .tab-btn { padding: 8px 14px; border: 1px solid var(--border); border-bottom: none; background: var(--row-alt); cursor: pointer; border-radius: 4px 4px 0 0; font-size: 13px; color: #555; }
+            .tab-btn:hover { background: var(--ok-bg); }
             .tab-btn.active { background: #4CAF50; color: white; border-color: #4CAF50; font-weight: bold; }
             .tab-panel { display: none; padding-top: 16px; }
             .tab-panel.active { display: block; }
@@ -11646,11 +12229,11 @@ def view_messages():
 
         <!-- Block modal -->
         <div id="block-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:1000; align-items:center; justify-content:center;">
-            <div style="background:#fff; border-radius:8px; padding:28px; max-width:420px; width:90%; box-shadow:0 4px 20px rgba(0,0,0,0.3);">
-                <h3 style="margin-top:0; color:#333;">Block Action</h3>
-                <p style="color:#555; margin-bottom:6px;">Phone: <strong id="modal-phone"></strong></p>
-                <p style="color:#555; margin-bottom:20px;">Name: <strong id="modal-name-text"></strong></p>
-                <p style="color:#333; font-weight:bold; margin-bottom:16px;">What would you like to block?</p>
+            <div style="background:var(--card-bg); border-radius:8px; padding:28px; max-width:420px; width:90%; box-shadow:0 4px 20px rgba(0,0,0,0.3);">
+                <h3 style="margin-top:0; color:var(--fg);">Block Action</h3>
+                <p style="color:var(--fg-muted); margin-bottom:6px;">Phone: <strong id="modal-phone"></strong></p>
+                <p style="color:var(--fg-muted); margin-bottom:20px;">Name: <strong id="modal-name-text"></strong></p>
+                <p style="color:var(--fg); font-weight:bold; margin-bottom:16px;">What would you like to block?</p>
                 <div style="display:flex; flex-direction:column; gap:10px;">
                     <button style="background:#f44336; color:white; padding:12px; border:none; border-radius:5px; cursor:pointer;"
                             onclick="blockPhone()">Block this number from texting again</button>
@@ -11667,11 +12250,11 @@ def view_messages():
 
         <!-- Respond modal -->
         <div id="respond-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:1000; align-items:center; justify-content:center;">
-            <div style="background:#fff; border-radius:8px; padding:28px; max-width:460px; width:90%; box-shadow:0 4px 20px rgba(0,0,0,0.3);">
-                <h3 style="margin-top:0; color:#333;">Send a Reply</h3>
-                <p style="color:#555; margin-bottom:12px;">To: <strong id="respond-to"></strong></p>
+            <div style="background:var(--card-bg); border-radius:8px; padding:28px; max-width:460px; width:90%; box-shadow:0 4px 20px rgba(0,0,0,0.3);">
+                <h3 style="margin-top:0; color:var(--fg);">Send a Reply</h3>
+                <p style="color:var(--fg-muted); margin-bottom:12px;">To: <strong id="respond-to"></strong></p>
                 <textarea id="respond-text" rows="4" maxlength="300"
-                          style="width:100%; box-sizing:border-box; padding:10px; border:1px solid #ccc; border-radius:5px; font-size:14px; font-family:inherit; resize:vertical;"
+                          style="width:100%; box-sizing:border-box; padding:10px; border:1px solid var(--border-strong); border-radius:5px; font-size:14px; font-family:inherit; resize:vertical;"
                           placeholder="Type your reply..."></textarea>
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-top:6px;">
                     <span id="respond-count" style="color:#999; font-size:12px;">0 / 300</span>
@@ -11769,7 +12352,7 @@ def view_messages():
                     html += '<div class="current-display">NOW DISPLAYING: ' + esc(status.currently_displaying.name) +
                             ' (from ***' + esc(status.currently_displaying.phone_last4) + ')</div>';
                 } else {
-                    html += '<div class="current-display" style="background:#bdbdbd;color:#333;">Nothing currently displaying</div>';
+                    html += '<div class="current-display" style="background:#bdbdbd;color:var(--fg);">Nothing currently displaying</div>';
                 }
                 if (status.queue_length > 0) {
                     html += '<h3 style="color:#FF9800;margin-top:20px;">Queue (' + status.queue_length + ' waiting):</h3>';
@@ -11793,7 +12376,7 @@ def view_messages():
 
             function renderTable(messages, showBlock) {
                 if (!messages || messages.length === 0) {
-                    return '<div style="background:#f5f5f5;padding:40px;text-align:center;border-radius:5px;"><h3>No messages</h3></div>';
+                    return '<div style="background:var(--row-alt);padding:40px;text-align:center;border-radius:5px;"><h3>No messages</h3></div>';
                 }
                 var statusLabel = {'displaying':'DISPLAYING NOW','queued':'Queued','displayed':'Displayed'};
                 var rows = messages.map(function(msg) {
@@ -11942,20 +12525,72 @@ def view_messages():
 
 @app.route('/api/tml/ping', methods=['GET'])
 def api_tml_ping():
-    """Identify this instance to a discovering peer: plugin name + effective role, plus a
-    friendly name and source number so a remote can tell multiple masters apart. A master
-    pushes only to peers that answer here with role == 'remote'."""
+    """Identify this instance to a discovering peer: plugin name + effective role, a friendly
+    name and source number (so a remote can tell masters apart), this box's overlay model size,
+    and - for a remote - whether the CALLER is the master it is pinned to (so a master can limit
+    the preview to remotes actually synced to it). A master pushes only to role == 'remote' peers."""
+    mw, mh = _overlay_model_dims()
     return jsonify({"plugin": "textmylights", "role": get_plugin_role(),
-                    "name": _instance_label(), "phone": _instance_phone_label()})
+                    "name": _instance_label(), "phone": _instance_phone_label(),
+                    "model_w": mw, "model_h": mh,
+                    "overlay_model": config.get('overlay_model_name', '') or '',
+                    "synced_to_caller": bool(is_remote() and _push_from_selected_master())})
+
+
+@app.route('/api/tml/remotes', methods=['GET'])
+def api_tml_remotes():
+    """Master: which plugin remotes are currently connected on the MultiSync network, plus
+    whether this master has its own overlay model. Powers the 'remotes connected' indicator
+    and lets the UI tell the user text has a place to render. A remote has no remotes of its
+    own, so it reports an empty list."""
+    if is_remote():
+        return jsonify({"role": "remote", "remotes": [], "count": 0,
+                        "overlay_model": config.get('overlay_model_name', '') or ''})
+    details = discover_remotes_detailed(force=request.args.get('force') == '1')
+    return jsonify({"role": "master", "remotes": details, "count": len(details),
+                    "overlay_model": config.get('overlay_model_name', '') or ''})
+
+
+@app.route('/api/tml/remote-frame', methods=['GET'])
+def api_tml_remote_frame():
+    """Master (browser-facing): proxy a background frame rendered by one of THIS master's synced
+    remotes, using that remote's overlay model, so the master can preview what that projector will
+    show. The master reaches the remote as a trusted MultiSync peer; the browser can't (cross-origin
+    + the remote's token). The remote address is validated against the synced-remote list (no SSRF)."""
+    if is_remote():
+        return jsonify({"error": "not a master"}), 409
+    addr = request.args.get('remote', '').strip()
+    base = next((r['base'] for r in discover_remotes_detailed() if r['address'] == addr), None)
+    if not base:
+        return jsonify({"error": "unknown or not-synced remote"}), 404
+    params = {k: request.args.get(k) for k in ('content', 'frame', 'time')
+              if request.args.get(k) is not None}
+    try:
+        r = requests.get(f"{base}/api/tml/render-frame", params=params, timeout=8)
+        if r.status_code != 200:
+            return jsonify({"error": f"remote render failed ({r.status_code})"}), 502
+        return Response(r.content, mimetype=r.headers.get('Content-Type', 'image/png'),
+                        headers={'Cache-Control': 'no-store'})
+    except Exception as e:
+        return _client_error("api_tml_remote_frame", e, 502)
 
 
 @app.route('/api/tml/content-list', methods=['GET'])
 def api_tml_content_list():
     """Master: the content ids in its Name Display list, so a remote can mirror them into its
-    own Display-tab dropdown (and give each its own overlay layout). Content ids only - no
-    layouts, no sequence data."""
-    names = [it.get('content', '') for it in (config.get('names_content_list', []) or []) if it.get('content')]
-    return jsonify({"names": names})
+    own Display-tab dropdown (and give each its own overlay layout). Also returns the master's
+    per-content display duration - the master owns timing (it starts/stops the effect), so a
+    remote mirrors these to keep its preview scrubber in sync. No layouts, no sequence data."""
+    items = [it for it in (config.get('names_content_list', []) or []) if it.get('content')]
+    names = [it['content'] for it in items]
+    _global = int(config.get('display_duration', 30) or 30)
+    durations = {}
+    for it in items:
+        try:
+            durations[it['content']] = max(1, int(it.get('display_duration', _global) or _global))
+        except (TypeError, ValueError):
+            durations[it['content']] = _global
+    return jsonify({"names": names, "durations": durations})
 
 
 @app.route('/api/tml/layout', methods=['GET'])
@@ -12073,6 +12708,19 @@ def api_activate():
         logging.error(msg)
         return jsonify({"success": False, "error": msg}), 400
 
+    # No visible render target? If this master has no overlay model of its own AND no remote
+    # is currently connected to render pushed names, text won't display anywhere. Warn (the UI
+    # shows a confirm); the user may still proceed with ?force=1 - SMS polling/replies work
+    # regardless, and they may be about to connect a remote.
+    _forced = (request.args.get('force') == '1') or bool((request.get_json(silent=True) or {}).get('force'))
+    if not _forced and not (config.get('overlay_model_name', '') or '').strip() and not discover_remotes():
+        msg = ("No overlay model is selected on this master, and no remote projectors are "
+               "connected. Text won't display anywhere. Select an overlay model (Settings "
+               "→ Overlay Model Name), or connect a remote projector. SMS replies will "
+               "still work if you start anyway.")
+        logging.warning("⚠️  Start: no overlay model and no remotes connected - nowhere to render")
+        return jsonify({"success": False, "confirm_required": True, "error": msg}), 200
+
     config['enabled'] = True
     stop_polling = False
     save_config()
@@ -12144,6 +12792,17 @@ if __name__ == '__main__':
                 logging.error(f"Migration failed {_old}: {_e}")
 
     load_config()
+
+    # Reflect the current role in FPP's Run Script list at boot: a remote hides the Start/Stop
+    # scheduler scripts (the master drives it), a master keeps them. Runs after a brief delay so
+    # FPP-mode auto-detection (which a role of "" relies on) has a chance to settle first.
+    def _sync_scripts_after_boot():
+        try:
+            time.sleep(8)
+            sync_scheduler_scripts()
+        except Exception as e:
+            logging.warning(f"Boot scheduler-script sync failed: {e}")
+    threading.Thread(target=_sync_scripts_after_boot, daemon=True).start()
 
     # Clean up log files older than 7 days
     cleanup_old_logs()

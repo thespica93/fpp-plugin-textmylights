@@ -5,7 +5,32 @@ $host = preg_replace('/:\d+$/', '', $_SERVER['HTTP_HOST']);
 // FPP's own web server, so only someone who can reach the FPP UI gets the token.
 $tokenFile = "/home/fpp/media/plugin.fpp-textmylights/.access_token";
 $token = is_readable($tokenFile) ? trim(file_get_contents($tokenFile)) : "";
+
+// Read FPP's own UI theme server-side (this PHP runs inside FPP) so the plugin, which
+// lives in a cross-origin iframe and can't see FPP's CSS, matches it exactly - 'light',
+// 'dark', or '' for System/unknown (then the iframe follows the OS preference). Checked
+// via FPP's $settings global, then the settings file, then a theme cookie.
+function tml_fpp_theme() {
+    $raw = '';
+    // FPP stores the user's UI choice as "themeOverride" (Light/Dark); older/other keys fall back.
+    if (isset($GLOBALS['settings']['themeOverride'])) $raw = $GLOBALS['settings']['themeOverride'];
+    if ($raw === '' && isset($GLOBALS['settings']['Theme'])) $raw = $GLOBALS['settings']['Theme'];
+    if ($raw === '' && is_readable('/home/fpp/media/settings')) {
+        $lines = file('/home/fpp/media/settings', FILE_IGNORE_NEW_LINES);
+        foreach ($lines as $line) { if (preg_match('/^\s*themeOverride\s*=\s*"?([^"]*)"?\s*$/i', $line, $m)) { $raw = $m[1]; break; } }
+        if ($raw === '') { foreach ($lines as $line) { if (preg_match('/^\s*Theme\s*=\s*"?([^"]*)"?\s*$/i', $line, $m)) { $raw = $m[1]; break; } } }
+    }
+    if ($raw === '' && isset($_COOKIE['fppTheme'])) $raw = $_COOKIE['fppTheme'];
+    $r = strtolower(trim($raw));
+    if (strpos($r, 'dark')  !== false) return 'dark';
+    if (strpos($r, 'light') !== false) return 'light';
+    return '';
+}
+$fppTheme  = tml_fpp_theme();
 $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($token) : "");
+if ($fppTheme !== "") {
+    $pluginUrl .= ($token !== "" ? "&" : "?") . "theme=" . $fppTheme;
+}
 ?>
 <style>
     #sms-plugin-frame {
@@ -30,6 +55,12 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
     }
     .tml-modal h3 { margin: 0 0 6px; color: #333; font-size: 20px; }
     .tml-modal .tml-sub { font-size: 13px; color: #555; margin: 0 0 14px; }
+    /* Dark theme (set via the .tml-dark class from tmlDetectTheme) to match FPP. */
+    .tml-modal.tml-dark .tml-card { background: #262a31; color: #e6e6e6; box-shadow: 0 8px 30px rgba(0,0,0,0.6); }
+    .tml-modal.tml-dark h3 { color: #e6e6e6; }
+    .tml-modal.tml-dark .tml-sub { color: #a0a6b0; }
+    .tml-modal.tml-dark .tml-opt .tml-desc { color: #9098a4; }
+    .tml-modal.tml-dark .tml-status { color: #a0a6b0; }
     .tml-modal label.tml-opt {
         display: flex; gap: 10px; align-items: flex-start; margin: 0 0 14px; cursor: pointer;
     }
@@ -90,8 +121,60 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
 <script>
     document.getElementById('sms-plugin-frame').addEventListener('load', function() {
         window.scrollTo(0, 0);
+        tmlSendTheme();   // tell the plugin which theme to use as soon as it loads
     });
     function tmlFrame() { return document.getElementById('sms-plugin-frame').contentWindow; }
+
+    // Match the plugin (served cross-origin in the iframe, so it can't read FPP's CSS) to FPP's
+    // own theme. We judge the theme from the luminance of FPP's page background - robust to
+    // whatever class names/CSS vars the installed FPP theme uses - and forward it to the iframe,
+    // which applies it. Falls back to the browser preference if the background can't be read.
+    function tmlLum(str) {
+        // Relative luminance of a CSS color, or null if transparent/unreadable.
+        var m = (str || '').match(/rgba?\(([^)]+)\)/i);
+        if (!m) return null;
+        var p = m[1].split(',').map(function (s) { return parseFloat(s); });
+        var a = p.length > 3 ? p[3] : 1;
+        if (!(a > 0.1)) return null;
+        return 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
+    }
+    // FPP's theme as read server-side ('light'/'dark', or '' for System/unknown).
+    var TML_FPP_THEME = <?php echo json_encode($fppTheme); ?>;
+    function tmlColorScheme() {
+        // FPP sets the CSS 'color-scheme' to its RESOLVED theme (light/dark) - including for
+        // "System Default" - so this is the reliable signal. Returns 'dark'/'light' or null.
+        try {
+            var cs = (getComputedStyle(document.documentElement).colorScheme || '') + ' ' +
+                     (getComputedStyle(document.body).colorScheme || '');
+            var d = /\bdark\b/.test(cs), l = /\blight\b/.test(cs);
+            if (d && !l) return 'dark';
+            if (l && !d) return 'light';
+        } catch (e) {}
+        return null;
+    }
+    function tmlDetectTheme() {
+        // 1) FPP's explicit light/dark setting (read server-side).
+        if (TML_FPP_THEME === 'dark' || TML_FPP_THEME === 'light') return TML_FPP_THEME;
+        // 2) CSS color-scheme = FPP's resolved theme (covers System Default). FPP's body
+        //    background is dark even in light mode, so bg luminance is NOT reliable; use
+        //    color-scheme, then the TEXT color (dark text => light theme), then the OS preference.
+        var cs = tmlColorScheme();
+        if (cs) return cs;
+        var fg = tmlLum(getComputedStyle(document.body).color);
+        if (fg !== null) return fg > 150 ? 'dark' : 'light';
+        return (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+    }
+    var _tmlLastTheme = null;
+    function tmlSendTheme() {
+        var t = tmlDetectTheme();
+        _tmlLastTheme = t;
+        try { tmlFrame().postMessage({ type: 'tml_theme', theme: t }, '*'); } catch (e) {}
+    }
+    // Re-forward if the user toggles FPP's theme while the page is open.
+    setInterval(function () {
+        var t = tmlDetectTheme();
+        if (t !== _tmlLastTheme) tmlSendTheme();
+    }, 1500);
 
     // The plugin service base + its access token (same token the iframe loads with).
     // Lets THIS parent page talk to :5000 directly - needed so the export download
@@ -123,7 +206,9 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
     }
     function tmlShowExport() {
         tmlResetExportBtn();
-        document.getElementById('tml-export-modal').style.display = 'flex';
+        var m = document.getElementById('tml-export-modal');
+        m.classList.toggle('tml-dark', tmlDetectTheme() === 'dark');
+        m.style.display = 'flex';
     }
     function tmlHideExport() {
         if (_tmlExporting) return;
@@ -183,7 +268,9 @@ $pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($toke
         document.getElementById('tml-imp-name').textContent = name || 'the selected file';
         document.getElementById('tml-imp-status').textContent = '';
         document.getElementById('tml-imp-status').style.color = '#555';
-        document.getElementById('tml-import-modal').style.display = 'flex';
+        var m = document.getElementById('tml-import-modal');
+        m.classList.toggle('tml-dark', tmlDetectTheme() === 'dark');
+        m.style.display = 'flex';
     }
     function tmlHideImport() {
         if (_tmlImporting) return;                 // don't close mid-import

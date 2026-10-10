@@ -16,6 +16,24 @@ function tml_shot($file, $alt) {
     return '<img class="shot" src="data:image/png;base64,' . $data . '" alt="'
          . htmlspecialchars($alt, ENT_QUOTES) . '">';
 }
+
+// FPP's UI theme, read server-side (see ui.php) - 'light'/'dark' or '' for System/unknown.
+function tml_fpp_theme_help() {
+    $raw = '';
+    if (isset($GLOBALS['settings']['themeOverride'])) $raw = $GLOBALS['settings']['themeOverride'];
+    if ($raw === '' && isset($GLOBALS['settings']['Theme'])) $raw = $GLOBALS['settings']['Theme'];
+    if ($raw === '' && is_readable('/home/fpp/media/settings')) {
+        $lines = file('/home/fpp/media/settings', FILE_IGNORE_NEW_LINES);
+        foreach ($lines as $line) { if (preg_match('/^\s*themeOverride\s*=\s*"?([^"]*)"?\s*$/i', $line, $m)) { $raw = $m[1]; break; } }
+        if ($raw === '') { foreach ($lines as $line) { if (preg_match('/^\s*Theme\s*=\s*"?([^"]*)"?\s*$/i', $line, $m)) { $raw = $m[1]; break; } } }
+    }
+    if ($raw === '' && isset($_COOKIE['fppTheme'])) $raw = $_COOKIE['fppTheme'];
+    $r = strtolower(trim($raw));
+    if (strpos($r, 'dark')  !== false) return 'dark';
+    if (strpos($r, 'light') !== false) return 'light';
+    return '';
+}
+$fppTheme = tml_fpp_theme_help();
 ?>
 <style>
     .sms-help { max-width: 1100px; margin: 0 auto; font-family: Arial, sans-serif; line-height: 1.5; }
@@ -56,12 +74,32 @@ function tml_shot($file, $alt) {
         .sms-help .tml-layout { flex-direction: column; }
         .sms-help .tml-nav { position: static; flex-basis: auto; width: 100%; }
     }
+
+    /* Dark theme - applied by matching FPP's theme (see the script at the bottom). Brand
+       accent green (#4CAF50) stays in both modes. */
+    .sms-help.tml-dark { color: #e6e6e6; }
+    .sms-help.tml-dark h1, .sms-help.tml-dark h3, .sms-help.tml-dark h4 { color: #e6e6e6; }
+    .sms-help.tml-dark p, .sms-help.tml-dark li, .sms-help.tml-dark strong, .sms-help.tml-dark em { color: #e6e6e6; }
+    .sms-help.tml-dark code { background: #2d323a; color: #e6e6e6; }
+    .sms-help.tml-dark .shot { border-color: #3a3f47; }
+    .sms-help.tml-dark .step-note { color: #a0a6b0; }
+    .sms-help.tml-dark .ref td { border-bottom-color: #3a3f47; color: #e6e6e6; }
+    .sms-help.tml-dark .ref tr:hover td { background: #262a31; }
+    .sms-help.tml-dark .note { background: #0e2a40; color: #9fd0ff; border-color: #2b5c82; }
+    .sms-help.tml-dark .warn { background: #4a3c0a; color: #ffd98a; border-color: #8a6d00; }
+    .sms-help.tml-dark .history-note { background: #3a3410; color: #e0d48a; border-color: #8a7d1a; }
+    .sms-help.tml-dark .tml-nav ul { background: #23262d; border-color: #3a3f47; }
+    .sms-help.tml-dark .tml-nav a { color: #e6e6e6; border-bottom-color: #3a3f47; }
+    .sms-help.tml-dark .tml-nav a:hover { background: #2a2e35; color: #e6e6e6; }
+    .sms-help.tml-dark .tml-nav a.active { background: #1e2127; color: #4CAF50; }
 </style>
 
 <div class="sms-help">
 
     <h1 style="color:#333; margin:0 0 6px;">📱 Text My Lights — Help</h1>
     <p>Visitors text their name to your number and it appears on your pixel display. Messages can come from <strong>Twilio</strong> or <strong>Google Voice</strong> — pick one under <em>Settings → Message Source</em>.</p>
+
+    <div class="note"><strong>Runs as a background layer.</strong> Text My Lights is designed to run as a <strong>background effect</strong> on the Pi so it can play alongside your main show without taking it over. For this to work, set your <strong>Waiting</strong> and <strong>Name Display</strong> content to <strong>sequences (.fseq)</strong>. <strong>Video and playlists are not supported at this time</strong> — they run as foreground content and would take over the player.</div>
 
     <a href="plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=ui.php" target="_top" class="ui-link">🔧 Open Config UI</a>
     <a href="plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=messages.php" target="_top" class="ui-link secondary">📋 View Message Queue</a>
@@ -151,7 +189,7 @@ function tml_shot($file, $alt) {
         <tr><th>Setting</th><th>What it does</th></tr>
         <tr><td>Message Source</td><td>Twilio or Google Voice. Changing it swaps which credential fields are shown, the rate-limit default, and the allowed responses.</td></tr>
         <tr><td>Start / Stop</td><td>The show is started and stopped by the <code>Start</code> / <code>Stop</code> scheduler commands — no manual enable toggle.</td></tr>
-        <tr><td>Runs as a background layer</td><td>Text My Lights always plays its content as a <strong>background effect</strong> (+ overlay), never as a foreground playlist, and <strong>Stop</strong> only stops <em>its own</em> content. So it can run on the projector while a separate foreground sequence drives your house pixels — the plugin never stops that other show. For this, set your <strong>Waiting</strong> and <strong>Name Display</strong> content to <strong>sequences (.fseq)</strong>, which run as background effects. (A playlist/video is foreground and will take over.)</td></tr>
+        <tr><td>Runs as a background layer</td><td>Text My Lights always plays its content as a <strong>background effect</strong> (+ overlay), never as a foreground playlist, and <strong>Stop</strong> only stops <em>its own</em> content. So it can run on the projector while a separate foreground sequence drives your house pixels — the plugin never stops that other show. For this, set your <strong>Waiting</strong> and <strong>Name Display</strong> content to <strong>sequences (.fseq)</strong>, which run as background effects. <strong>Video and playlists are not supported at this time</strong> — they are foreground content and would take over the player.</td></tr>
         <tr><td>Credentials</td><td>Twilio: Account SID, Auth Token, Phone Number. Google Voice: Gmail Address + App Password.</td></tr>
         <tr><td>Poll Interval</td><td>How often (seconds) to check for new messages. 2–5 is typical.</td></tr>
         <tr><td>Default “Waiting” Content</td><td><strong>Required.</strong> The playlist/sequence that loops while waiting for texts.</td></tr>
@@ -296,5 +334,41 @@ function tml_shot($file, $alt) {
     }
     showFromHash();
     window.addEventListener('hashchange', showFromHash);
+})();
+
+// Match FPP's theme. This page renders inside the FPP page, so judge the theme from the
+// FPP page-background luminance (robust to whatever theme CSS FPP uses), falling back to the
+// browser preference, and toggle the dark class on the help container. Re-check periodically
+// so a live FPP theme toggle is picked up.
+(function () {
+    var el = document.querySelector('.sms-help');
+    if (!el) return;
+    function lumOf(str) {
+        var m = (str || '').match(/rgba?\(([^)]+)\)/i);
+        if (!m) return null;
+        var p = m[1].split(',').map(function (s) { return parseFloat(s); });
+        var a = p.length > 3 ? p[3] : 1;
+        if (!(a > 0.1)) return null;
+        return 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
+    }
+    var TML_FPP_THEME = <?php echo json_encode($fppTheme); ?>;
+    function detect() {
+        if (TML_FPP_THEME === 'dark' || TML_FPP_THEME === 'light') return TML_FPP_THEME;
+        // FPP's CSS color-scheme is the resolved theme (covers System Default); its body bg is
+        // dark even in light mode, so use color-scheme, then text color, then the OS preference.
+        try {
+            var cs = (getComputedStyle(document.documentElement).colorScheme || '') + ' ' +
+                     (getComputedStyle(document.body).colorScheme || '');
+            var d = /\bdark\b/.test(cs), l = /\blight\b/.test(cs);
+            if (d && !l) return 'dark';
+            if (l && !d) return 'light';
+            var fg = lumOf(getComputedStyle(document.body).color);
+            if (fg !== null) return fg > 150 ? 'dark' : 'light';
+        } catch (e) {}
+        return (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+    }
+    function apply() { el.classList.toggle('tml-dark', detect() === 'dark'); }
+    apply();
+    setInterval(apply, 1500);
 })();
 </script>

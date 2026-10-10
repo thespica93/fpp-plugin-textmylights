@@ -1500,21 +1500,31 @@ def _fit_text_to_box(draw, text, font_name, box_w, box_h, min_size=6, max_size=N
         return None, 0, 0
     if max_size is None:
         max_size = max([300] + [int(d * 2) for d in (box_w, box_h) if d is not None])
+    # Measure WIDTH as the advance width (what the browser's canvas measureText().width
+    # returns), not the ink width (textbbox right-left). For decorative fonts with large side
+    # bearings the two differ a lot, and using ink width here made the device fit a bigger font
+    # than the preview - so the projection overflowed/overlapped while the preview looked fine.
+    # Height stays the ink height (matches the canvas actualBoundingBox ascent+descent).
+    def _wh(font):
+        bbox = draw.textbbox((0, 0), text, font=font)
+        try:
+            w = int(round(draw.textlength(text, font=font)))   # advance width (float → int)
+        except Exception:
+            w = bbox[2] - bbox[0]
+        return w, bbox[3] - bbox[1]
     lo, hi = min_size, max_size
     # Seed with the smallest size so a box too small for even min_size to fit still
     # renders something (slightly overflowing) instead of the line silently vanishing.
     best_font = _find_font(font_name, min_size)
     if best_font is not None:
-        bbox = draw.textbbox((0, 0), text, font=best_font)
-        best_w, best_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        best_w, best_h = _wh(best_font)
     else:
         best_w, best_h = len(text) * (min_size * 0.6), min_size
     while lo <= hi:
         mid = (lo + hi) // 2
         font = _find_font(font_name, mid)
         if font is not None:
-            bbox = draw.textbbox((0, 0), text, font=font)
-            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            w, h = _wh(font)
         else:
             w, h = len(text) * (mid * 0.6), mid
         if (box_w is None or w <= box_w) and (box_h is None or h <= box_h):

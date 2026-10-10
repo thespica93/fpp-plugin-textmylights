@@ -140,21 +140,28 @@ if ($fppTheme !== "") {
     }
     // FPP's theme as read server-side ('light'/'dark', or '' for System/unknown).
     var TML_FPP_THEME = <?php echo json_encode($fppTheme); ?>;
-    function tmlDetectTheme() {
-        // Authoritative: FPP's actual setting when it's an explicit light/dark.
-        if (TML_FPP_THEME === 'dark' || TML_FPP_THEME === 'light') return TML_FPP_THEME;
-        // System/unknown → infer from the FPP page without depending on its class names:
-        //  1) a non-transparent page background (body, then <html>) - dark bg => dark theme;
-        //  2) else the TEXT color, which the theme always sets even when backgrounds are
-        //     transparent - light text => dark theme (inverted);
-        //  3) else the OS/browser preference (what FPP's "system default" follows).
+    function tmlColorScheme() {
+        // FPP sets the CSS 'color-scheme' to its RESOLVED theme (light/dark) - including for
+        // "System Default" - so this is the reliable signal. Returns 'dark'/'light' or null.
         try {
-            var bg = tmlLum(getComputedStyle(document.body).backgroundColor);
-            if (bg === null) bg = tmlLum(getComputedStyle(document.documentElement).backgroundColor);
-            if (bg !== null) return bg < 128 ? 'dark' : 'light';
-            var fg = tmlLum(getComputedStyle(document.body).color);
-            if (fg !== null) return fg > 150 ? 'dark' : 'light';
+            var cs = (getComputedStyle(document.documentElement).colorScheme || '') + ' ' +
+                     (getComputedStyle(document.body).colorScheme || '');
+            var d = /\bdark\b/.test(cs), l = /\blight\b/.test(cs);
+            if (d && !l) return 'dark';
+            if (l && !d) return 'light';
         } catch (e) {}
+        return null;
+    }
+    function tmlDetectTheme() {
+        // 1) FPP's explicit light/dark setting (read server-side).
+        if (TML_FPP_THEME === 'dark' || TML_FPP_THEME === 'light') return TML_FPP_THEME;
+        // 2) CSS color-scheme = FPP's resolved theme (covers System Default). FPP's body
+        //    background is dark even in light mode, so bg luminance is NOT reliable; use
+        //    color-scheme, then the TEXT color (dark text => light theme), then the OS preference.
+        var cs = tmlColorScheme();
+        if (cs) return cs;
+        var fg = tmlLum(getComputedStyle(document.body).color);
+        if (fg !== null) return fg > 150 ? 'dark' : 'light';
         return (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
     }
     var _tmlLastTheme = null;

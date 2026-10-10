@@ -265,7 +265,10 @@ def _require_access_token():
     if request.path.startswith('/api/tml/'):
         if request.remote_addr in _trusted_tml_peers():
             return None
-        return Response("Not a recognized FPP peer.", status=403, mimetype='text/plain')
+        # Not a MultiSync peer - fall through to the normal token/cookie check below, so the
+        # master's OWN browser UI can reach the browser-facing /api/tml/* endpoints
+        # (/api/tml/remotes, /api/tml/remote-frame). Inter-instance calls still pass via the
+        # peer check above without needing a token.
     # First load carries the token as a query param (embedded by the FPP UI);
     # we then set a cookie so subsequent same-origin fetches are authorized.
     qtok = request.args.get('token', '')

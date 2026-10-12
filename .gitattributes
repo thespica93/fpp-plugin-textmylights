@@ -1,3 +1,9 @@
 # Auto-merge list files so local additions and repo updates both survive
 whitelist.txt merge=union
 blacklist.txt merge=union
+
+# Force LF for scripts that run on the Pi (Linux) regardless of a contributor's
+# core.autocrlf — CRLF in a shell script breaks the shebang/`\r` on Linux.
+*.sh text eol=lf
+*.py text eol=lf
+scripts/tml-fix-shm-perms text eol=lf

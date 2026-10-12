@@ -47,12 +47,13 @@ log_and_show "NOTE: Installation can take 3-5 minutes."
 log_and_show "Please do not close this window."
 log_and_show ""
 
-# Install pip3 if needed
-if ! command -v pip3 &> /dev/null; then
-    log_and_show "Installing pip3... please wait"
-    apt_update_once
-    DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip >> "$LOG" 2>&1
-fi
+# Python dependencies are installed via apt (Debian packages), not pip. On FPP 10+
+# they are also declared in pluginInfo.json's dependencies.packages so FPP
+# reference-counts them and removes them on uninstall only when unused. The
+# import-check guards below keep updates fast (skip anything already present) and
+# keep FPP 9 working, where dependencies.packages isn't honored. apt is strongly
+# preferred over pip here: pip packages are system-wide and not reference-counted,
+# so uninstalling them would break other plugins that share them.
 
 # Install system fonts used for rendering text on the overlay model. Some FPP base
 # images ship with zero TrueType fonts installed, which would otherwise make PIL
@@ -68,14 +69,21 @@ fi
 
 # Install the plugin's bundled theme fonts (see fonts/<category>/NOTICE.md in
 # each category folder for license/attribution — all "100% Free" per
-# dafont.com). Installed flat into /usr/local/share/fonts so both FPP's own
-# font scanner and the plugin's own get_fpp_fonts() pick them up; fc-cache
-# indexes them for fc-match resolution in sms_plugin.py's _find_font(). Every
-# category subfolder under fonts/ (christmas/, halloween/, etc.) is picked up
-# automatically — no script changes needed when a new category is added.
-# Skip the copy + fc-cache rebuild (the slow part) when the bundled fonts are
-# unchanged since last run — otherwise every update pays the fc-cache cost.
-FONT_MARKER="/usr/local/share/fonts/.tml-fonts-hash"
+# dafont.com). Installed into our OWN subdirectory of /usr/local/share/fonts so
+# both FPP's own font scanner (PixelOverlay.cpp findFonts() recurses) and the
+# plugin's own get_fpp_fonts() pick them up; fc-cache indexes them for fc-match
+# resolution in sms_plugin.py's _find_font(). We deliberately do NOT write flat
+# into /usr/local/share/fonts: that directory is shared — FPP core loads overlay
+# fonts from it and FPP-Plugin-Matrix-Message moves user-uploaded fonts there —
+# so clearing it would destroy fonts this plugin doesn't own. Keeping everything
+# under fpp-plugin-textmylights/ lets us safely mirror the repo without touching
+# anyone else's fonts. Every category subfolder under fonts/ (christmas/,
+# halloween/, etc.) is picked up automatically — no script changes needed when a
+# new category is added. Skip the copy + fc-cache rebuild (the slow part) when
+# the bundled fonts are unchanged since last run — otherwise every update pays
+# the fc-cache cost.
+FONT_DEST="/usr/local/share/fonts/fpp-plugin-textmylights"
+FONT_MARKER="$FONT_DEST/.tml-fonts-hash"
 FONT_HASH=$(find "$PLUGIN_DIR/fonts" -type f \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.pfb' \) -exec md5sum {} \; 2>/dev/null | sort | md5sum | cut -d' ' -f1)
 if [ -f "$FONT_MARKER" ] && [ "$(cat "$FONT_MARKER" 2>/dev/null)" = "$FONT_HASH" ] && command -v fc-cache &> /dev/null; then
     log_and_show "[2/7] Theme fonts already up to date"
@@ -85,17 +93,21 @@ else
         apt_update_once
         DEBIAN_FRONTEND=noninteractive apt-get install -y fontconfig >> "$LOG" 2>&1
     fi
-    mkdir -p /usr/local/share/fonts
-    # Clear previous runs' copies first so /usr/local/share/fonts always exactly
-    # mirrors the current repo — otherwise a renamed/removed bundled font (e.g.
-    # "Santa Christmas" -> "Present Snow") leaves its old file behind forever,
-    # and _enumerate_fonts() then miscategorizes it as a "System" font since its
-    # name no longer matches anything under fonts/<category>/. This directory is
-    # exclusively managed by this plugin, so it's safe to clear.
-    find /usr/local/share/fonts -maxdepth 1 -type f \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.pfb' \) -delete 2>> "$LOG" || true
+    # Migrate away from older versions that copied our bundled fonts FLAT into
+    # /usr/local/share/fonts: remove ONLY the exact filenames we ship, never a
+    # blanket delete, so fonts owned by FPP core / other plugins are untouched.
+    find "$PLUGIN_DIR/fonts" -type f \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.pfb' \) -printf '%f\n' 2>/dev/null \
+        | while IFS= read -r f; do rm -f "/usr/local/share/fonts/$f"; done 2>> "$LOG" || true
+    # Clear and recreate OUR subdirectory so it always exactly mirrors the repo —
+    # otherwise a renamed/removed bundled font (e.g. "Santa Christmas" ->
+    # "Present Snow") leaves its old file behind forever, and _enumerate_fonts()
+    # then miscategorizes it as a "System" font. This subdirectory is exclusively
+    # managed by this plugin, so it's safe to clear.
+    rm -rf "$FONT_DEST"
+    mkdir -p "$FONT_DEST"
     find "$PLUGIN_DIR/fonts" -type f \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.pfb' \) \
-        -exec cp {} /usr/local/share/fonts/ \; 2>> "$LOG" || true
-    fc-cache -f /usr/local/share/fonts >> "$LOG" 2>&1
+        -exec cp {} "$FONT_DEST/" \; 2>> "$LOG" || true
+    fc-cache -f "$FONT_DEST" >> "$LOG" 2>&1
     echo "$FONT_HASH" > "$FONT_MARKER"
     log_and_show "[2/7] Theme fonts complete"
 fi
@@ -105,15 +117,17 @@ if python3 -c "import flask" >/dev/null 2>&1; then
     log_and_show "[3/7] Flask already installed"
 else
     log_and_show "[3/7] Installing Flask... please wait"
-    pip3 install --break-system-packages --no-cache-dir flask==3.0.0 >> "$LOG" 2>&1
+    apt_update_once
+    DEBIAN_FRONTEND=noninteractive apt-get install -y python3-flask >> "$LOG" 2>&1
     log_and_show "[3/7] Flask complete"
 fi
 
 if python3 -c "import twilio" >/dev/null 2>&1; then
     log_and_show "[4/7] Twilio already installed"
 else
-    log_and_show "[4/7] Installing Twilio... please wait (this is the slow one)"
-    pip3 install --break-system-packages --no-cache-dir twilio==8.10.0 >> "$LOG" 2>&1
+    log_and_show "[4/7] Installing Twilio... please wait"
+    apt_update_once
+    DEBIAN_FRONTEND=noninteractive apt-get install -y python3-twilio >> "$LOG" 2>&1
     TWILIO_EXIT=$?
     if [ $TWILIO_EXIT -ne 0 ]; then
         log_and_show "ERROR: Twilio installation failed with exit code $TWILIO_EXIT"
@@ -126,7 +140,8 @@ if python3 -c "import requests" >/dev/null 2>&1; then
     log_and_show "[5/7] Requests already installed"
 else
     log_and_show "[5/7] Installing Requests... please wait"
-    pip3 install --break-system-packages --no-cache-dir requests==2.32.3 >> "$LOG" 2>&1
+    apt_update_once
+    DEBIAN_FRONTEND=noninteractive apt-get install -y python3-requests >> "$LOG" 2>&1
     log_and_show "[5/7] Requests complete"
 fi
 
@@ -134,22 +149,21 @@ if python3 -c "import PIL" >/dev/null 2>&1; then
     log_and_show "[6/7] Pillow already installed"
 else
     log_and_show "[6/7] Installing Pillow (image rendering)... please wait"
-    pip3 install --break-system-packages --no-cache-dir pillow >> "$LOG" 2>&1
+    apt_update_once
+    DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pil >> "$LOG" 2>&1
     log_and_show "[6/7] Pillow complete"
 fi
 
 # zstandard is OPTIONAL — only used to preview zstd-compressed FSEQ files; the
-# plugin runs fine without it (ZSTD_AVAILABLE=False). Its pip build is a C
-# extension that can take many minutes or hang/OOM on a Pi with no prebuilt
-# wheel. Skip entirely if already importable (so updates don't re-attempt it);
-# otherwise prefer the prebuilt Debian package, fall back to a time-bounded pip
-# install, and never let this step block the installer from finishing.
+# plugin runs fine without it (ZSTD_AVAILABLE=False). Install the prebuilt Debian
+# package (python3-zstandard) rather than building the C extension from pip, which
+# can take many minutes or hang/OOM on a Pi with no prebuilt wheel. Skip entirely
+# if already importable, and never let this step block the installer from
+# finishing.
 if python3 -c "import zstandard" >/dev/null 2>&1; then
     log_and_show "[7/7] zstandard already installed"
 elif { apt_update_once; DEBIAN_FRONTEND=noninteractive apt-get install -y python3-zstandard >> "$LOG" 2>&1; }; then
     log_and_show "[7/7] zstandard complete (system package)"
-elif timeout 180 pip3 install --break-system-packages --no-cache-dir zstandard >> "$LOG" 2>&1; then
-    log_and_show "[7/7] zstandard complete (pip)"
 else
     log_and_show "[7/7] zstandard skipped — optional (zstd FSEQ preview only); plugin works without it"
 fi
@@ -159,10 +173,30 @@ fi
 # settings files and is bundled into crash reports). The plugin creates the blocklist on
 # demand and treats a missing file as empty, so nothing to seed here.
 
+# Runtime data lives under the FPP-guideline location /home/fpp/media/plugindata/<repo>/.
+# Earlier versions used /home/fpp/media/plugin.fpp-textmylights; migrate that ONCE on
+# install/update by moving the whole directory (which preserves the 0700 secrets/ and all
+# PII/credentials) when the old dir exists and the new one doesn't yet.
+PLUGIN_DATA_DIR="/home/fpp/media/plugindata/fpp-plugin-textmylights"
+OLD_PLUGIN_DATA_DIR="/home/fpp/media/plugin.fpp-textmylights"
+if [ -d "$OLD_PLUGIN_DATA_DIR" ] && [ ! -d "$PLUGIN_DATA_DIR" ]; then
+    mkdir -p "$(dirname "$PLUGIN_DATA_DIR")"
+    if mv "$OLD_PLUGIN_DATA_DIR" "$PLUGIN_DATA_DIR" 2>> "$LOG"; then
+        log_and_show "Migrated plugin data to $PLUGIN_DATA_DIR"
+    else
+        # Move failed (e.g. cross-device) - fall back to copy-then-remove, preserving perms.
+        cp -a "$OLD_PLUGIN_DATA_DIR/." "$PLUGIN_DATA_DIR/" 2>> "$LOG" \
+            && rm -rf "$OLD_PLUGIN_DATA_DIR" \
+            && log_and_show "Migrated plugin data to $PLUGIN_DATA_DIR (copied)"
+    fi
+elif [ -d "$OLD_PLUGIN_DATA_DIR" ] && [ -d "$PLUGIN_DATA_DIR" ]; then
+    # Both exist (unusual) - keep the new one; leave the old in place for the operator.
+    log_and_show "NOTE: old data dir $OLD_PLUGIN_DATA_DIR still present alongside the new one; using the new one"
+fi
+
 # Create the plugin data dir and an OWNER-ONLY secrets folder for credentials
 # (Twilio auth token, Gmail app password). Kept out of plugin.json/logs/backups;
 # 0700 so only the fpp user can read it. The plugin also ensures this at startup.
-PLUGIN_DATA_DIR="/home/fpp/media/plugin.fpp-textmylights"
 mkdir -p "$PLUGIN_DATA_DIR/secrets"
 chown -R fpp:fpp "$PLUGIN_DATA_DIR" 2>/dev/null || true
 chmod 700 "$PLUGIN_DATA_DIR/secrets" 2>/dev/null || true
@@ -241,12 +275,11 @@ log_and_show "Installation complete!"
 log_and_show "Restart FPPD to start the service"
 log_and_show "========================================"
 
-# Restart the plugin service if it's already running (e.g. during an update)
+# Restart the plugin service if it's already running (e.g. during an update).
 if pgrep -f sms_plugin.py > /dev/null 2>&1; then
     log_and_show "Restarting SMS plugin service..."
-    pkill -f sms_plugin.py 2>/dev/null || true
-    # Bounded wait for the old process to exit (instead of a flat sleep).
-    for _i in $(seq 1 20); do pgrep -f sms_plugin.py >/dev/null 2>&1 || break; sleep 0.1; done
+    # Stop via the PID file (shared helper); it also waits for the old process to exit.
+    "$PLUGIN_DIR/scripts/tml-stop.sh" || true
     setsid su fpp -c "cd '$PLUGIN_DIR' && nohup python3 sms_plugin.py > /dev/null 2>/home/fpp/media/logs/plugin-fpp-plugin-textmylights.log &" < /dev/null > /dev/null 2>&1 || true
     log_and_show "SMS plugin service restarted"
 fi

@@ -26,7 +26,7 @@
 		}
 	],
 	"dependencies": {
-		"python": ["flask==3.0.0", "twilio==8.10.0", "requests==2.32.3", "Pillow"]
+		"packages": ["python3-flask", "python3-twilio", "python3-requests", "python3-pil", "python3-zstandard"]
 	},
 	"privacy": {
 		"summary": "Names people text to your show are relayed through your Twilio or Google Voice account and shown on your lights; sender phone numbers and messages are stored on this device to run the display.",
@@ -50,21 +50,21 @@
 				"about": "visitors",
 				"keptDays": 7,
 				"canDelete": true,
-				"where": "/home/fpp/media/plugin.fpp-textmylights/logs/messages/"
+				"where": "/home/fpp/media/plugindata/fpp-plugin-textmylights/logs/messages/"
 			},
 			{
 				"what": "Blocked and approved phone numbers / names",
 				"about": "visitors",
 				"keptDays": null,
 				"canDelete": true,
-				"where": "/home/fpp/media/plugin.fpp-textmylights/"
+				"where": "/home/fpp/media/plugindata/fpp-plugin-textmylights/"
 			},
 			{
 				"what": "Your Twilio auth token and Gmail app password",
 				"about": "operator",
 				"keptDays": null,
 				"canDelete": true,
-				"where": "/home/fpp/media/plugin.fpp-textmylights/secrets/credentials.json"
+				"where": "/home/fpp/media/plugindata/fpp-plugin-textmylights/secrets/credentials.json"
 			}
 		],
 		"sensors": [],

@@ -192,7 +192,7 @@ $fppTheme = tml_fpp_theme_help();
         <tr><td>Runs as a background layer</td><td>Text My Lights always plays its content as a <strong>background effect</strong> (+ overlay), never as a foreground playlist, and <strong>Stop</strong> only stops <em>its own</em> content. So it can run on the projector while a separate foreground sequence drives your house pixels — the plugin never stops that other show. For this, set your <strong>Waiting</strong> and <strong>Name Display</strong> content to <strong>sequences (.fseq)</strong>, which run as background effects. <strong>Video and playlists are not supported at this time</strong> — they are foreground content and would take over the player.</td></tr>
         <tr><td>Credentials</td><td>Twilio: Account SID, Auth Token, Phone Number. Google Voice: Gmail Address + App Password.</td></tr>
         <tr><td>Poll Interval</td><td>How often (seconds) to check for new messages. 2–5 is typical.</td></tr>
-        <tr><td>Default “Waiting” Content</td><td><strong>Required.</strong> The playlist/sequence that loops while waiting for texts.</td></tr>
+        <tr><td>Default “Waiting” Content</td><td><strong>Required.</strong> The sequence (.fseq) or image that loops while waiting for texts. (Playlists aren’t supported — they’re foreground and would take over the player.)</td></tr>
         <tr><td>Name Display Content</td><td>Optional content to play while a name is on screen (defaults to the waiting content).</td></tr>
         <tr><td>Overlay Model</td><td>The FPP overlay model the name text is drawn onto.</td></tr>
         <tr><td>Max messages / phone</td><td>Per-day rate limit per phone number (0 = unlimited).</td></tr>

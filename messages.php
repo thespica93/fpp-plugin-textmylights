@@ -1,8 +1,8 @@
 <?php
-$host = preg_replace('/:\d+$/', '', $_SERVER['HTTP_HOST']);
-// Pass the plugin's network access token to the iframe (see ui.php for details).
-$tokenFile = "/home/fpp/media/plugin.fpp-textmylights/.access_token";
-$token = is_readable($tokenFile) ? trim(file_get_contents($tokenFile)) : "";
+// Served SAME-ORIGIN through FPP via proxy.php (see ui.php). No token to the browser -
+// the daemon trusts loopback and the proxy reaches it over 127.0.0.1. Relative base so it
+// works under /proxy/<ip>/.
+$proxyBase = "plugin.php?plugin=fpp-plugin-textmylights&page=proxy.php&nopage=1&p=";
 
 // Match FPP's UI theme (read server-side; see ui.php) - 'light'/'dark', or '' for System.
 function tml_fpp_theme_msg() {
@@ -21,10 +21,8 @@ function tml_fpp_theme_msg() {
     return '';
 }
 $fppTheme  = tml_fpp_theme_msg();
-$pluginUrl = "http://$host:5000/messages" . ($token !== "" ? "?token=" . urlencode($token) : "");
-if ($fppTheme !== "") {
-    $pluginUrl .= ($token !== "" ? "&" : "?") . "theme=" . $fppTheme;
-}
+// p=messages -> proxy forwards to the daemon's /messages; theme is forwarded as a query param.
+$pluginUrl = $proxyBase . "messages" . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) : "");
 ?>
 <style>
     #sms-messages-frame {

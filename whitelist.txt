@@ -486,7 +486,6 @@ Afnan
 Afonso
 Afra
 Afrae
-Africa
 Afrika
 Afrodisia
 Afrodisio
@@ -1038,8 +1037,6 @@ Aliza
 Alize
 Alizee
 Alizia
-Alla
-Allah
 Allal
 Allan
 Alle
@@ -1503,7 +1500,6 @@ Angharad
 Anghel
 Anghelina
 Anghelus
-Angie
 Angil
 Angila
 Angiolina
@@ -1894,7 +1890,6 @@ Ariadna
 Ariadne
 Ariadnna
 Ariam
-Arian
 Ariana
 Ariane
 Arianna
@@ -2077,7 +2072,6 @@ Arvydas
 Arwa
 Arwen
 Aryaman
-Aryan
 Aryn
 Asa
 Asaad
@@ -2976,7 +2970,6 @@ Bhavna
 Bhima
 Bhrigu
 Bhupinder
-Bi
 Biagio
 Bianca
 Bianka
@@ -3148,7 +3141,6 @@ Bolivar
 Bolivia
 Bonaventura
 Bondad
-Bong
 Boni
 Bonifacia
 Bonifacio
@@ -3481,7 +3473,6 @@ Calypso
 Cam
 Camala
 Camara
-Camel
 Camelia
 Camella
 Camellia
@@ -4048,7 +4039,6 @@ Chieko
 Chifae
 Chihab
 Chima
-Chin
 China
 Ching
 Chiquia
@@ -5180,7 +5170,6 @@ Desheng
 Desideria
 Desiderio
 Desirae
-Desire
 Desiree
 Desiri
 Desislav
@@ -5261,7 +5250,6 @@ Diara
 Diarra
 Diawara
 Diawoye
-Dick
 Dickson
 Dicra
 Dictina
@@ -5391,7 +5379,6 @@ Divina
 Divine
 Divino
 Divya
-Dix
 Dixie
 Diyan
 Diyana
@@ -5507,7 +5494,6 @@ Donella
 Donelle
 Donetta
 Donette
-Dong
 Dongdong
 Dongfen
 Donghai
@@ -6502,7 +6488,6 @@ Ernesto
 Ernie
 Erno
 Ernst
-Ero
 Erol
 Erola
 Erondina
@@ -6885,7 +6870,6 @@ Faical
 Faik
 Faina
 Fairouz
-Fairy
 Faisal
 Faissal
 Faith
@@ -6926,7 +6910,6 @@ Fanida
 Fanka
 Fanni
 Fannie
-Fanny
 Fanor
 Fanta
 Fanuta
@@ -6962,7 +6945,6 @@ Farrukh
 Faruk
 Farwa
 Farzana
-Fatah
 Fateh
 Fatema
 Fatemeh
@@ -7298,7 +7280,6 @@ Flossy
 Floy
 Floyd
 Flss
-Foad
 Foday
 Fode
 Fodie
@@ -7420,7 +7401,6 @@ Frumencio
 Frusina
 Frutos
 Ftimou
-Fu
 Fuad
 Fuencisla
 Fuensanta
@@ -7463,7 +7443,6 @@ Gadea
 Gadiel
 Gador
 Gados
-Gae
 Gael
 Gaelle
 Gaetan
@@ -7503,7 +7482,6 @@ Gandharva
 Ganeko
 Ganesh
 Ganesha
-Gang
 Ganix
 Ganka
 Ganna
@@ -7559,7 +7537,6 @@ Gavra
 Gavrielle
 Gavril
 Gavrila
-Gay
 Gayane
 Gaye
 Gayel
@@ -7567,7 +7544,6 @@ Gayla
 Gayle
 Gayleen
 Gaylene
-Gaylord
 Gaynell
 Gaynelle
 Gaynor
@@ -7612,7 +7588,6 @@ Genevie
 Genevieve
 Genevive
 Genevra
-Geni
 Genia
 Genica
 Genie
@@ -7709,7 +7684,6 @@ Gerlinde
 Germa
 Germain
 Germaine
-German
 Germana
 Germania
 Germanico
@@ -8162,7 +8136,6 @@ Gui
 Guia
 Guiayara
 Guida
-Guido
 Guiem
 Guifang
 Guifen
@@ -8618,7 +8591,6 @@ He
 Heath
 Heather
 Heba
-Hebe
 Heber
 Hebert
 Hecham
@@ -9635,7 +9607,6 @@ Isora
 Isra
 Israa
 Israe
-Israel
 Israr
 Isreal
 Isrrael
@@ -9658,7 +9629,6 @@ Isusko
 Itahisa
 Itai
 Italia
-Italiano
 Italo
 Itamar
 Itciar
@@ -9853,7 +9823,6 @@ Jacynth
 Jad
 Jada
 Jadduch
-Jade
 Jaden
 Jader
 Jadiel
@@ -10246,7 +10215,6 @@ Jestine
 Jesua
 Jesualda
 Jesualdo
-Jesus
 Jesusa
 Jesusita
 Jetta
@@ -10366,7 +10334,6 @@ Jiaying
 Jiayu
 Jie
 Jieke
-Jihad
 Jihan
 Jihane
 Jilali
@@ -11378,7 +11345,6 @@ Kieran
 Kiersten
 Kiesha
 Kieth
-Kike
 Kikelia
 Kiko
 Kiley
@@ -11458,7 +11424,6 @@ Kissima
 Kit
 Kitti
 Kittie
-Kitty
 Kiyoko
 Kizkitza
 Kizzee
@@ -11594,7 +11559,6 @@ Kuljit
 Kulvir
 Kulwant
 Kulwinder
-Kum
 Kumar
 Kumba
 Kumiko
@@ -11677,7 +11641,6 @@ Lahssen
 Lai
 Laia
 Laiba
-Laid
 Laida
 Laie
 Laiene
@@ -11951,7 +11914,6 @@ Leatha
 Leatrice
 Lebbie
 Lebdaoui
-Lech
 Lecia
 Leda
 Ledicia
@@ -12005,7 +11967,6 @@ Lele
 Lelia
 Lemine
 Lemuel
-Len
 Lena
 Lenard
 Lene
@@ -12224,7 +12185,6 @@ Liena
 Liene
 Lier
 Lierni
-Lies
 Liesa
 Liesbeth
 Lieselotte
@@ -12492,7 +12452,6 @@ Loles
 Loleta
 Loli
 Lolimar
-Lolita
 Lolly
 Loma
 Lon
@@ -13765,7 +13724,6 @@ Mavra
 Mawdo
 Max
 Maxence
-Maxi
 Maxie
 Maxim
 Maxima
@@ -14593,7 +14551,6 @@ Mubashir
 Mudasar
 Mudassar
 Muela
-Muffin
 Mufi
 Mufinella
 Mugurel
@@ -14632,7 +14589,6 @@ Mushegh
 Mushtaq
 Muskan
 Muskilda
-Muslim
 Mussa
 Mustafa
 Mustansar
@@ -15571,7 +15527,6 @@ Nurul
 Nury
 Nurys
 Nusrat
-Nut
 Nuta
 Nuti
 Nutu
@@ -15850,7 +15805,6 @@ Orville
 Orysya
 Osagie
 Osahon
-Osama
 Osane
 Osaretin
 Osariemen
@@ -16024,7 +15978,6 @@ Pandu
 Panfilo
 Pankaj
 Pansie
-Pansy
 Pantaleon
 Pantaleona
 Paola
@@ -16190,7 +16143,6 @@ Pennie
 Penny
 Pep
 Pepa
-Pepe
 Pepi
 Pepita
 Per
@@ -16542,7 +16494,6 @@ Quiana
 Quico
 Quilen
 Quiliano
-Quim
 Quima
 Quin
 Quinciano
@@ -16766,10 +16717,8 @@ Randee
 Randell
 Randene
 Randhir
-Randi
 Randie
 Randolph
-Randy
 Ranee
 Rangel
 Rani
@@ -18070,7 +18019,6 @@ Selmira
 Seloua
 Selva
 Sem
-Semen
 Semida
 Semidan
 Semiramis
@@ -18093,7 +18041,6 @@ Señor
 Senorina
 Seny
 Sephira
-Seppo
 September
 Sequero
 Serafi
@@ -18474,7 +18421,6 @@ Shonta
 Shorena
 Shoshana
 Shoshanna
-Shota
 Shoukat
 Shu
 Shuai
@@ -18688,7 +18634,6 @@ Sisinia
 Sisinio
 Sissel
 Sissie
-Sissy
 Sita
 Siu
 Siusan
@@ -19296,7 +19241,6 @@ Tallia
 Tallie
 Tallou
 Tallulah
-Tally
 Talwinder
 Talya
 Talyah
@@ -19441,7 +19385,6 @@ Taysa
 Taysir
 Tayyab
 Tayyaba
-Tea
 Teba
 Tecla
 Ted
@@ -19735,7 +19678,6 @@ Tish
 Tisha
 Tita
 Titel
-Titi
 Titiana
 Titina
 Tito
@@ -20080,7 +20022,6 @@ Urszula
 Urtza
 Urtzi
 Urvashi
-Usama
 Usha
 Usman
 Usoa
@@ -20650,7 +20591,6 @@ Wandis
 Wanessa
 Waneta
 Wanetta
-Wang
 Wangfen
 Wangjun
 Wanids
@@ -20825,14 +20765,12 @@ Williams
 Willian
 Willians
 Willibald
-Willie
 Williemae
 Willington
 Willis
 Willma
 Willodean
 Willow
-Willy
 Willyt
 Wilma
 Wilman
@@ -22170,3 +22108,26 @@ Zviad
 Zviadi
 Zydrunas
 Zygmunt
+
+# ============================================================================
+# REVIEW NEEDED - matched the shipped blacklist (word-boundary match, exactly
+# how the plugin screens). These were REMOVED from the active whitelist so they
+# are no longer auto-approved. They are commented out (the loader ignores '#'
+# lines), so none are active. Uncomment any you want back on the whitelist after
+# review. Format:  # <Name>   (matched blacklist word '<word>')
+# ============================================================================
+Angie
+Arian
+Aryan
+Desire
+Geni
+German
+Israel
+Jade
+Jesus
+Len
+Randy
+Tally
+Tea
+Willie
+Willy

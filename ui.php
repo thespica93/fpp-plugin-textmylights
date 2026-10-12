@@ -1,10 +1,11 @@
 <?php
-$host = preg_replace('/:\d+$/', '', $_SERVER['HTTP_HOST']);
-// Read the plugin's network access token (minted by sms_plugin.py) and pass it
-// to the iframe so the service authorizes this browser. This page is served by
-// FPP's own web server, so only someone who can reach the FPP UI gets the token.
-$tokenFile = "/home/fpp/media/plugin.fpp-textmylights/.access_token";
-$token = is_readable($tokenFile) ? trim(file_get_contents($tokenFile)) : "";
+// The plugin UI is served SAME-ORIGIN through FPP via proxy.php (which forwards to the
+// daemon on 127.0.0.1:5000). No access token is passed to the browser: the daemon trusts
+// the loopback interface, and the proxy reaches it over loopback. This avoids the blocked
+// cross-origin iframe, HTTPS mixed content, and the token leaking under FPP's /proxy view.
+// The proxy base is RELATIVE so it resolves correctly under /proxy/<ip>/ (each box talks
+// to its own daemon).
+$proxyBase = "plugin.php?plugin=fpp-plugin-textmylights&page=proxy.php&nopage=1&p=";
 
 // Read FPP's own UI theme server-side (this PHP runs inside FPP) so the plugin, which
 // lives in a cross-origin iframe and can't see FPP's CSS, matches it exactly - 'light',
@@ -27,10 +28,8 @@ function tml_fpp_theme() {
     return '';
 }
 $fppTheme  = tml_fpp_theme();
-$pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($token) : "");
-if ($fppTheme !== "") {
-    $pluginUrl .= ($token !== "" ? "&" : "?") . "theme=" . $fppTheme;
-}
+// p is empty -> proxy forwards to the daemon root ('/'); theme is forwarded as a query param.
+$pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) : "");
 ?>
 <style>
     #sms-plugin-frame {
@@ -176,12 +175,10 @@ if ($fppTheme !== "") {
         if (t !== _tmlLastTheme) tmlSendTheme();
     }, 1500);
 
-    // The plugin service base + its access token (same token the iframe loads with).
-    // Lets THIS parent page talk to :5000 directly - needed so the export download
-    // is triggered by the real Export click here (user activation) instead of a
-    // postMessage inside the cross-origin iframe, which browsers block.
-    var TML_SVC   = <?php echo json_encode("http://$host:5000/"); ?>;
-    var TML_TOKEN = <?php echo json_encode($token); ?>;
+    // Same-origin proxy base for THIS parent page. Lets the Export download be triggered by
+    // the real Export click here (user activation) through the FPP proxy (loopback-trusted,
+    // no token). Relative so it works under /proxy/<ip>/.
+    var TML_PROXY = <?php echo json_encode($proxyBase); ?>;
 
     // Create the hidden download iframe ONCE, up front. Creating it and setting its
     // src in the same click handler made the browser skip that first navigation (the
@@ -232,10 +229,11 @@ if ($fppTheme !== "") {
         // sidesteps the cross-origin-iframe download block. Auth via ?token; the
         // server's Content-Disposition names the file.
         // Cache-buster (&_ts) guarantees the iframe sees a new URL and navigates
-        // every time, even for two identical back-to-back exports.
-        var url = TML_SVC + 'api/config/export?settings=' + sel.s + '&lists=' + sel.l
+        // every time, even for two identical back-to-back exports. Routed through the
+        // FPP proxy (p=api/config/export), so no token and no cross-origin request.
+        var url = TML_PROXY + encodeURIComponent('api/config/export')
+                + '&settings=' + sel.s + '&lists=' + sel.l
                 + '&content=' + sel.c + '&overlay=' + sel.o
-                + (TML_TOKEN ? '&token=' + encodeURIComponent(TML_TOKEN) : '')
                 + '&_ts=' + Date.now();
         var dl = document.getElementById('tml-export-dl');
         if (!dl) {   // defensive: init IIFE should have made it already

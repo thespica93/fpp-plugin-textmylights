@@ -6,5 +6,6 @@ whitelist_added.txt
 blacklist_removed.txt
 blacklist_added.txt
 
-# Local-only: FPP publication review tracker (not for the published plugin repo)
+# Local-only: FPP publication review tracker + test plan (not for the published plugin repo)
 FPP_REVIEW_ISSUES.md
+FPP_TEST_PLAN.md

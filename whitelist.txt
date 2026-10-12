@@ -1086,12 +1086,12 @@ Aloise
 Aloisia
 Aloma
 Alona
-Aloña
 Alondra
 Alonso
 Alonzo
 Alou
 Aloysia
+Aloña
 Alpha
 Alphonse
 Alphonso
@@ -1363,7 +1363,6 @@ Anastasiya
 Anastassia
 Anatael
 Anatalia
-Añaterve
 Anatola
 Anatole
 Anatoli
@@ -1455,7 +1454,6 @@ Anelis
 Aneliya
 Aner
 Anes
-Añes
 Anesia
 Anesio
 Anestassia
@@ -1500,6 +1498,7 @@ Angharad
 Anghel
 Anghelina
 Anghelus
+Angie
 Angil
 Angila
 Angiolina
@@ -1567,7 +1566,11 @@ Anke
 Ankor
 Anmol
 Ann
+Ann-Marie
 Anna
+Anna-Diana
+Anna-Diane
+Anna-Maria
 Annabal
 Annabel
 Annabela
@@ -1575,9 +1578,7 @@ Annabell
 Annabella
 Annabelle
 Annadiana
-Anna-Diana
 Annadiane
-Anna-Diane
 Annais
 Annalee
 Annaliese
@@ -1585,12 +1586,12 @@ Annalisa
 Annalise
 Annamae
 Annamaria
-Anna-Maria
 Annamarie
 Annas
 Anne
-Annecorinne
 Anne-Corinne
+Anne-Marie
+Annecorinne
 Annegret
 Anneke
 Anneli
@@ -1600,7 +1601,6 @@ Anneliese
 Annelise
 Annelle
 Annemarie
-Anne-Marie
 Annemieke
 Annet
 Annett
@@ -1617,7 +1617,6 @@ Annissa
 Annita
 Annmaria
 Annmarie
-Ann-Marie
 Annnora
 Annora
 Annunziata
@@ -1890,6 +1889,7 @@ Ariadna
 Ariadne
 Ariadnna
 Ariam
+Arian
 Ariana
 Ariane
 Arianna
@@ -1914,7 +1914,6 @@ Arik
 Arild
 Arima
 Arina
-Ariñe
 Arion
 Aris
 Arismendy
@@ -1926,6 +1925,7 @@ Aristobulo
 Aristoteles
 Aritz
 Aritza
+Ariñe
 Arjan
 Arjun
 Arkadi
@@ -2072,6 +2072,7 @@ Arvydas
 Arwa
 Arwen
 Aryaman
+Aryan
 Aryn
 Asa
 Asaad
@@ -2456,6 +2457,8 @@ Azzedine
 Azzie
 Azziz
 Azzouz
+Añaterve
+Añes
 B
 Ba
 Bab
@@ -2572,7 +2575,6 @@ Bangali
 Bangally
 Bangaly
 Banna
-Baños
 Banta
 Banu
 Bao
@@ -2587,8 +2589,8 @@ Barb
 Barbabra
 Barbar
 Barbara
-Barbaraanne
 Barbara-Anne
+Barbaraanne
 Barbaro
 Barbe
 Barbee
@@ -2674,6 +2676,7 @@ Baya
 Bayan
 Baye
 Bayron
+Baños
 Bea
 Beat
 Beata
@@ -2696,10 +2699,10 @@ Beckie
 Becky
 Beda
 Bee
-Begoña
-Begoñe
 Begonia
 Begonya
+Begoña
+Begoñe
 Begum
 Bei
 Beibei
@@ -2763,7 +2766,6 @@ Benaouda
 Benardina
 Benardino
 Benat
-Beñat
 Benayga
 Bencomo
 Bendaoud
@@ -2935,8 +2937,8 @@ Betsey
 Betsy
 Betta
 Bette
-Betteann
 Bette-Ann
+Betteann
 Betteanne
 Betti
 Bettie
@@ -2959,12 +2961,12 @@ Beverlie
 Beverly
 Bevvy
 Bezza
+Beñat
 Bhaga
 Bhagwan
 Bhajan
 Bharat
 Bharata
-Bharata 
 Bharti
 Bhavna
 Bhima
@@ -3515,9 +3517,6 @@ Candra
 Candy
 Candyce
 Canek
-Caños
-Cañosanto
-Cañosantos
 Cantia
 Canto
 Canuta
@@ -3597,15 +3596,16 @@ Carmen
 Carmencita
 Carmenza
 Carmina
-Carmiña
 Carminda
 Carmine
 Carminia
 Carmita
+Carmiña
 Carmo
 Carmon
 Caro
 Carol
+Carol-Jean
 Carola
 Carolan
 Carolann
@@ -3617,7 +3617,6 @@ Carolina
 Caroline
 Carolino
 Caroljean
-Carol-Jean
 Caroll
 Carolo
 Carolyn
@@ -3739,6 +3738,9 @@ Cayetana
 Cayetano
 Cayla
 Cayo
+Caños
+Cañosanto
+Cañosantos
 Ce
 Cebria
 Cebrian
@@ -4397,7 +4399,6 @@ Consolacio
 Consolacion
 Consolata
 Consorcia
-Constança
 Constance
 Constancia
 Constancio
@@ -4412,6 +4413,7 @@ Constantine
 Constantino
 Constanza
 Constanze
+Constança
 Consuela
 Consuelo
 Contacto
@@ -4664,6 +4666,9 @@ Cyrus
 Cythia
 Czeslaw
 Czeslawa
+D'Arc
+D'Asis
+D'Assis
 Da
 Daba
 Dabi
@@ -4847,7 +4852,6 @@ Darb
 Darbie
 Darby
 Darc
-D'Arc
 Darcee
 Darcel
 Darcey
@@ -4910,8 +4914,6 @@ Dasha
 Dasi
 Dasie
 Dasio
-D'Asis
-D'Assis
 Dasya
 Datha
 Dativa
@@ -5112,7 +5114,6 @@ Demofilo
 Dena
 Denae
 Denar
-Deñe
 Deneen
 Denes
 Denese
@@ -5170,6 +5171,7 @@ Desheng
 Desideria
 Desiderio
 Desirae
+Desire
 Desiree
 Desiri
 Desislav
@@ -5213,6 +5215,7 @@ Deyan
 Deyanira
 Deysi
 Deyvid
+Deñe
 Dharma
 Dharminder
 Di
@@ -5237,9 +5240,9 @@ Dian
 Diana
 Diandra
 Diane
+Diane-Marie
 Dianelys
 Dianemarie
-Diane-Marie
 Diango
 Diann
 Dianna
@@ -5426,7 +5429,6 @@ Doe
 Doha
 Doina
 Doinita
-Dolça
 Doll
 Dolley
 Dolli
@@ -5440,6 +5442,7 @@ Doloritas
 Dolors
 Doltza
 Doly
+Dolça
 Dombina
 Domenec
 Domenech
@@ -5945,8 +5948,8 @@ Ekaterina
 Ekaterine
 Ekhi
 Ekhine
-Ekhiñe
 Ekhiotz
+Ekhiñe
 Eki
 Ekiñe
 Ekram
@@ -6338,7 +6341,6 @@ Enaitz
 Enar
 Enara
 Enaut
-Eñaut
 Encarna
 Encarnacio
 Encarnacion
@@ -6534,13 +6536,13 @@ Esneda
 Esneider
 Esohe
 Esosa
-España
 Espartaco
+España
 Espectacion
 Espen
-Esperança
 Esperanto
 Esperanza
+Esperança
 Espino
 Espiridion
 Espiritu
@@ -6826,6 +6828,7 @@ Ezzahraa
 Ezzahrae
 Ezzohra
 Ezzouhra
+Eñaut
 F
 Faber
 Fabia
@@ -7008,7 +7011,6 @@ Fawzi
 Fawzia
 Fay
 Faycal
-Fayçal
 Faydra
 Faye
 Fayette
@@ -7023,6 +7025,7 @@ Fayth
 Faythe
 Fayyaz
 Fayza
+Fayçal
 Fazal
 Fco
 Fdila
@@ -7308,7 +7311,6 @@ Fozia
 Fran
 Franc
 Franca
-Français
 France
 Francelina
 Francene
@@ -7333,9 +7335,7 @@ Franciska
 Franciszek
 Franck
 Franco
-François
 Francoise
-Françoise
 Francy
 Francyne
 Frank
@@ -7351,6 +7351,9 @@ Fransisca
 Frantisek
 Franz
 Franziska
+Français
+François
+Françoise
 Fraternidad
 Frauke
 Frayda
@@ -7588,6 +7591,7 @@ Genevie
 Genevieve
 Genevive
 Genevra
+Geni
 Genia
 Genica
 Genie
@@ -7684,6 +7688,7 @@ Gerlinde
 Germa
 Germain
 Germaine
+German
 Germana
 Germania
 Germanico
@@ -7977,13 +7982,13 @@ Goldie
 Goldina
 Goldy
 Goliat
-Gonçal
-Gonçalo
 Gontzal
 Gonzaga
 Gonzala
 Gonzalina
 Gonzalo
+Gonçal
+Gonçalo
 Goodluck
 Gopal
 Gopala
@@ -8016,9 +8021,7 @@ Goyo
 Grabiel
 Grabiela
 Graca
-Graça
 Gracas
-Graças
 Grace
 Gracia
 Gracian
@@ -8054,6 +8057,8 @@ Graziela
 Graziella
 Grazina
 Grazyna
+Graça
+Graças
 Grecia
 Greer
 Greg
@@ -8627,10 +8632,10 @@ Helaina
 Helaine
 Helder
 Helen
+Helen-Elizabeth
 Helena
 Helenca
 Helene
-Helen-Elizabeth
 Helenio
 Helenka
 Heleodora
@@ -8859,8 +8864,8 @@ Holli
 Hollie
 Hollis
 Holly
-Hollyanne
 Holly-Anne
+Hollyanne
 Holmes
 Homar
 Homer
@@ -9328,12 +9333,8 @@ Imtiaz
 In
 Ina
 Inacio
-Iñake
 Inaki
-Iñaki
-Iñaky
 Inam
-Iñaqui
 Inar
 Inara
 Inas
@@ -9382,7 +9383,6 @@ Ingrida
 Ingunna
 Inha
 Inhar
-Iñigo
 Inka
 Inko
 Inma
@@ -9512,9 +9512,9 @@ Iron
 Ironim
 Irshad
 Iru
-Iruña
 Irundina
 Irune
+Iruña
 Irvin
 Irving
 Irwin
@@ -9607,6 +9607,7 @@ Isora
 Isra
 Israa
 Israe
+Israel
 Israr
 Isreal
 Isrrael
@@ -9760,6 +9761,11 @@ Izortze
 Izotz
 Izza
 Izzan
+Iñake
+Iñaki
+Iñaky
+Iñaqui
+Iñigo
 J
 Ja
 Jaafar
@@ -9823,6 +9829,7 @@ Jacynth
 Jad
 Jada
 Jadduch
+Jade
 Jaden
 Jader
 Jadiel
@@ -10052,6 +10059,7 @@ Jazmina
 Jazmine
 Jc
 Jean
+Jean-François
 Jeana
 Jeane
 Jeanelle
@@ -10060,7 +10068,6 @@ Jeaneth
 Jeanett
 Jeanetta
 Jeanette
-Jean-François
 Jeanice
 Jeanie
 Jeanine
@@ -10215,6 +10222,7 @@ Jestine
 Jesua
 Jesualda
 Jesualdo
+Jesus
 Jesusa
 Jesusita
 Jetta
@@ -10410,6 +10418,8 @@ Jitka
 Jmiaa
 Jo
 Jo Ann
+Jo-Ann
+Jo-Anne
 Joachim
 Joachin
 Joakim
@@ -10421,10 +10431,8 @@ Joane
 Joanes
 Joanie
 Joann
-Jo-Ann
 Joanna
 Joanne
-Jo-Anne
 Joannes
 Joannie
 Joao
@@ -10929,9 +10937,9 @@ Kapil
 Kapila
 Kapka
 Kara
+Kara-Lynn
 Karalee
 Karalynn
-Kara-Lynn
 Karam
 Karamat
 Karamba
@@ -11967,6 +11975,7 @@ Lele
 Lelia
 Lemine
 Lemuel
+Len
 Lena
 Lenard
 Lene
@@ -12418,8 +12427,8 @@ Lleir
 Lleonard
 Llibert
 Llibertat
-Llorenç
 Llorens
+Llorenç
 Lloyd
 Lluc
 Lluch
@@ -12766,6 +12775,12 @@ Lyudmil
 Lyudmila
 Lyudmyla
 M
+M'Barek
+M'Bark
+M'Barka
+M'Hamed
+M'Hammed
+M'Hand
 Ma
 Maaike
 Maamar
@@ -13185,7 +13200,6 @@ Marbella
 Marbelys
 Marc
 Marca
-Marçal
 Marcas
 Marce
 Marcel
@@ -13334,11 +13348,11 @@ Maricruz
 Maricuta
 Maridel
 Marie
+Marie-Ann
+Marie-Jeanne
 Mariea
 Marieann
-Marie-Ann
 Mariejeanne
-Marie-Jeanne
 Marieke
 Mariel
 Mariela
@@ -13387,11 +13401,9 @@ Marilza
 Marimar
 Marin
 Marina
-Mariña
 Marinalva
 Marinda
 Marine
-Mariñe
 Marineide
 Marinel
 Marinela
@@ -13451,6 +13463,8 @@ Mariza
 Marizabel
 Marizete
 Marizol
+Mariña
+Mariñe
 Marj
 Marja
 Marjan
@@ -13542,7 +13556,6 @@ Martinho
 Martiniana
 Martiniano
 Martino
-Martiño
 Martins
 Martinus
 Martir
@@ -13551,6 +13564,7 @@ Martiria
 Martirian
 Martirio
 Martita
+Martiño
 Marton
 Martos
 Martxel
@@ -13625,6 +13639,7 @@ Marzia
 Marzio
 Marzok
 Marzouk
+Marçal
 Masako
 Masha
 Masiel
@@ -13786,11 +13801,8 @@ Mbacke
 Mballo
 Mbarak
 Mbarek
-M'Barek
 Mbark
-M'Bark
 Mbarka
-M'Barka
 Mbaye
 Mbemba
 Mbene
@@ -13957,7 +13969,6 @@ Mennana
 Merab
 Merari
 Merce
-Merçe
 Merced
 Mercedes
 Mercedez
@@ -14030,6 +14041,7 @@ Meryen
 Meryl
 Merzak
 Merzouk
+Merçe
 Mesalina
 Mesbah
 Mesias
@@ -14048,12 +14060,9 @@ Mfedal
 Mfeddal
 Mfedla
 Mhamed
-M'Hamed
 Mhammad
 Mhammed
-M'Hammed
 Mhand
-M'Hand
 Mher
 Mi
 Mia
@@ -15315,7 +15324,6 @@ Ninive
 Ninnetta
 Ninnette
 Nino
-Niño
 Ninon
 Ninoska
 Niobe
@@ -15355,6 +15363,7 @@ Nixie
 Nixon
 Nizam
 Nizar
+Niño
 Noa
 Noah
 Noam
@@ -15515,7 +15524,6 @@ Numidia
 Nune
 Nunilon
 Nuno
-Nuño
 Nunzia
 Nunzio
 Nur
@@ -15531,6 +15539,7 @@ Nuta
 Nuti
 Nutu
 Nuvia
+Nuño
 Nydia
 Nyima
 Nyla
@@ -16122,9 +16131,6 @@ Peli
 Peligros
 Pello
 Pen
-Peña
-Peñarroya
-Peñas
 Pencho
 Penda
 Penelopa
@@ -16134,7 +16140,6 @@ Pengcheng
 Pengfei
 Pengpeng
 Penha
-Peñitas
 Penka
 Penko
 Penney
@@ -16218,6 +16223,10 @@ Petter
 Petunia
 Petya
 Petyo
+Peña
+Peñarroya
+Peñas
+Peñitas
 Phaedra
 Phaidra
 Phebe
@@ -16331,11 +16340,11 @@ Pompeyo
 Pompilia
 Pompilio
 Pompiliu
-Ponç
 Poncho
 Ponciana
 Ponciano
 Poncio
+Ponç
 Pooh
 Pooja
 Pool
@@ -16719,6 +16728,7 @@ Randene
 Randhir
 Randie
 Randolph
+Randy
 Ranee
 Rangel
 Rani
@@ -17520,12 +17530,12 @@ Sabiha
 Sabin
 Sabina
 Sabine
-Sabiñe
 Sabiniana
 Sabiniano
 Sabino
 Sabir
 Sabira
+Sabiñe
 Sabra
 Sabri
 Sabria
@@ -17846,8 +17856,8 @@ Sapphire
 Saqib
 Saqlain
 Sara
-Saraann
 Sara-Ann
+Saraann
 Sarabel
 Sarabi
 Sarabjit
@@ -18037,7 +18047,6 @@ Seni
 Senia
 Senida
 Senobia
-Señor
 Senorina
 Seny
 Sephira
@@ -18123,6 +18132,7 @@ Seymour
 Seynabou
 Seyni
 Sezgin
+Señor
 Sfia
 Sghir
 Sha
@@ -18314,8 +18324,8 @@ Sheeree
 Shehzad
 Sheikh
 Sheila
-Sheilah
 Sheila-Kathryn
+Sheilah
 Sheima
 Shel
 Shela
@@ -18742,7 +18752,6 @@ Sommer
 Somna
 Son
 Sona
-Soña
 Sonali
 Sonam
 Sonata
@@ -18835,6 +18844,7 @@ Sounia
 Souraya
 Souria
 Sow
+Soña
 Sparkle
 Spartak
 Spas
@@ -19241,6 +19251,7 @@ Tallia
 Tallie
 Tallou
 Tallulah
+Tally
 Talwinder
 Talya
 Talyah
@@ -19385,6 +19396,7 @@ Taysa
 Taysir
 Tayyab
 Tayyaba
+Tea
 Teba
 Tecla
 Ted
@@ -19744,7 +19756,6 @@ Tonette
 Toney
 Tong
 Toni
-Toñi
 Tonia
 Tonica
 Tonie
@@ -19801,6 +19812,7 @@ Tova
 Tove
 Towanda
 Toya
+Toñi
 Tracee
 Tracey
 Traci
@@ -20310,7 +20322,6 @@ Vianney
 Viatcheslav
 Vibeke
 Vica
-Vicenç
 Vicencia
 Vicencio
 Vicens
@@ -20320,6 +20331,7 @@ Vicente
 Vicentina
 Vicentiu
 Vicenzo
+Vicenç
 Vickey
 Vicki
 Vickie
@@ -20383,7 +20395,6 @@ Vilmos
 Vilson
 Vin
 Vina
-Viñas
 Vince
 Vincent
 Vincenza
@@ -20492,6 +20503,7 @@ Vivina
 Viviyan
 Vivyan
 Vivyanne
+Viñas
 Vlad
 Vlada
 Vladas
@@ -20765,12 +20777,14 @@ Williams
 Willian
 Willians
 Willibald
+Willie
 Williemae
 Willington
 Willis
 Willma
 Willodean
 Willow
+Willy
 Willyt
 Wilma
 Wilman
@@ -22108,26 +22122,3 @@ Zviad
 Zviadi
 Zydrunas
 Zygmunt
-
-# ============================================================================
-# REVIEW NEEDED - matched the shipped blacklist (word-boundary match, exactly
-# how the plugin screens). These were REMOVED from the active whitelist so they
-# are no longer auto-approved. They are commented out (the loader ignores '#'
-# lines), so none are active. Uncomment any you want back on the whitelist after
-# review. Format:  # <Name>   (matched blacklist word '<word>')
-# ============================================================================
-Angie
-Arian
-Aryan
-Desire
-Geni
-German
-Israel
-Jade
-Jesus
-Len
-Randy
-Tally
-Tea
-Willie
-Willy

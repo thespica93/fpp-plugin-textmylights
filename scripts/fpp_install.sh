@@ -38,6 +38,50 @@ apt_update_once() {
     fi
 }
 
+# apt-install a package ONLY if it can be added WITHOUT removing anything. A Pi that is
+# mid-OS-upgrade (lots of held-back packages) can have apt decide it must REMOVE core packages
+# - even apache2, which would break FPP - just to satisfy one install. So we simulate first and
+# refuse if the plan contains any removal. Never hangs on a conffile question (confold), never
+# aborts the script. Returns 0 only if apt actually installed it.
+apt_install_safe() {
+    _pkg="$1"
+    apt_update_once
+    if apt-get install -s -y "$_pkg" 2>/dev/null | grep -q '^Remv '; then
+        return 1   # apt would remove other packages - refuse (let the caller fall back)
+    fi
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        -o Dpkg::Options::="--force-confold" "$_pkg" >> "$LOG" 2>&1
+}
+
+# Make a Python module importable. Preference: (1) already present, (2) the Debian package via
+# apt_install_safe, (3) pip as a fallback so the plugin still installs on a Pi that isn't fully
+# updated (this is how the plugin installed everything before the apt switch). Call with
+# `|| true` so a single failure never aborts the whole install.
+# Args: <import_name> <apt_package> <pip_package> <friendly label>
+ensure_pydep() {
+    _imp="$1"; _apt="$2"; _pip="$3"; _label="$4"
+    if python3 -c "import $_imp" >/dev/null 2>&1; then
+        log_and_show "$_label already installed"
+        return 0
+    fi
+    log_and_show "Installing $_label... please wait"
+    if apt_install_safe "$_apt" && python3 -c "import $_imp" >/dev/null 2>&1; then
+        log_and_show "$_label complete (system package)"
+        return 0
+    fi
+    # Fallback: pip (doesn't touch apt). Bootstrap pip3 the same safe way if it's missing.
+    command -v pip3 >/dev/null 2>&1 || apt_install_safe python3-pip || true
+    if command -v pip3 >/dev/null 2>&1; then
+        pip3 install --break-system-packages --no-cache-dir "$_pip" >> "$LOG" 2>&1 || true
+    fi
+    if python3 -c "import $_imp" >/dev/null 2>&1; then
+        log_and_show "$_label complete (pip fallback)"
+        return 0
+    fi
+    log_and_show "WARNING: could not install $_label via apt or pip - the plugin may not work"
+    return 1
+}
+
 log_and_show "========================================"
 log_and_show "Text My Lights Plugin Installer"
 log_and_show "$(date)"
@@ -47,22 +91,23 @@ log_and_show "NOTE: Installation can take 3-5 minutes."
 log_and_show "Please do not close this window."
 log_and_show ""
 
-# Python dependencies are installed via apt (Debian packages), not pip. On FPP 10+
-# they are also declared in pluginInfo.json's dependencies.packages so FPP
-# reference-counts them and removes them on uninstall only when unused. The
-# import-check guards below keep updates fast (skip anything already present) and
-# keep FPP 9 working, where dependencies.packages isn't honored. apt is strongly
-# preferred over pip here: pip packages are system-wide and not reference-counted,
-# so uninstalling them would break other plugins that share them.
+# Python dependencies install via apt (Debian packages), preferred over pip because apt
+# packages are reference-counted (and on FPP 10+ they're also declared in pluginInfo.json's
+# dependencies.packages, which FPP installs). ensure_pydep() keeps that apt-first behavior but
+# adds a pip FALLBACK, so the plugin still installs on a Pi whose apt is wedged mid-OS-upgrade
+# (where a single `apt install` would otherwise try to remove core packages). Anything already
+# importable is skipped instantly, which also keeps updates fast.
 
 # Install system fonts used for rendering text on the overlay model. Some FPP base
 # images ship with zero TrueType fonts installed, which would otherwise make PIL
 # silently fall back to a tiny built-in bitmap font instead of a real one.
 if [ ! -f /usr/share/fonts/truetype/freefont/FreeSans.ttf ]; then
     log_and_show "[1/7] Installing fonts (fonts-freefont-ttf)... please wait"
-    apt_update_once
-    DEBIAN_FRONTEND=noninteractive apt-get install -y fonts-freefont-ttf >> "$LOG" 2>&1
-    log_and_show "[1/7] Fonts complete"
+    if apt_install_safe fonts-freefont-ttf; then
+        log_and_show "[1/7] Fonts complete"
+    else
+        log_and_show "[1/7] System fonts skipped (apt busy/Pi not fully updated); bundled theme fonts still install"
+    fi
 else
     log_and_show "[1/7] Fonts already installed"
 fi
@@ -90,8 +135,7 @@ if [ -f "$FONT_MARKER" ] && [ "$(cat "$FONT_MARKER" 2>/dev/null)" = "$FONT_HASH"
 else
     log_and_show "[2/7] Installing bundled theme fonts... please wait"
     if ! command -v fc-cache &> /dev/null; then
-        apt_update_once
-        DEBIAN_FRONTEND=noninteractive apt-get install -y fontconfig >> "$LOG" 2>&1
+        apt_install_safe fontconfig || true
     fi
     # Migrate away from older versions that copied our bundled fonts FLAT into
     # /usr/local/share/fonts: remove ONLY the exact filenames we ship, never a
@@ -112,57 +156,19 @@ else
     log_and_show "[2/7] Theme fonts complete"
 fi
 
-# Install packages — each is skipped instantly if already importable.
-if python3 -c "import flask" >/dev/null 2>&1; then
-    log_and_show "[3/7] Flask already installed"
-else
-    log_and_show "[3/7] Installing Flask... please wait"
-    apt_update_once
-    DEBIAN_FRONTEND=noninteractive apt-get install -y python3-flask >> "$LOG" 2>&1
-    log_and_show "[3/7] Flask complete"
-fi
+# Required Python deps: apt first, pip fallback (see ensure_pydep). import-name / apt pkg / pip pkg.
+ensure_pydep flask    python3-flask    flask    "[3/7] Flask"    || true
+ensure_pydep twilio   python3-twilio   twilio   "[4/7] Twilio"   || true
+ensure_pydep requests python3-requests requests "[5/7] Requests" || true
+ensure_pydep PIL      python3-pil      pillow   "[6/7] Pillow (image rendering)" || true
 
-if python3 -c "import twilio" >/dev/null 2>&1; then
-    log_and_show "[4/7] Twilio already installed"
-else
-    log_and_show "[4/7] Installing Twilio... please wait"
-    apt_update_once
-    DEBIAN_FRONTEND=noninteractive apt-get install -y python3-twilio >> "$LOG" 2>&1
-    TWILIO_EXIT=$?
-    if [ $TWILIO_EXIT -ne 0 ]; then
-        log_and_show "ERROR: Twilio installation failed with exit code $TWILIO_EXIT"
-        exit 1
-    fi
-    log_and_show "[4/7] Twilio complete"
-fi
-
-if python3 -c "import requests" >/dev/null 2>&1; then
-    log_and_show "[5/7] Requests already installed"
-else
-    log_and_show "[5/7] Installing Requests... please wait"
-    apt_update_once
-    DEBIAN_FRONTEND=noninteractive apt-get install -y python3-requests >> "$LOG" 2>&1
-    log_and_show "[5/7] Requests complete"
-fi
-
-if python3 -c "import PIL" >/dev/null 2>&1; then
-    log_and_show "[6/7] Pillow already installed"
-else
-    log_and_show "[6/7] Installing Pillow (image rendering)... please wait"
-    apt_update_once
-    DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pil >> "$LOG" 2>&1
-    log_and_show "[6/7] Pillow complete"
-fi
-
-# zstandard is OPTIONAL — only used to preview zstd-compressed FSEQ files; the
-# plugin runs fine without it (ZSTD_AVAILABLE=False). Install the prebuilt Debian
-# package (python3-zstandard) rather than building the C extension from pip, which
-# can take many minutes or hang/OOM on a Pi with no prebuilt wheel. Skip entirely
-# if already importable, and never let this step block the installer from
-# finishing.
+# zstandard is OPTIONAL — only used to preview zstd-compressed FSEQ files; the plugin runs fine
+# without it (ZSTD_AVAILABLE=False). Install the prebuilt Debian package only; do NOT pip-fall-
+# back here, because the pip build is a C extension that can take many minutes or hang/OOM on a
+# Pi with no prebuilt wheel. Skip entirely if already importable, and never block the installer.
 if python3 -c "import zstandard" >/dev/null 2>&1; then
     log_and_show "[7/7] zstandard already installed"
-elif { apt_update_once; DEBIAN_FRONTEND=noninteractive apt-get install -y python3-zstandard >> "$LOG" 2>&1; }; then
+elif apt_install_safe python3-zstandard && python3 -c "import zstandard" >/dev/null 2>&1; then
     log_and_show "[7/7] zstandard complete (system package)"
 else
     log_and_show "[7/7] zstandard skipped — optional (zstd FSEQ preview only); plugin works without it"

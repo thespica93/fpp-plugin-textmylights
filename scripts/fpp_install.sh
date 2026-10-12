@@ -280,7 +280,7 @@ if pgrep -f sms_plugin.py > /dev/null 2>&1; then
     log_and_show "Restarting SMS plugin service..."
     # Stop via the PID file (shared helper); it also waits for the old process to exit.
     "$PLUGIN_DIR/scripts/tml-stop.sh" || true
-    setsid su fpp -c "cd '$PLUGIN_DIR' && nohup python3 sms_plugin.py > /dev/null 2>/home/fpp/media/logs/plugin-fpp-plugin-textmylights.log &" < /dev/null > /dev/null 2>&1 || true
+    setsid su fpp -c "cd '$PLUGIN_DIR' && nohup python3 sms_plugin.py >> /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log 2>&1 &" < /dev/null > /dev/null 2>&1 || true
     log_and_show "SMS plugin service restarted"
 fi
 

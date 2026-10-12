@@ -81,6 +81,12 @@ rm -f /etc/sudoers.d/90-fpp-sms-shm
 rm -f /usr/local/bin/tml-fix-shm-perms
 log_and_show "✓ Sudoers rule and helper removed"
 
+# Remove the FPP scheduler command scripts the installer dropped into media/scripts so they
+# stop appearing in FPP's Run Script dropdown after uninstall.
+log_and_show "Removing scheduler command scripts..."
+rm -f /home/fpp/media/scripts/TextMyLightsStart.sh /home/fpp/media/scripts/TextMyLightsStop.sh
+log_and_show "✓ Scheduler command scripts removed"
+
 # Remove log files
 log_and_show "Removing log files..."
 rm -f /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log

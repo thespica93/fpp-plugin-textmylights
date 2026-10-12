@@ -16,13 +16,15 @@
 			"minFPPVersion": "9.0",
 			"maxFPPVersion": "9.99",
 			"branch": "beta",
-			"sha": ""
+			"sha": "",
+			"platforms": ["Raspberry Pi", "Debian"]
 		},
 		{
 			"minFPPVersion": "10.0",
 			"maxFPPVersion": "0",
 			"branch": "beta",
-			"sha": ""
+			"sha": "",
+			"platforms": ["Raspberry Pi", "Debian"]
 		}
 	],
 	"dependencies": {
@@ -33,14 +35,20 @@
 		"sends": [
 			{
 				"to": "api.twilio.com",
-				"what": "Reads inbound SMS (sender number + text) from your Twilio account; sends optional reply texts",
-				"why": "Receive the names people text and optionally reply",
+				"what": "Reads inbound SMS (sender number + text) from your Twilio account. Read-only: the plugin never sends replies via Twilio.",
+				"why": "Receive the names people text",
 				"alwaysOn": false
 			},
 			{
 				"to": "Gmail (imap.gmail.com / smtp.gmail.com)",
-				"what": "Reads Google Voice SMS-to-email (sender + text) from your Gmail; can send optional replies",
-				"why": "Receive texted names when Google Voice is the source",
+				"what": "Reads Google Voice SMS-to-email (sender + text); sends reply texts (on by default) and texts the admin for Live Name Approval.",
+				"why": "Receive texted names via Google Voice; send replies and approval prompts",
+				"alwaysOn": false
+			},
+			{
+				"to": "Other FPP instances on your LAN (http://<peer>:5000)",
+				"what": "In Master/Remote mode the master pushes the texted name and show state to remotes (/api/tml/state, /api/tml/stop) to display in sync.",
+				"why": "Multi-instance Master/Remote synchronization",
 				"alwaysOn": false
 			}
 		],
@@ -60,6 +68,27 @@
 				"where": "/home/fpp/media/plugindata/fpp-plugin-textmylights/"
 			},
 			{
+				"what": "Live Name Approval: admin phone number and Gmail relay address",
+				"about": "operator",
+				"keptDays": null,
+				"canDelete": true,
+				"where": "/home/fpp/media/plugindata/fpp-plugin-textmylights/admin_reply_ctx.json"
+			},
+			{
+				"what": "Pending/expired name-approval requests: texter number, message and name (kept indefinitely when the timeout is 0)",
+				"about": "visitors",
+				"keptDays": null,
+				"canDelete": true,
+				"where": "/home/fpp/media/plugindata/fpp-plugin-textmylights/pending_approvals.json, expired_approvals.json"
+			},
+			{
+				"what": "Per-phone daily profanity-strike counts (used for auto-blocking)",
+				"about": "visitors",
+				"keptDays": null,
+				"canDelete": true,
+				"where": "/home/fpp/media/plugindata/fpp-plugin-textmylights/profanity_strikes.json"
+			},
+			{
 				"what": "Your Twilio auth token and Gmail app password",
 				"about": "operator",
 				"keptDays": null,
@@ -72,10 +101,26 @@
 		"systemChanges": [
 			{
 				"kind": "privilege",
-				"what": "Adds an /etc/sudoers.d rule allowing a validated root helper to give the overlay model's shared-memory file to the fpp user/group (group-writable, not world) for pixel rendering"
+				"what": "Adds an /etc/sudoers.d rule so a validated root helper can make the overlay model's /dev/shm file group-writable for pixel rendering."
+			},
+			{
+				"kind": "network",
+				"what": "Runs a local web service on 0.0.0.0:5000 for the settings UI and Master/Remote sync between FPP instances on your LAN."
+			},
+			{
+				"kind": "package",
+				"what": "Installs apt packages: fonts-freefont-ttf, fontconfig, python3-zstandard, and the Python libraries listed in dependencies."
+			},
+			{
+				"kind": "file",
+				"what": "Copies bundled fonts to /usr/local/share/fonts/fpp-plugin-textmylights/ and installs TextMyLightsStart/Stop.sh into media/scripts."
+			},
+			{
+				"kind": "file",
+				"what": "Config import writes into media/playlists, sequences, images and videos, and the overlay model into config/co-other.json."
 			}
 		],
 		"closedCode": false,
-		"other": "Credentials are stored in an owner-only (0600) file and are removed on uninstall. The plugin also installs FPP scheduler command scripts (TextMyLightsStart/Stop). No data is sent anywhere except your own Twilio/Google accounts."
+		"other": "Credentials are stored in an owner-only (0600) file and removed on uninstall. In Master/Remote mode the texted name and show state are also sent to your other FPP instances on the LAN. No data goes to third parties beyond your own Twilio/Google accounts and your own FPP devices."
 	}
 }

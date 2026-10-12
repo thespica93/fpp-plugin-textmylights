@@ -2,7 +2,7 @@
 
 > Full reference for every setting in the plugin web interface.
 
-Access the configuration page at: **`http://YOUR_FPP_IP:5000`**
+Access the configuration page from the FPP web UI: **Content Setup → Text My Lights**
 
 ---
 
@@ -189,7 +189,7 @@ Below the Text Position dropdown is a live canvas preview of your overlay model 
 | Left to Right / Right to Left | Y only | Shown | Hidden |
 | Top to Bottom / Bottom to Top | X only | Hidden | Shown |
 
-> 💡 **Position settings persist through firmware and plugin updates.** X/Y coordinates are saved to `/home/fpp/media/config/plugin.fpp-textmylights.json`, which is never touched by FPP or plugin updates.
+> 💡 **Position settings persist through firmware and plugin updates.** X/Y coordinates are saved to `/home/fpp/media/plugindata/fpp-plugin-textmylights/plugin.json`, which is never touched by FPP or plugin updates.
 
 ---
 

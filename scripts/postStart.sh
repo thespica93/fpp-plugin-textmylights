@@ -17,6 +17,8 @@ PLUGIN_DIR="/home/fpp/media/plugins/fpp-plugin-textmylights"
 
 # Start the service as fpp user
 cd "$PLUGIN_DIR"
-su fpp -c "cd '$PLUGIN_DIR' && nohup python3 sms_plugin.py > /dev/null 2>/home/fpp/media/logs/plugin-fpp-plugin-textmylights.log &"
+# APPEND (>>), never truncate (2>): the daemon writes this same log via a WatchedFileHandler,
+# and FPP's logrotate manages it. Truncating on every start would wipe the prior run's log.
+su fpp -c "cd '$PLUGIN_DIR' && nohup python3 sms_plugin.py >> /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log 2>&1 &"
 
 exit 0

@@ -4,7 +4,7 @@
 
 This page explains exactly how an incoming text is turned into one or more names on your display, so you know what to expect and what to tell your visitors.
 
-Name format rules are set in the **⚙️ Configuration** tab at **`http://YOUR_FPP_IP:5000`** under **Name Format Rules**.
+Name format rules are set in the **⚙️ Configuration** tab of the plugin (**Content Setup → Text My Lights**) under **Name Format Rules**.
 
 ---
 

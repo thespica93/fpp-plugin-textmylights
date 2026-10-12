@@ -2,7 +2,7 @@
 
 > Monitor incoming messages, view history, and manage individual senders.
 
-Access the Message Queue at: **`http://YOUR_FPP_IP:5000/messages`**
+Open the Message Queue from the plugin UI (**Content Setup → Text My Lights → View Message Queue**).
 
 ---
 
@@ -144,7 +144,7 @@ Each entry shows:
 
 Message history is also saved to disk at:
 ```
-/home/fpp/media/logs/received_messages.json
+/home/fpp/media/plugindata/fpp-plugin-textmylights/logs/messages/
 ```
 
 This file persists between plugin restarts and can be viewed for a full history of the season.

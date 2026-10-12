@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from twilio.rest import Client
 from collections import deque
 import os
+import sys
 import atexit
 import signal
 import ssl
@@ -209,16 +210,17 @@ try:
 except OSError:
     pass
 
-# Setup logging - ensure the log directory exists, then write to file + stderr.
-# The file handler is size-bounded (rotating) so the log can never fill the SD card:
-# ~4 MB hard ceiling total (1 MB x 3 backups + the active file), oldest lines discarded.
+# Setup logging - ONE log, managed by FPP. We write directly to FPP's recognized log file in
+# APPEND mode via a WatchedFileHandler, which reopens the file when its inode changes - so FPP's
+# logrotate (which renames WITHOUT copytruncate) is handled automatically; we never keep writing
+# to the rotated .1 file. We do NOT self-rotate (leave rotation to FPP). On a non-FPP box (no
+# logs dir) we fall back to stderr.
 import logging.handlers
-_log_handlers = [logging.StreamHandler()]  # stderr always available via nohup
+FPP_LOG_FILE = "/home/fpp/media/logs/plugin-fpp-plugin-textmylights.log"
 try:
-    _log_handlers.append(logging.handlers.RotatingFileHandler(
-        LOG_FILE, maxBytes=1_000_000, backupCount=3))
+    _log_handlers = [logging.handlers.WatchedFileHandler(FPP_LOG_FILE)]  # append mode (default)
 except Exception:
-    pass  # directory may not exist on some FPP installs; stderr is the fallback
+    _log_handlers = [logging.StreamHandler()]   # fallback (e.g. dev box without /home/fpp/media/logs)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -226,6 +228,21 @@ logging.basicConfig(
 )
 # Keep Flask/werkzeug at ERROR so its per-request access logging stays off (that WOULD be chatty).
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
+
+# Route uncaught exceptions (main + worker threads) through logging so they land in the managed
+# log file. The shell redirect's stderr would otherwise keep writing to the rotated file after a
+# logrotate rename; funneling through logging means WatchedFileHandler always targets the live file.
+def _log_uncaught(exc_type, exc, tb):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc, tb)
+        return
+    logging.error("Uncaught exception", exc_info=(exc_type, exc, tb))
+sys.excepthook = _log_uncaught
+try:
+    threading.excepthook = lambda a: logging.error(
+        "Uncaught thread exception", exc_info=(a.exc_type, a.exc_value, a.exc_traceback))
+except Exception:
+    pass  # threading.excepthook is Python 3.8+
 
 import flask.cli
 flask.cli.show_server_banner = lambda *args: None
@@ -422,9 +439,11 @@ DEFAULT_CONFIG = {
     "gv_smtp_port": 587,
     "poll_interval": 2,
     "display_duration": 10,
-    # 0 = unlimited, matching the Google Voice default source (Twilio uses 5, applied
-    # by the source selector's change handler when you switch to Twilio).
-    "max_messages_per_phone": 0,
+    # Per-phone daily message cap the OPERATOR controls. Default 5 so a fresh install isn't
+    # unlimited (one texter can't flood the show / your Gmail with replies). 0 = unlimited
+    # per phone - but the HARDCODED global daily reply cap (GLOBAL_DAILY_REPLY_CAP) still
+    # protects Gmail's send limit regardless of this value.
+    "max_messages_per_phone": 5,
     "max_message_length": 30,
     "max_message_age_mins": 5,
     "one_word_only": False,
@@ -641,20 +660,6 @@ def _default_plugin_role():
     """Suggested default role from FPP's mode; 'master' (the full-function role, correct for a
     lone box) when FPP can't be reached."""
     return _fpp_mode_role() or 'master'
-
-
-def _fpp_mode_role_for_seed(attempts=5, delay=2):
-    """Like _fpp_mode_role() but retried a few times, for the one-time first-install role
-    seed. The plugin is launched by postStart.sh right as FPPD comes up, so FPP's API can
-    still be warming up for the first few seconds - a single read could miss 'remote'.
-    Returns 'remote'/'master', or None if FPP never answered in the window."""
-    for i in range(attempts):
-        role = _fpp_mode_role()
-        if role is not None:
-            return role
-        if i < attempts - 1:
-            time.sleep(delay)
-    return None
 
 
 def fpp_mode_watcher():
@@ -1401,17 +1406,13 @@ def load_config():
 
         logging.info("Configuration loaded successfully")
     except FileNotFoundError:
-        # FIRST INSTALL ONLY (no plugin.json yet). If THIS FPP box is already in Remote
-        # mode, open the plugin as a remote too - seed an EXPLICIT plugin_role='remote'.
-        # Seeding it explicitly (rather than leaving '' = auto) means later plugin updates
-        # never re-evaluate or flip it; the stored role wins from here on. A non-remote box
-        # is left on '' (auto -> master), unchanged, and if FPP can't be reached in time we
-        # also leave '' so the auto-follow watcher resolves it later.
-        if _fpp_mode_role_for_seed() == 'remote':
-            config['plugin_role'] = 'remote'
-            logging.info(f"First install on a Remote FPP: seeded plugin_role='remote' [{_fpp_mode_detail}]")
+        # FIRST INSTALL ONLY (no plugin.json yet). Leave plugin_role on '' (auto): the
+        # mode-watcher follows FPP's own mode, so the plugin acts as a remote while FPP is in
+        # Remote mode and as a master in Player/Master mode - AND it keeps following if the box
+        # is switched later. (Previously we seeded an EXPLICIT 'remote' here, but an explicit
+        # role never re-evaluates, so a box later switched to Player stayed stuck as a remote.)
         save_config()
-        logging.info("Created default configuration")
+        logging.info("Created default configuration (plugin_role left on auto)")
     except Exception as e:
         logging.error(f"Error loading config: {e}")
 
@@ -2804,7 +2805,7 @@ def block_phone(phone):
     if phone not in blocklist:
         blocklist.append(phone)
         save_blocklist(blocklist)
-        logging.info(f"🚫 Blocked phone number: {phone}")
+        logging.info(f"🚫 Blocked phone number: {mask_phone(phone)}")
         return True
     return False
 
@@ -2814,7 +2815,7 @@ def unblock_phone(phone):
     if phone in blocklist:
         blocklist.remove(phone)
         save_blocklist(blocklist)
-        logging.info(f"✅ Unblocked phone number: {phone}")
+        logging.info(f"✅ Unblocked phone number: {mask_phone(phone)}")
         return True
     return False
 
@@ -3022,8 +3023,12 @@ def verify_admin_ctx(force=False):
         imap = imaplib.IMAP4_SSL(config.get('gv_imap_host', 'imap.gmail.com'), timeout=20, ssl_context=_TLS_CONTEXT)
         imap.login(email_addr, app_pw)
         imap.select(config.get('gv_imap_folder', 'INBOX'))
-        # Targeted header search for exactly the stored thread message.
-        typ, data = imap.uid('search', None, 'HEADER', 'Message-ID', msgid)
+        # Targeted header search for exactly the stored thread message. Quote the Message-ID
+        # as an IMAP quoted-string: it comes from an email header and may contain spaces or
+        # (if crafted) CR/LF that would otherwise break the search or inject into the IMAP
+        # command. Strip control chars, then escape backslash/quote and wrap in quotes.
+        _mid = _sanitize_header(msgid).replace('\\', '\\\\').replace('"', '\\"')
+        typ, data = imap.uid('search', None, 'HEADER', 'Message-ID', '"%s"' % _mid)
         found = (typ == 'OK' and data and data[0] and len(data[0].split()) > 0)
         if found:
             return True
@@ -3151,7 +3156,7 @@ def add_name_to_whitelist(name):
                 f.write('\n'.join(sorted(removed)) + '\n' if removed else '')
         _whitelist_cache = None
         _whitelist_mtime = None
-        logging.info(f"Added '{name}' to whitelist via admin approval")
+        logging.info(f"Added '{_mask_name(name)}' to whitelist via admin approval")
         return True
     except Exception as e:
         logging.error(f"Error adding '{name}' to whitelist: {e}")
@@ -3216,8 +3221,10 @@ def _maybe_handle_admin_message(from_number, body):
     if decision is None:
         return False  # admin texted a real name - let normal processing handle it
 
-    # A name-targeted reply ('Y Grandma') resolves that request; otherwise FIFO
-    # (oldest first). Shared by the active and the expired lists.
+    # A name-targeted reply ('Y Grandma') resolves THAT request by EXACT name; a bare 'Y'/'N'
+    # resolves the oldest (FIFO). When a name is given but matches nothing, return None and do
+    # NOT fall back to the oldest - otherwise the admin could whitelist a name they never saw.
+    # The caller re-prompts instead. Shared by the active and the expired lists.
     def _pick(items):
         if not items:
             return None
@@ -3225,6 +3232,7 @@ def _maybe_handle_admin_message(from_number, body):
             for i, it in enumerate(items):
                 if it.get('name', '').lower() == target.lower():
                     return items.pop(i)
+            return None  # named but no exact match - ask again, never approve the oldest
         return items.pop(0)
 
     # Pull the admin's target out of the RAW pending list first - BEFORE pruning - so
@@ -3247,22 +3255,22 @@ def _maybe_handle_admin_message(from_number, body):
         if decision == 'approve':
             add_name_to_whitelist(name)
             if is_late:
-                log_message(texter_phone, record.get('body', ''), name, "admin_approved_late")
-                logging.info(f"✅ Admin approved '{name}' after timeout - whitelisted only, not shown")
+                log_message(texter_phone, record.get('body', ''), name, "admin_approved_late", reply_ctx=texter_ctx)
+                logging.info(f"✅ Admin approved '{_mask_name(name)}' after timeout - whitelisted only, not shown")
             else:
                 add_to_queue(name, texter_phone, record.get('body', name))
-                log_message(texter_phone, record.get('body', ''), name, "admin_approved")
+                log_message(texter_phone, record.get('body', ''), name, "admin_approved", reply_ctx=texter_ctx)
                 _send_feature_reply(texter_ctx, config.get('response_success', ''), 'success')
-                logging.info(f"✅ Admin approved '{name}' - added to whitelist and queued")
+                logging.info(f"✅ Admin approved '{_mask_name(name)}' - added to whitelist and queued")
         else:  # deny
             if is_late:
-                log_message(texter_phone, record.get('body', ''), name, "admin_denied_late")
-                logging.info(f"🚫 Admin denied '{name}' after timeout - no action")
+                log_message(texter_phone, record.get('body', ''), name, "admin_denied_late", reply_ctx=texter_ctx)
+                logging.info(f"🚫 Admin denied '{_mask_name(name)}' after timeout - no action")
             else:
-                log_message(texter_phone, record.get('body', ''), name, "admin_denied")
+                log_message(texter_phone, record.get('body', ''), name, "admin_denied", reply_ctx=texter_ctx)
                 # A denial just sends the standard Not-on-Whitelist response.
                 _send_feature_reply(texter_ctx, config.get('response_not_whitelisted', ''), 'not_whitelisted')
-                logging.info(f"🚫 Admin denied '{name}'")
+                logging.info(f"🚫 Admin denied '{_mask_name(name)}'")
         # Now sweep any OTHER genuinely-expired-and-unanswered requests (sends their
         # timeout reply); safe, since the one we just handled is already removed.
         prune_pending_approvals()
@@ -3278,10 +3286,28 @@ def _maybe_handle_admin_message(from_number, body):
         name = exp_rec.get('name', '')
         if decision == 'approve':
             add_name_to_whitelist(name)
-            log_message(exp_rec.get('texter_phone', ''), exp_rec.get('body', ''), name, "admin_approved_late")
-            logging.info(f"✅ Admin approved '{name}' after timeout - whitelisted only, not shown")
+            log_message(exp_rec.get('texter_phone', ''), exp_rec.get('body', ''), name, "admin_approved_late",
+                        reply_ctx=exp_rec.get('texter_ctx'))
+            logging.info(f"✅ Admin approved '{_mask_name(name)}' after timeout - whitelisted only, not shown")
         else:  # late deny
-            logging.info(f"🚫 Admin denied '{name}' after timeout - no action")
+            logging.info(f"🚫 Admin denied '{_mask_name(name)}' after timeout - no action")
+        return True
+
+    # A NAME was given but matched nothing in pending or expired. Never fall back to the oldest
+    # (the admin must not whitelist a name they didn't see) - ask again, listing what's actually
+    # pending so they can reply with an exact name.
+    if target:
+        _pending_names = [it.get('name', '') for it in load_pending_approvals() if it.get('name')]
+        if _pending_names:
+            _msg = (f'No pending request matches "{target}". Pending: '
+                    + ", ".join(_pending_names[:10])
+                    + ('…' if len(_pending_names) > 10 else '')
+                    + '. Reply Y <name> or N <name>.')
+        else:
+            _msg = f'No pending request matches "{target}", and nothing is pending right now.'
+        if _gv_reply_ctx and _gv_reply_ctx.get('to'):
+            send_gv_reply(_msg, 'admin_clarify', ctx=dict(_gv_reply_ctx))
+        logging.info(f"Admin named '{target}' but no exact match; re-prompted instead of falling back")
         return True
 
     logging.info("Admin Y/N received but no pending (or recently expired) approvals; ignoring")
@@ -3320,7 +3346,7 @@ def _maybe_request_admin_approval(name, from_number, body):
     for it in pending:
         if _normalize_phone(it.get('texter_phone', '')) == _normalize_phone(from_number) \
                 and it.get('name', '').lower() == name.lower():
-            logging.info(f"Duplicate pending approval for '{name}' from {from_number[-4:]}; not re-prompting")
+            logging.info(f"Duplicate pending approval for '{_mask_name(name)}' from {from_number[-4:]}; not re-prompting")
             _send_feature_reply(texter_ctx, config.get('response_whitelist_pending', ''), 'whitelist_pending')
             log_message(from_number, body, name, "admin_pending")
             return True
@@ -3333,17 +3359,29 @@ def _maybe_request_admin_approval(name, from_number, body):
         "created_ts": time.time(),
     }
     pending.append(record)
-    # Cap the list so a flood can never grow it without bound (oldest dropped).
+    # Cap the list so a flood can never grow it without bound. Rather than dropping the oldest
+    # SILENTLY (that texter would never hear back), notify each dropped texter with the standard
+    # not-whitelisted reply and log it, so the drop is visible to them and in the message log.
     MAX_PENDING = 50
     if len(pending) > MAX_PENDING:
+        dropped = pending[:-MAX_PENDING]
         pending = pending[-MAX_PENDING:]
+        for d in dropped:
+            try:
+                _send_feature_reply(d.get('texter_ctx'), config.get('response_not_whitelisted', ''), 'not_whitelisted')
+                log_message(d.get('texter_phone', ''), d.get('body', ''), d.get('name', ''),
+                            "admin_dropped_overflow", reply_ctx=d.get('texter_ctx'))
+                logging.warning(f"Pending approvals full ({MAX_PENDING}); dropped '{d.get('name','')}' "
+                                f"from {str(d.get('texter_phone',''))[-4:]} and notified the texter")
+            except Exception as _de:
+                logging.error(f"Error notifying dropped approval: {_de}")
     save_pending_approvals(pending)
 
     prompt = config.get('admin_approval_prompt', '').replace('{name}', name)
     _send_feature_reply(admin_ctx, prompt, 'admin_prompt')
     _send_feature_reply(texter_ctx, config.get('response_whitelist_pending', ''), 'whitelist_pending')
     log_message(from_number, body, name, "admin_pending")
-    logging.info(f"📨 Requested admin approval for '{name}' from {from_number[-4:]}")
+    logging.info(f"📨 Requested admin approval for '{_mask_name(name)}' from {from_number[-4:]}")
     return True
 
 def send_sms_response(to_phone, message_type):
@@ -3378,33 +3416,17 @@ def send_sms_response(to_phone, message_type):
 def send_sms_text(to_phone, text, message_type="message"):
     """Send arbitrary SMS text to a recipient via the active message source.
 
-    Lower-level than send_sms_response(): it does NOT consult the per-type
-    enable toggles or response templates, so it's used for dynamically built
-    messages such as the multi-name batch summary. Routing (Twilio REST vs
-    Google Voice reply-to-email) matches send_sms_response()."""
+    GOOGLE VOICE ONLY. Twilio is READ-ONLY by design: the plugin reads inbound SMS from
+    Twilio (polling) but never sends replies through it - so there are no per-segment Twilio
+    reply charges and the Twilio account needs no send permissions. On Twilio this is a no-op
+    (the SMS Responses tab is hidden and _response_is_muted() suppresses every reply too)."""
     if not text:
         return False
 
-    # Google Voice: reply-to-email path
+    # Google Voice: reply-to-email path. Twilio: read-only, never sends.
     if config.get('message_source') == 'google_voice':
         return send_gv_reply(text, message_type)
-
-    # Twilio: REST API path
-    if not twilio_client:
-        logging.warning("Cannot send SMS: Twilio client not initialized")
-        return False
-
-    try:
-        twilio_client.messages.create(
-            body=text,
-            from_=config['twilio_phone_number'],
-            to=to_phone
-        )
-        logging.info(f"📤 Sent SMS to {to_phone[-4:]}: {message_type}")
-        return True
-    except Exception as e:
-        logging.error(f"Error sending SMS: {e}")
-        return False
+    return False
 
 
 def _sanitize_header(value):
@@ -3415,6 +3437,43 @@ def _sanitize_header(value):
         return ''
     return re.sub(r'[\r\n\x00]+', ' ', str(value)).strip()
 
+# Hardcoded daily cap on ALL outbound Google Voice sends (replies + admin prompts), across
+# every texter. This is a SAFETY net for Google's send limit and is deliberately NOT user-
+# configurable: a free Gmail caps at ~500 sends/day and exceeding it blocks ALL sending for
+# ~24h, which would kill every show reply. We stop replying before that point; the display
+# keeps running. Operators throttle per-texter with the configurable max_messages_per_phone.
+GLOBAL_DAILY_REPLY_CAP = 400
+_reply_quota = {"date": None, "count": 0}
+_reply_quota_lock = threading.Lock()
+_reply_quota_warned = False
+
+def _reply_quota_allow():
+    """True if another outbound reply may be sent today; counts reset at local midnight."""
+    global _reply_quota_warned
+    today = datetime.now().date().isoformat()
+    with _reply_quota_lock:
+        if _reply_quota["date"] != today:
+            _reply_quota["date"] = today
+            _reply_quota["count"] = 0
+            _reply_quota_warned = False
+        if _reply_quota["count"] < GLOBAL_DAILY_REPLY_CAP:
+            return True
+        if not _reply_quota_warned:
+            _reply_quota_warned = True
+            logging.warning(f"⛔ Global daily reply cap ({GLOBAL_DAILY_REPLY_CAP}) reached - pausing "
+                            f"outbound replies until midnight to protect Gmail's send limit. "
+                            f"Names still display.")
+        return False
+
+def _reply_quota_record():
+    """Count one successful outbound send toward today's global cap."""
+    today = datetime.now().date().isoformat()
+    with _reply_quota_lock:
+        if _reply_quota["date"] != today:
+            _reply_quota["date"] = today
+            _reply_quota["count"] = 0
+        _reply_quota["count"] += 1
+
 def send_gv_reply(text, message_type="", ctx=None):
     """Send an outbound SMS via Google Voice by replying to the forwarding email.
 
@@ -3423,10 +3482,17 @@ def send_gv_reply(text, message_type="", ctx=None):
     reply context (target address + threading headers) - an explicit `ctx` when
     given (e.g. a manual reply from the queue page, resolved from the message
     log), otherwise the one captured by the poller for the message currently
-    being processed."""
+    being processed.
+
+    Subject to the hardcoded GLOBAL_DAILY_REPLY_CAP safety limit (see _reply_quota_allow)."""
     ctx = ctx if ctx is not None else _gv_reply_ctx
     if not ctx or not ctx.get('to'):
         logging.warning("GV reply: no reply context for current message; cannot respond")
+        return False
+
+    # Global daily safety cap (hardcoded, protects Gmail's send limit). When reached we stop
+    # sending for the day - the display keeps running, only outbound replies pause.
+    if not _reply_quota_allow():
         return False
 
     # Only ever reply INTO Google Voice. The reply address is normally captured from a
@@ -3465,7 +3531,8 @@ def send_gv_reply(text, message_type="", ctx=None):
             s.ehlo()
             s.login(email_addr, app_pw)
             s.sendmail(email_addr, [ctx['to']], reply.as_string())
-        logging.info(f"📤 Sent Google Voice reply ({message_type}) to {ctx['to']}")
+        _reply_quota_record()   # count toward the global daily cap
+        logging.info(f"📤 Sent Google Voice reply ({message_type})")   # relay address omitted (contains the texter's number)
         return True
     except Exception as e:
         logging.error(f"Error sending Google Voice reply: {e}")
@@ -3649,7 +3716,7 @@ def contains_profanity(text):
     text_lower = text.lower()
 
     if pattern.search(text_lower):
-        logging.info(f"🚫 Profanity detected in '{text}'")
+        logging.info("🚫 Profanity detected")   # message text omitted from the log (PII)
         return True
 
     return False
@@ -3737,6 +3804,15 @@ def mask_phone(p):
         return p
     digits = re.sub(r'\D', '', str(p))
     return '***' + digits[-4:] if len(digits) >= 4 else '***'
+
+def _mask_name(name):
+    """Redact a submitted name for the APPLICATION log (which goes into support bundles and
+    outlives the 7-day message log): keep only the first initial. Full names live only in the
+    message log, never the long-lived app log. Passes the 'Guest' sentinel through."""
+    s = (str(name) if name is not None else '').strip()
+    if not s or s == 'Guest':
+        return s or '(blank)'
+    return s[0] + '***'
 
 def redact_messages(messages, log_date):
     """Return copies of message log entries with phone numbers masked to last-4,
@@ -3908,12 +3984,17 @@ def load_last_gv_uid():
     except Exception:
         return None
 
-def log_message(phone, message, name, status, counts=True):
+def log_message(phone, message, name, status, counts=True, reply_ctx=None):
     """Log received message to today's daily log file.
 
     counts=False marks this row as NOT counting toward the per-phone daily
     message limit (see get_message_count). Used for rejected/queued grouped
-    (multi-name) texts, which never consume a sender's allowance."""
+    (multi-name) texts, which never consume a sender's allowance.
+
+    reply_ctx: explicitly stash the reply target for this row's Respond button. Pass the
+    TEXTER's context when logging during admin approval - at that moment the global
+    _gv_reply_ctx is the ADMIN's message, so relying on it would make the Respond button
+    text the admin instead of the texter. Defaults to the current message's context."""
     try:
         log_path = get_day_log_path()
         try:
@@ -3933,9 +4014,11 @@ def log_message(phone, message, name, status, counts=True):
         # Under Google Voice, stash how to reply to this exact message (target
         # address + threading headers) so the queue page's Respond button can
         # answer it later. Kept server-side only - redact_messages() strips it
-        # before anything reaches the browser.
-        if config.get('message_source') == 'google_voice' and _gv_reply_ctx and _gv_reply_ctx.get('to'):
-            entry["reply_ctx"] = _gv_reply_ctx
+        # before anything reaches the browser. An explicit reply_ctx wins over the
+        # global (the admin-approval path passes the TEXTER's context here).
+        _ctx = reply_ctx if reply_ctx is not None else _gv_reply_ctx
+        if config.get('message_source') == 'google_voice' and _ctx and _ctx.get('to'):
+            entry["reply_ctx"] = _ctx
         logs.append(entry)
         with open(log_path, 'w') as f:
             json.dump(logs, f, indent=2)
@@ -3997,7 +4080,7 @@ def add_to_queue(name, phone, message, override=None):
 
         save_queue()  # persist OUTSIDE queue_lock
 
-        logging.info(f"📋 Added to queue (position {queue_position}): {name}")
+        logging.info(f"📋 Added to queue (position {queue_position}): {_mask_name(name)}")
         return True
     except Exception as e:
         logging.error(f"💥 ERROR in add_to_queue: {e}")
@@ -4138,7 +4221,7 @@ def send_to_fpp(name, override=None):
         # FPP API fallback: join lines with newline
         display_message = '\n'.join(item[0] for item in rendered_lines) if rendered_lines else name
 
-        logging.info(f"🎄 Displaying '{name}' (content={name_playlist or 'none'}, model={overlay_model or 'none'})")
+        logging.info(f"🎄 Displaying '{_mask_name(name)}' (content={name_playlist or 'none'}, model={overlay_model or 'none'})")
 
         # Step 1: Start the name display playlist/sequence/video/image (background)
         if name_playlist:
@@ -4716,7 +4799,7 @@ def display_worker():
             name = currently_displaying['name']
             phone = currently_displaying['phone']
             
-            logging.info(f"🎬 NOW DISPLAYING: {name} (from {phone[-4:]})")
+            logging.info(f"🎬 NOW DISPLAYING: {_mask_name(name)} (from {phone[-4:]})")
 
             try:
                 update_message_status(phone, name, "displaying")
@@ -4775,7 +4858,7 @@ def display_worker():
             except Exception as e:
                 logging.error(f"💥 Error returning to default / stopping: {e}")
             
-            logging.info(f"✅ FINISHED DISPLAYING: {name}")
+            logging.info(f"✅ FINISHED DISPLAYING: {_mask_name(name)}")
             
             try:
                 update_message_status(phone, name, "displayed")
@@ -4879,7 +4962,7 @@ def process_incoming_message(from_number, body):
     # drop them so we never fire an invalid_format (or any) auto-response.
     # Returning normally lets the caller advance its dedup marker.
     if is_non_name_message(body):
-        logging.info(f"🙈 Ignored reaction/emoji-only reply from {from_number[-4:]}: '{body[:30]}'")
+        logging.info(f"🙈 Ignored reaction/emoji-only reply from {from_number[-4:]}")
         return
 
     if not config.get('enabled', False):
@@ -4957,7 +5040,7 @@ def process_incoming_message(from_number, body):
             send_sms_response(from_number, "rate_limited")
 
         elif not config.get('allow_duplicate_names', False) and has_sent_name_today(from_number, name):
-            logging.info(f"🔄 Duplicate name: {name}")
+            logging.info(f"🔄 Duplicate name: {_mask_name(name)}")
             log_message(from_number, body, name, "duplicate_name_today")
             send_sms_response(from_number, "duplicate")
 
@@ -4965,7 +5048,7 @@ def process_incoming_message(from_number, body):
             # Too Long (over Max Message Length) gets its own response; any other
             # format failure (word count) gets the Invalid Format response.
             resp = "too_long" if reason == "too_long" else "invalid_format"
-            logging.info(f"❌ {resp}: '{body[:30]}'")
+            logging.info(f"❌ {resp} from {from_number[-4:]}")
             log_message(from_number, body, name, resp)
             send_sms_response(from_number, resp)
 
@@ -4985,7 +5068,7 @@ def process_incoming_message(from_number, body):
                     if register_profanity_strike(from_number, body):
                         logging.info(f"🚫 Profanity threshold reached - auto-blocked {from_number[-4:]}")
                 elif add_to_queue(name, from_number, body):
-                    logging.info(f"✅ Queued: {name}")
+                    logging.info(f"✅ Queued: {_mask_name(name)}")
                     log_message(from_number, body, name, "queued")
                     send_sms_response(from_number, "success")
                 else:
@@ -5010,7 +5093,7 @@ def process_incoming_message(from_number, body):
 
             else:
                 # Admin approval not active → standard not-whitelisted reject.
-                logging.info(f"❌ Not on whitelist: {name}")
+                logging.info(f"❌ Not on whitelist: {_mask_name(name)}")
                 log_message(from_number, body, name, "not_on_whitelist")
                 send_sms_response(from_number, "not_whitelisted")
 
@@ -5024,7 +5107,7 @@ def process_incoming_message(from_number, body):
 
         else:
             if add_to_queue(name, from_number, body):
-                logging.info(f"✅ Queued: {name}")
+                logging.info(f"✅ Queued: {_mask_name(name)}")
                 log_message(from_number, body, name, "queued")
                 send_sms_response(from_number, "success")
             else:
@@ -5112,7 +5195,7 @@ def poll_twilio():
                 from_number = msg.from_
                 body = msg.body
 
-                logging.info(f"📱 SMS from {from_number[-4:]}: '{body[:30]}'")  # keep at INFO - new message is significant
+                logging.info(f"📱 SMS from {from_number[-4:]}")  # keep at INFO; message text omitted (PII)
 
                 try:
                     process_incoming_message(from_number, body)
@@ -5434,7 +5517,7 @@ def poll_google_voice():
                             parsed = parse_gv_email(raw)
                             if parsed:
                                 from_id, body, reply_ctx = parsed
-                                logging.info(f"📱 GV SMS from {from_id[-4:]}: '{body[:30]}'")
+                                logging.info(f"📱 GV SMS from {from_id[-4:]}")
                                 # Make the reply target available to send_sms_response
                                 # for the duration of this message's processing.
                                 _gv_reply_ctx = reply_ctx
@@ -5885,8 +5968,9 @@ def index():
                              content is configured, and keeps import/export compatible. -->
                         <input type="hidden" id="display_duration" value="{{ config.display_duration }}">
 
-                        <label>Max Messages Per Phone (0 = unlimited):</label>
+                        <label>Max Messages Per Phone / Day (0 = unlimited):</label>
                         <input type="number" id="max_messages" value="{{ config.max_messages_per_phone }}" min="0" max="100">
+                        <p class="help-text" style="margin-top:4px;">How many texts one phone number can send per day (and get replies to). Default 5. Set 0 for no per-phone limit. A fixed safety cap on total daily replies always applies on top of this to protect your Google/Gmail sending limit, so the show's replies can't be exhausted by a flood.</p>
 
                         <div id="max_length_section">
                             <label>Max Message Length:</label>
@@ -9999,6 +10083,15 @@ def update_config():
         if str(config.get('gv_smtp_host', '')).strip().lower() != 'smtp.gmail.com':
             config['gv_smtp_host'] = 'smtp.gmail.com'
 
+        # Per-phone daily message cap: non-negative int, 0 = unlimited per phone (the hardcoded
+        # global daily reply cap still applies). Clamp so a bad client value can't wedge it.
+        if 'max_messages_per_phone' in new_config:
+            try:
+                _mm = int(new_config.get('max_messages_per_phone', 5) or 0)
+            except (TypeError, ValueError):
+                _mm = 5
+            config['max_messages_per_phone'] = max(0, min(_mm, 100))
+
         # Profanity auto-block threshold: non-negative int, 0 = off. Clamp so a bad
         # client value can't disable the feature by accident or run away.
         if 'profanity_threshold' in new_config:
@@ -10247,6 +10340,32 @@ def _content_source_files(content_value, warnings):
 
     return files
 
+# Export runs as a streamed download in a hidden iframe, so the browser can't read its HTTP
+# status or body. We record progress per client-supplied dl_token here and expose it at
+# /api/config/export/status, so the UI can tell a real download from a 403/500/failed-start
+# (and from a mid-stream error that still went out as HTTP 200) and show an error instead of
+# silently closing the dialog.
+_export_status = {}            # dl_token -> {'state','error','ts'}
+_export_status_lock = threading.Lock()
+
+def _set_export_status(token, state, error=''):
+    if not token:
+        return
+    now = time.time()
+    with _export_status_lock:
+        for _k in [k for k, v in _export_status.items() if now - v.get('ts', 0) > 300]:
+            _export_status.pop(_k, None)   # prune entries older than 5 min
+        _export_status[token] = {'state': state, 'error': error, 'ts': now}
+
+@app.route('/api/config/export/status')
+def export_status():
+    """Progress of an in-flight/just-finished export, keyed by the dl_token the UI passed to
+    /api/config/export. 'unknown' = never started (e.g. the request was rejected before it
+    reached here, or wrong token)."""
+    with _export_status_lock:
+        st = _export_status.get(request.args.get('dl_token', ''))
+    return jsonify(st or {'state': 'unknown'})
+
 @app.route('/api/config/export')
 def export_config():
     """Build and stream a .zip bundle of the selected plugin configuration.
@@ -10254,8 +10373,11 @@ def export_config():
     The export modal sends section flags as query params (settings/lists/content/
     overlay = 1|0). settings/lists/overlay default to included when absent; content
     defaults to EXCLUDED (it's the only group that could carry a traversal path, and
-    bundles are shared between operators)."""
+    bundles are shared between operators). An optional dl_token lets the UI poll
+    /api/config/export/status to confirm the download actually started/finished."""
     tmp = None
+    dl_token = request.args.get('dl_token', '')
+    _set_export_status(dl_token, 'started')
     try:
         want = lambda k: request.args.get(k, '1') == '1'
         inc_settings = want('settings')
@@ -10399,7 +10521,18 @@ def export_config():
             if data:
                 yield data
 
-        resp = Response(_generate(), mimetype='application/zip')
+        # Wrap the streaming generator so we can mark the export done/failed for the status
+        # endpoint. A failure AFTER headers have flushed can't change the HTTP 200, but it CAN
+        # be reported here so the UI shows an error instead of a silent (truncated) success.
+        def _tracked():
+            try:
+                yield from _generate()
+                _set_export_status(dl_token, 'done')
+            except Exception as _ge:
+                _set_export_status(dl_token, 'error', str(_ge))
+                raise
+
+        resp = Response(_tracked(), mimetype='application/zip')
         resp.headers['Content-Disposition'] = f'attachment; filename="{download_name}"'
         resp.headers['Cache-Control'] = 'no-store'
         return resp
@@ -10411,6 +10544,7 @@ def export_config():
                 pass
         import traceback
         logging.error(f"export_config failed: {e}\n{traceback.format_exc()}")
+        _set_export_status(dl_token, 'error', str(e))
         return jsonify({"success": False, "error": str(e)}), 500
 
 def _overlay_items(data):
@@ -11235,11 +11369,21 @@ def get_messages():
 
 @app.route('/api/messages/clear', methods=['POST'])
 def clear_messages():
+    # Clear ALL retained day files, not just today's - message history is disclosed as
+    # canDelete in pluginInfo.json, so "clear" must actually remove every day (the plugin
+    # keeps up to 7). Leaving the other six behind would make that disclosure false.
     try:
-        with open(get_day_log_path(), 'w') as f:
-            json.dump([], f)
-        logging.info("Message history cleared (today's file)")
-        return jsonify({"success": True})
+        removed = 0
+        if os.path.isdir(MESSAGES_DIR):
+            for fn in os.listdir(MESSAGES_DIR):
+                if fn.startswith('messages_') and fn.endswith('.json'):
+                    try:
+                        os.remove(os.path.join(MESSAGES_DIR, fn))
+                        removed += 1
+                    except OSError:
+                        pass
+        logging.info(f"Message history cleared ({removed} day file(s))")
+        return jsonify({"success": True, "cleared": removed})
     except Exception as e:
         return _client_error("clear_messages", e)
 
@@ -11556,7 +11700,7 @@ def api_add_whitelist():
                     f.write('\n'.join(sorted(removed)) + '\n')
                 _whitelist_cache = None
                 _whitelist_mtime = None
-                logging.info(f"Re-enabled '{name}' in whitelist")
+                logging.info(f"Re-enabled '{_mask_name(name)}' in whitelist")
                 return jsonify({"success": True})
             else:
                 return jsonify({"success": False, "error": "Name already in whitelist"})
@@ -11575,7 +11719,7 @@ def api_add_whitelist():
                 f.write('\n'.join(sorted(removed)) + '\n')
         _whitelist_cache = None
         _whitelist_mtime = None
-        logging.info(f"Added '{name}' to user whitelist")
+        logging.info(f"Added '{_mask_name(name)}' to user whitelist")
         return jsonify({"success": True})
     except Exception as e:
         return _client_error("api_add_whitelist", e)
@@ -11604,7 +11748,7 @@ def api_remove_whitelist():
                 f.write('\n'.join(sorted(removed)) + '\n')
         _whitelist_cache = None
         _whitelist_mtime = None
-        logging.info(f"Removed '{name}' from whitelist")
+        logging.info(f"Removed '{_mask_name(name)}' from whitelist")
         return jsonify({"success": True})
     except Exception as e:
         return _client_error("api_remove_whitelist", e)
@@ -12386,8 +12530,11 @@ def view_messages():
             .block-btn { background: #f44336; padding: 5px 10px; font-size: 12px; }
             .respond-btn { background: #1976d2; padding: 4px 10px; font-size: 12px; margin: 0 0 0 8px; }
             .clear-btn { background: #f44336; }
-            .info { background: var(--note-bg); padding: 10px; border-radius: 5px; margin: 10px 0; font-size: 14px; border: 1px solid #90caf9; color: var(--fg); }
-            .queue-box { background: #f3e5f5; padding: 20px; border-radius: 5px; margin: 20px 0; border: 1px solid #ce93d8; color: var(--fg); }
+            .info { background: var(--note-bg); padding: 10px; border-radius: 5px; margin: 10px 0; font-size: 14px; border: 1px solid var(--note-border); color: var(--fg); }
+            .queue-box { background: var(--queue-bg); padding: 20px; border-radius: 5px; margin: 20px 0; border: 1px solid var(--queue-border); color: var(--fg); }
+            /* Let wide tables scroll horizontally inside the (scrolling="no") iframe instead of
+               clipping at phone width. */
+            #today-messages-content, #queue-box-content, [id^="history-content-"] { overflow-x: auto; }
             .current-display { background: #4CAF50; padding: 15px; border-radius: 5px; margin: 10px 0; font-size: 18px; font-weight: bold; color: white; }
             .queue-item { background: #f9f9f9; padding: 10px; border-radius: 5px; margin: 5px 0; border-left: 4px solid #FF9800; }
             .tab-bar { display: flex; flex-wrap: wrap; gap: 4px; margin: 16px 0 0; border-bottom: 2px solid #4CAF50; }
@@ -12888,7 +13035,7 @@ def api_tml_stop():
         return _client_error("api_tml_stop", e)
 
 
-@app.route('/api/activate', methods=['GET', 'POST'])
+@app.route('/api/activate', methods=['POST'])
 def api_activate():
     """FPP scheduler hook: enable the plugin, start SMS polling, and start the waiting playlist."""
     global polling_thread, stop_polling
@@ -12967,7 +13114,7 @@ def _deactivate_local():
     return {"success": True, "message": "Text My Lights plugin deactivated"}
 
 
-@app.route('/api/deactivate', methods=['GET', 'POST'])
+@app.route('/api/deactivate', methods=['POST'])
 def api_deactivate():
     """FPP scheduler hook: disable the plugin and stop the show. The polling thread keeps
     running to send show_not_live replies. When this is the master, the Stop is also

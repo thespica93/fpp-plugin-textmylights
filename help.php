@@ -37,6 +37,7 @@ $fppTheme = tml_fpp_theme_help();
 ?>
 <style>
     .sms-help { max-width: 1100px; margin: 0 auto; font-family: Arial, sans-serif; line-height: 1.5; }
+    .sms-help h1 { color: #333; margin: 0 0 6px; }
     .sms-help h2 { color: #4CAF50; border-bottom: 2px solid #4CAF50; padding-bottom: 6px; margin-top: 0; }
     .sms-help h3 { color: #333; margin-top: 18px; }
     .sms-help h4 { color: #333; margin-top: 14px; margin-bottom: 4px; font-size: 15px; }
@@ -96,7 +97,7 @@ $fppTheme = tml_fpp_theme_help();
 
 <div class="sms-help">
 
-    <h1 style="color:#333; margin:0 0 6px;">📱 Text My Lights — Help</h1>
+    <h1>📱 Text My Lights — Help</h1>
     <p>Visitors text their name to your number and it appears on your pixel display. Messages can come from <strong>Twilio</strong> or <strong>Google Voice</strong> — pick one under <em>Settings → Message Source</em>.</p>
 
     <div class="note"><strong>Runs as a background layer.</strong> Text My Lights is designed to run as a <strong>background effect</strong> on the Pi so it can play alongside your main show without taking it over. For this to work, set your <strong>Waiting</strong> and <strong>Name Display</strong> content to <strong>sequences (.fseq)</strong>. <strong>Video and playlists are not supported at this time</strong> — they run as foreground content and would take over the player.</div>

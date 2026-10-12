@@ -30,14 +30,25 @@ esac
 
 target="/dev/shm/FPP-Model-Data-${name}"
 
+# Reject a SYMLINK outright. /dev/shm is world-writable (sticky), so another local user
+# could plant a symlink named FPP-Model-Data-<name> pointing at, say, /etc/shadow; chowning
+# it as root would follow the link and hand that file to the fpp user (privilege escalation).
+# -L tests the path itself without following it. (Note: -f below follows symlinks, so this
+# check MUST come first.)
+if [ -L "$target" ]; then
+    echo "tml-fix-shm-perms: refusing symlink target" >&2
+    exit 1
+fi
+
 # Only act on a regular file that actually exists; never create anything.
 if [ ! -f "$target" ]; then
     echo "tml-fix-shm-perms: no such shm file" >&2
     exit 1
 fi
 
-# Hand the file to the fpp user/group and make it group-writable only (660, no
-# world access). chown is needed because FPP creates the file owned by root:root,
-# so group perms alone would not let the fpp user write.
-/usr/bin/chown fpp:fpp "$target"
+# Hand the file to the fpp user/group and make it group-writable only (660, no world
+# access). chown is needed because FPP creates the file owned by root:root, so group perms
+# alone would not let the fpp user write. -h (no-dereference) so that even if the path is
+# swapped for a symlink right after the check (TOCTOU), chown acts on the link, not its target.
+/usr/bin/chown -h fpp:fpp "$target"
 exec /usr/bin/chmod 660 "$target"

@@ -43,7 +43,7 @@ If the Plugin Manager is unavailable or you want to install a specific version:
 ssh fpp@YOUR_FPP_IP
 
 # Navigate to the plugins directory
-cd /opt/fpp/plugins
+cd /home/fpp/media/plugins
 
 # Clone the repository
 git clone https://github.com/thespica93/fpp-plugin-textmylights.git
@@ -63,14 +63,13 @@ The install script will:
 
 ### Check Plugin is Running
 
-After FPP starts (or immediately after install), the plugin service should be running on **port 5000**.
+After FPP starts (or immediately after install), open the plugin from the FPP web UI:
 
-Open a browser and go to:
-```
-http://YOUR_FPP_IP:5000
-```
+**Content Setup → Text My Lights**
 
-You should see the plugin configuration page.
+You should see the plugin configuration page. (The plugin's own service runs locally and is
+served *through* FPP's web UI — don't browse to `http://YOUR_FPP_IP:5000` directly; it only
+accepts requests from the FPP UI and will return 403.)
 
 ![Plugin configuration page](images/plugin-config-page.png)
 
@@ -81,7 +80,7 @@ You should see the plugin configuration page.
 ps aux | grep sms_plugin
 
 # View the startup log
-tail -50 /home/fpp/media/logs/sms_plugin.log
+tail -50 /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log
 ```
 
 A healthy startup log looks like:
@@ -105,7 +104,7 @@ To update to the latest version:
 
 ### Via SSH
 ```bash
-cd /opt/fpp/plugins/fpp-plugin-textmylights
+cd /home/fpp/media/plugins/fpp-plugin-textmylights
 git pull
 ```
 
@@ -121,7 +120,7 @@ git pull
 
 ### Via SSH
 ```bash
-cd /opt/fpp/plugins/fpp-plugin-textmylights
+cd /home/fpp/media/plugins/fpp-plugin-textmylights
 bash scripts/fpp_uninstall.sh
 cd ..
 rm -rf fpp-plugin-textmylights
@@ -129,16 +128,19 @@ rm -rf fpp-plugin-textmylights
 
 ---
 
-## Port 5000 Access
+## Can't reach the plugin page?
 
-The plugin web UI runs on **port 5000**. If you can't reach it:
+Open it from the FPP web UI (**Content Setup → Text My Lights**) — not a raw IP:port. FPP serves
+the plugin page itself, so there's no firewall port to open (FPP images don't ship `ufw` anyway).
+
+If the page is blank or errors, check the plugin service is running:
 
 ```bash
-# Check if port 5000 is open
-sudo ufw allow 5000
+# Is the daemon running?
+pgrep -af sms_plugin.py
 
-# Or check if the process is listening
-ss -tlnp | grep 5000
+# Recent plugin log
+tail -n 50 /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log
 ```
 
 ---

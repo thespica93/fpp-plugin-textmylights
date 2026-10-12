@@ -42,7 +42,7 @@ Visitor texts name → Twilio → Plugin polls & receives → Filters applied �
 
 1. **[Create a Twilio account](docs/01-twilio-setup.md)** and get a phone number
 2. **[Install the plugin](docs/02-installation.md)** via FPP Plugin Manager
-3. Open `http://YOUR_FPP_IP:5000` and enter your Twilio credentials
+3. Open the plugin from the FPP web UI (**Content Setup → Text My Lights**) and enter your Twilio or Google Voice credentials
 4. Set your FPP display settings (playlist, overlay model, font)
 5. Save and test — text your Twilio number with a name!
 
@@ -66,7 +66,7 @@ Visitor texts name → Twilio → Plugin polls & receives → Filters applied �
 
 ## Requirements
 
-- FPP (Falcon Player) v6.0 or higher
+- FPP (Falcon Player) 9.0 or higher
 - Twilio account (free trial available)
 - Internet connection on your FPP device
 - An LED matrix configured as an FPP Overlay Model
@@ -77,13 +77,13 @@ Visitor texts name → Twilio → Plugin polls & receives → Filters applied �
 
 | File | Path |
 |------|------|
-| Plugin directory | `/opt/fpp/plugins/fpp-plugin-textmylights/` |
-| Configuration | `/home/fpp/media/config/plugin.fpp-textmylights.json` |
+| Plugin directory | `/home/fpp/media/plugins/fpp-plugin-textmylights/` |
+| Configuration | `/home/fpp/media/plugindata/fpp-plugin-textmylights/plugin.json` |
 | Whitelist | `[plugin dir]/whitelist.txt` |
 | Blacklist | `[plugin dir]/blacklist.txt` |
-| Blocked phones | `[plugin dir]/blocked_phones.json` |
-| Log file | `/home/fpp/media/logs/sms_plugin.log` |
-| Message history | `/home/fpp/media/logs/received_messages.json` |
+| Blocked phones | `/home/fpp/media/plugindata/fpp-plugin-textmylights/blocked_phones.json` |
+| Log file | `/home/fpp/media/logs/plugin-fpp-plugin-textmylights.log` |
+| Message history | `/home/fpp/media/plugindata/fpp-plugin-textmylights/logs/messages/` (per-day files, 7-day retention) |
 
 ---
 
@@ -106,7 +106,7 @@ Visitor texts name → Twilio → Plugin polls & receives → Filters applied �
 
 - **Issues:** [GitHub Issues](https://github.com/thespica93/fpp-plugin-textmylights/issues)
 - **FPP Community:** [FalconChristmas.com Forums](https://falconchristmas.com/)
-- **Logs:** `/home/fpp/media/logs/sms_plugin.log`
+- **Logs:** `/home/fpp/media/logs/plugin-fpp-plugin-textmylights.log`
 
 ---
 

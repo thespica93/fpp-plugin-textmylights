@@ -97,6 +97,7 @@ $pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) :
             <span><strong>Content files</strong> (off by default)<br><span class="tml-desc">Copies the actual sequence / image / video files into the bundle - can be large. Leave OFF: xLights FPP Connect already distributes sequences to your Pis, so the export just records which content to use by name. Turn ON only for a fully self-contained copy.</span></span></label>
         <label class="tml-opt"><input type="checkbox" id="tml-exp-overlay" checked>
             <span><strong>Overlay model (matrix)</strong><br><span class="tml-desc">The FPP Pixel Overlay Model the names are drawn onto.</span></span></label>
+        <p class="tml-status" id="tml-exp-status"></p>
         <div class="tml-actions">
             <button type="button" id="tml-exp-cancel" class="tml-cancel" onclick="tmlHideExport()">Cancel</button>
             <button type="button" id="tml-exp-go" class="tml-go" onclick="tmlDoExport()">Export</button>
@@ -194,7 +195,7 @@ $pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) :
     })();
 
     /* ---------------- Export ---------------- */
-    var _tmlExporting = false, _tmlExportTimer = null;
+    var _tmlExporting = false, _tmlExportPoll = null;
     function tmlResetExportBtn() {
         var go = document.getElementById('tml-exp-go');
         go.disabled = false; go.textContent = 'Export';
@@ -209,6 +210,7 @@ $pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) :
     }
     function tmlHideExport() {
         if (_tmlExporting) return;
+        clearInterval(_tmlExportPoll);
         document.getElementById('tml-export-modal').style.display = 'none';
     }
     function tmlDoExport() {
@@ -221,19 +223,19 @@ $pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) :
         var go = document.getElementById('tml-exp-go');
         go.disabled = true; go.textContent = 'Exporting...';
         document.getElementById('tml-exp-cancel').disabled = true;
+        var st = document.getElementById('tml-exp-status');
+        st.style.color = ''; st.textContent = '';
 
-        // Download straight from this parent page via a hidden iframe. The browser
-        // streams the (possibly very large) sequence zip to disk - it never buffers
-        // the whole file in JS memory, so the tab can't freeze. Triggering it here,
-        // from the real Export click, keeps the user activation browsers require and
-        // sidesteps the cross-origin-iframe download block. Auth via ?token; the
-        // server's Content-Disposition names the file.
-        // Cache-buster (&_ts) guarantees the iframe sees a new URL and navigates
-        // every time, even for two identical back-to-back exports. Routed through the
-        // FPP proxy (p=api/config/export), so no token and no cross-origin request.
+        // Download straight from this parent page via a hidden iframe. The browser streams the
+        // (possibly very large) zip to disk - never buffered in JS - so the tab can't freeze.
+        // A unique dl_token lets us POLL the service for whether the download actually started
+        // and finished, because a hidden-iframe download exposes no HTTP status to JS: a 403,
+        // 500, or an error after streaming began would otherwise close the dialog silently.
+        var token = 'dl' + Date.now() + '-' + Math.random().toString(36).slice(2);
         var url = TML_PROXY + encodeURIComponent('api/config/export')
                 + '&settings=' + sel.s + '&lists=' + sel.l
                 + '&content=' + sel.c + '&overlay=' + sel.o
+                + '&dl_token=' + encodeURIComponent(token)
                 + '&_ts=' + Date.now();
         var dl = document.getElementById('tml-export-dl');
         if (!dl) {   // defensive: init IIFE should have made it already
@@ -243,14 +245,42 @@ $pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) :
             document.body.appendChild(dl);
         }
         dl.src = url;
-
-        // Keep the modal up through the hand-off so the user sees it start, then
-        // close. The browser's own download manager shows the rest of the transfer.
         go.textContent = 'Downloading...';
-        _tmlExportTimer = setTimeout(function() {
-            document.getElementById('tml-export-modal').style.display = 'none';
-            tmlResetExportBtn();
-        }, 1800);
+
+        // Poll export status; show an error instead of silently closing if it never starts or
+        // fails. 'done' = the zip was fully written; 'error' = it failed (incl. mid-stream);
+        // no response within 20s = the request never reached the service (e.g. 403/blocked).
+        var statusUrl = TML_PROXY + encodeURIComponent('api/config/export/status')
+                      + '&dl_token=' + encodeURIComponent(token);
+        var startedAt = Date.now();
+        clearInterval(_tmlExportPoll);
+        _tmlExportPoll = setInterval(function() {
+            function fail(msg) {
+                clearInterval(_tmlExportPoll);
+                tmlResetExportBtn();
+                st.style.color = '#c62828';
+                st.textContent = msg;
+            }
+            fetch(statusUrl, { cache: 'no-store' })
+                .then(function(r) { return r.json(); })
+                .then(function(s) {
+                    if (s.state === 'done') {
+                        clearInterval(_tmlExportPoll);
+                        _tmlExporting = false;
+                        go.textContent = 'Downloaded';
+                        st.style.color = '#2e7d32';
+                        st.textContent = 'Export complete.';
+                        setTimeout(function() { tmlHideExport(); tmlResetExportBtn(); }, 1200);
+                    } else if (s.state === 'error') {
+                        fail('Export failed: ' + (s.error || 'unknown error'));
+                    } else if (Date.now() - startedAt > 20000) {
+                        fail('Export did not start (no response from the plugin service).');
+                    }
+                })
+                .catch(function() {
+                    if (Date.now() - startedAt > 20000) fail('Export did not start (service unreachable).');
+                });
+        }, 600);
     }
 
     /* ---------------- Import ---------------- */

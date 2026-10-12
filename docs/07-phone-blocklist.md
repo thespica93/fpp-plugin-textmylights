@@ -2,7 +2,7 @@
 
 > Block specific phone numbers from submitting names to your display.
 
-Access the Phone Blocklist at: **`http://YOUR_FPP_IP:5000/blocklist`**
+Open the Phone Blocklist from the plugin UI (**Content Setup → Text My Lights → View Message Queue**, then block a number).
 
 ---
 
@@ -32,7 +32,7 @@ Unlike the profanity filter and whitelist, the phone blocklist is **always activ
 
 ## How to Block a Phone Number
 
-Phone numbers are blocked from the **[Message Queue](04-message-queue.md)** page (`http://YOUR_FPP_IP:5000/messages`).
+Phone numbers are blocked from the **[Message Queue](04-message-queue.md)** page.
 
 1. Find the message from the phone number you want to block
 2. Click the **🚫 Block** button next to that message
@@ -49,7 +49,7 @@ The phone number is immediately added to the blocklist and all future texts from
 
 ## Viewing Blocked Numbers
 
-Go to **`http://YOUR_FPP_IP:5000/blocklist`** to see all currently blocked phone numbers.
+Open the plugin's Phone Blocklist page to see all currently blocked phone numbers.
 
 ![Phone blocklist page](images/blocklist-page.png)
 
@@ -66,7 +66,7 @@ You can also reach this page from the [Plugin Configuration](03-plugin-configura
 
 To unblock a phone number:
 
-1. Go to `http://YOUR_FPP_IP:5000/blocklist`
+1. Open the plugin's Phone Blocklist page
 2. Find the number you want to unblock
 3. Click **Unblock**
 4. Confirm — the number is removed from the list immediately
@@ -93,7 +93,7 @@ The block check uses the phone number's **full E.164 format** (e.g., `+155512345
 Blocked phone numbers are stored in:
 
 ```
-/opt/fpp/plugins/fpp-plugin-textmylights/blocked_phones.json
+/home/fpp/media/plugins/fpp-plugin-textmylights/blocked_phones.json
 ```
 
 This is a JSON file, for example:

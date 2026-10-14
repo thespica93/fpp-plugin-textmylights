@@ -337,10 +337,12 @@ def _require_access_token():
     ctok = request.cookies.get(_AUTH_COOKIE, '')
     if ctok and _secrets.compare_digest(ctok, ACCESS_TOKEN):
         return None
-    return Response(
-        "Access denied. Open this plugin from the FPP web UI "
-        "(Content Setup → Text My Lights).",
-        status=403, mimetype='text/plain')
+    # Unauthorized direct hit (someone browsing to :5000 themselves). Give nothing
+    # away: a bare 404 looks like a dead URL, with no hint that a plugin - or FPP -
+    # lives here and no instructions pointing anyone to the FPP UI. A true TCP
+    # timeout isn't possible from here without hanging a worker thread (abusable),
+    # so an empty not-found is the stealthy, safe equivalent.
+    return Response("Not Found", status=404, mimetype='text/plain')
 
 IFRAME_RESIZE_SCRIPT = """<script>
 (function() {
@@ -363,7 +365,7 @@ def _tml_base_shim(proxy_base):
         "(function(){function u(x){if(typeof x!=='string'||!window.TML_BASE||x.charAt(0)!=='/')return x;"
         "var p=x.slice(1),q='',i=p.indexOf('?');if(i>=0){q=p.slice(i+1);p=p.slice(0,i);}"
         "return window.TML_BASE+encodeURIComponent(p)+(q?'&'+q:'');}"
-        "window.tmlUrl=u;if(window.TML_BASE){var f=window.fetch;"
+        "window.tmlUrl=u;window.tmlGo=function(p){location.href=u(p);};if(window.TML_BASE){var f=window.fetch;"
         "if(f)window.fetch=function(a,b){return f.call(this,u(a),b);};"
         "var o=XMLHttpRequest.prototype.open;"
         "XMLHttpRequest.prototype.open=function(m,a){try{arguments[1]=u(a);}catch(e){}return o.apply(this,arguments);};"
@@ -6014,7 +6016,7 @@ def index():
 
                         <label class="toggle-switch"><input type="checkbox" id="use_whitelist" {{ 'checked' if config.get('use_whitelist', False) else '' }} onchange="updateFormatRules(); checkFiltersState(); checkWhitelistResponseState(); updateLiveApprovalWlState(); updateAdminApprovalUI(); saveConfig();"><span class="toggle-slider"></span></label>
                         <label class="checkbox-label">Enable Name Whitelist - only allow approved names</label><br>
-                        <button class="view-btn" onclick="location.href='/whitelist'" style="margin-top:6px;">📋 Manage Whitelist</button>
+                        <button class="view-btn" onclick="tmlGo('/whitelist')" style="margin-top:6px;">📋 Manage Whitelist</button>
                     </div>
 
                     <!-- Sub-col 2: Name Format Rules -->
@@ -6044,7 +6046,7 @@ def index():
                     <!-- Sub-col 3: Phone Blocklist + Duplicate Names -->
                     <div style="flex:0 0 220px;">
                         <label style="font-weight:bold; margin-bottom:4px;">Phone Blocklist</label>
-                        <button onclick="location.href='/blocklist'" style="background:#f44336; margin-top:4px; display:block;">🚫 View Blocklist</button>
+                        <button onclick="tmlGo('/blocklist')" style="background:#f44336; margin-top:4px; display:block;">🚫 View Blocklist</button>
 
                         <hr style="border:none; border-top:1px solid #444; margin:15px 0;">
 
@@ -9888,7 +9890,10 @@ var _saveTimer = null;
             }
 
             function viewMessages() {
-                window.location.href = '/messages';
+                // Served same-origin THROUGH FPP's proxy, so a root-absolute '/messages' would
+                // hit FPP's Apache root (404). tmlGo routes it back through the proxy to the
+                // daemon's /messages (and is a no-op passthrough on a direct :5000 load).
+                tmlGo('/messages');
             }
 
             function submitTestMessage() {
@@ -9913,7 +9918,7 @@ var _saveTimer = null;
                         resultDiv.innerHTML = '<p class="success">✅ ' + data.message + '</p>';
                         document.getElementById('test_name').value = '';
                         setTimeout(() => {
-                            resultDiv.innerHTML += '<p><a href="/messages" style="color: #4CAF50;">📋 View Queue Status</a></p>';
+                            resultDiv.innerHTML += '<p><a href="' + tmlUrl('/messages') + '" style="color: #4CAF50;">📋 View Queue Status</a></p>';
                         }, 1000);
                     } else {
                         resultDiv.innerHTML = '<p class="error">❌ ' + data.error + '</p>';
@@ -10019,7 +10024,7 @@ var _saveTimer = null;
                 document.getElementById('blacklist-warning-modal').style.display = 'none';
             }
             function proceedToBlacklist() {
-                location.href = '/blacklist';
+                tmlGo('/blacklist');
             }
         </script>
 
@@ -11844,7 +11849,7 @@ def view_whitelist():
             <button onclick="toggleSetting('use_whitelist', false)" style="background:#f44336; color:white; border:none; padding:6px 14px; border-radius:4px; cursor:pointer; font-size:13px; white-space:nowrap;">✗ Disable Whitelist</button>
         </div>
         {% endif %}
-        <button onclick="location.href='/'">← Back to Config</button>
+        <button onclick="tmlGo('/')">← Back to Config</button>
 
         <script>
         function toggleSetting(key, value) {
@@ -12102,7 +12107,7 @@ def view_blacklist_page():
             <button onclick="toggleSetting('profanity_filter', false)" style="background:#f44336; color:white; border:none; padding:6px 14px; border-radius:4px; cursor:pointer; font-size:13px; white-space:nowrap;">✗ Disable Profanity Filter</button>
         </div>
         {% endif %}
-        <button onclick="location.href='/'">← Back to Config</button>
+        <button onclick="tmlGo('/')">← Back to Config</button>
 
         <script>
         function toggleSetting(key, value) {
@@ -12339,8 +12344,8 @@ def view_blocklist():
         <div class="info">
             ℹ️ Blocked numbers cannot send messages | Total Blocked: {{ blocklist|length }}
         </div>
-        <button onclick="location.href='/'">← Back to Config</button>
-        <button onclick="location.href='/messages'">📋 View Messages</button>
+        <button onclick="tmlGo('/')">← Back to Config</button>
+        <button onclick="tmlGo('/messages')">📋 View Messages</button>
         
         {% if blocklist|length == 0 %}
         <div class="no-blocked">
@@ -12430,7 +12435,7 @@ def status_page():
     </head>
     <body><script>if('scrollRestoration'in history)history.scrollRestoration='manual';function _toTop(){{window.scrollTo(0,0);document.documentElement.scrollTop=0;document.body.scrollTop=0;try{{window.parent.postMessage({{type:'scrollTop'}},'*');}}catch(e){{}}}}_toTop();document.addEventListener('DOMContentLoaded',_toTop);window.addEventListener('load',_toTop);</script>
         <h1>🔧 Text My Lights - Status</h1>
-        <button onclick="location.href='/'">← Back</button>
+        <button onclick="tmlGo('/')">← Back</button>
         <button onclick="location.reload()">🔄 Refresh</button>
         
         <div class="section">
@@ -12548,7 +12553,7 @@ def view_messages():
     </head>
     <body><script>if('scrollRestoration'in history)history.scrollRestoration='manual';function _toTop(){window.scrollTo(0,0);document.documentElement.scrollTop=0;document.body.scrollTop=0;try{window.parent.postMessage({type:'scrollTop'},'*');}catch(e){}}_toTop();document.addEventListener('DOMContentLoaded',_toTop);window.addEventListener('load',_toTop);</script>
         <h1>Message History & Queue</h1>
-        <button onclick="location.href='/'">Back to Config</button>
+        <button onclick="tmlGo('/')">Back to Config</button>
         <button class="clear-btn" onclick="clearHistory()">Clear Today's Messages</button>
 
         <div class="tab-bar">

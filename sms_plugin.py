@@ -2906,84 +2906,11 @@ def admin_ctx_is_seeded():
         return False
     return _normalize_phone(ctx.get('phone', '')) == _normalize_phone(admin_phone)
 
-_last_admin_seed_scan = 0.0
 _last_admin_verify_scan = 0.0
 
-def seed_admin_ctx_from_inbox(force=False):
-    """Seed the admin reply context from the most recent Google Voice email ALREADY in
-    the inbox that came from the configured admin number. This lets the feature turn on
-    from existing texting history, instead of only from a brand-new text the poller
-    happens to see after the number is set. Lightweight (headers only) and throttled so
-    the status poll can call it cheaply. Returns True if a context is now seeded."""
-    global _last_admin_seed_scan
-    if config.get('message_source') != 'google_voice':
-        return False
-    admin_phone = config.get('admin_phone', '').strip()
-    if not admin_phone:
-        return False
-    if admin_ctx_is_seeded():
-        return True
-    now = time.time()
-    if not force and (now - _last_admin_seed_scan) < 20:
-        return False
-    _last_admin_seed_scan = now
-
-    email_addr = config.get('gv_email', '').strip()
-    app_pw = config.get('gv_app_password', '').strip()
-    if not email_addr or not app_pw:
-        return False
-
-    want = _normalize_phone(admin_phone)
-    imap = None
-    try:
-        # Explicit timeout: this can run from the config page's status request, so a
-        # hung Gmail connection must not stall the web response.
-        imap = imaplib.IMAP4_SSL(config.get('gv_imap_host', 'imap.gmail.com'), timeout=20, ssl_context=_TLS_CONTEXT)
-        imap.login(email_addr, app_pw)
-        imap.select(config.get('gv_imap_folder', 'INBOX'))
-        typ, data = imap.uid('search', None, 'FROM', 'txt.voice.google.com')
-        raw_uids = data[0].split() if (typ == 'OK' and data and data[0]) else []
-        uids = sorted((int(u) for u in raw_uids), reverse=True)  # newest first
-        # Only headers are needed to match the sender and build the reply context.
-        # Scan newest-first and stop at the first match - the admin usually texts often
-        # so the match is near the top; the cap just bounds a one-time setup scan (this
-        # never runs once a context is seeded). Reads Gmail history, so age does not
-        # matter as long as the email is still in the inbox.
-        hdr_spec = '(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT MESSAGE-ID REFERENCES AUTHENTICATION-RESULTS)])'
-        for uid in uids[:500]:
-            typ, msg_data = imap.uid('fetch', str(uid), hdr_spec)
-            if typ != 'OK' or not msg_data or not msg_data[0]:
-                continue
-            hdr = email.message_from_bytes(msg_data[0][1])
-            # Only trust GENUINE Google Voice mail - a planted email with the admin's
-            # number in a forgeable field must never seed the admin reply context.
-            if not _gv_from_is_authentic(hdr):
-                continue
-            _disp, addr = email.utils.parseaddr(str(hdr.get('From', '')))
-            fid = _gv_sender_id(hdr)
-            if _normalize_phone(fid) != want or not addr:
-                continue
-            ctx = {
-                'to': addr,
-                'message_id': str(hdr.get('Message-ID', '')).strip(),
-                'references': str(hdr.get('References', '')).strip(),
-                'subject': _gv_decode_header(str(hdr.get('Subject', ''))),
-                'phone': want,
-            }
-            save_admin_ctx(ctx)
-            logging.info("🔑 Admin reply context seeded from existing inbox history")
-            return True
-        logging.info("Admin ctx scan: no existing GV message from the admin number found")
-        return False
-    except Exception as e:
-        logging.error(f"Admin ctx inbox scan failed: {e}")
-        return False
-    finally:
-        if imap is not None:
-            try:
-                imap.logout()
-            except Exception:
-                pass
+# NOTE: the admin reply context is NOT auto-seeded from existing inbox history. The operator
+# must explicitly connect by texting the "admin" keyword (see _maybe_handle_admin_message), so
+# "connected" never turns on merely because the admin number texted names in the past.
 
 def verify_admin_ctx(force=False):
     """Confirm the stored admin reply context still points at a live email thread.
@@ -3204,19 +3131,35 @@ def _maybe_handle_admin_message(from_number, body):
     if _normalize_phone(from_number) != _normalize_phone(admin_phone):
         return False
 
-    # Seed/refresh the reply context for the admin's number from THIS message, so
-    # the operator only has to text the GV number once and it self-refreshes after.
-    if _gv_reply_ctx and _gv_reply_ctx.get('to'):
+    # Establish the reply context ONLY when the admin explicitly texts the connect keyword.
+    # After that, keep it fresh from their later messages so the thread doesn't go stale. We
+    # deliberately do NOT connect from an ordinary name text or from past inbox history - the
+    # operator must opt in by texting "admin", which keeps the "connected" state honest.
+    is_connect_keyword = body.strip().lower() == ADMIN_CONNECT_KEYWORD
+    if (is_connect_keyword or admin_ctx_is_seeded()) and _gv_reply_ctx and _gv_reply_ctx.get('to'):
         ctx = dict(_gv_reply_ctx)
         ctx['phone'] = _normalize_phone(admin_phone)
         save_admin_ctx(ctx)
-        logging.info("🔑 Admin reply context refreshed from inbound admin message")
+        logging.info("🔑 Admin reply context %s",
+                     "established via 'admin' keyword" if is_connect_keyword
+                     else "refreshed from admin message")
 
-    # The dedicated connect keyword: texting "admin" is the suggested way to seed the
-    # reply context on first setup. It is consumed here (never shown as a name) - the
-    # save above already captured the context we needed from it.
-    if body.strip().lower() == ADMIN_CONNECT_KEYWORD:
+    # The dedicated connect keyword is consumed here (never shown as a name); the save above
+    # captured the context, so now just confirm back to the operator.
+    if is_connect_keyword:
         logging.info("🔗 Admin connect keyword received - reply context established")
+        # Confirm back so the connect isn't silent (operators reasonably expect a reply when
+        # they text the keyword). Tailor the hint to whether approvals can actually fire yet:
+        # Live Name Approval only triggers when the whitelist is ON and a name isn't on it.
+        if config.get('use_whitelist', False):
+            _confirm = ("✅ Admin connected. When the show is live and someone sends a name "
+                        "that isn't on the list, you'll get a request here - reply Y to approve "
+                        "or N to deny.")
+        else:
+            _confirm = ("✅ Admin connected. Turn ON the Name Whitelist in the plugin "
+                        "settings to start receiving name-approval requests here.")
+        if _gv_reply_ctx and _gv_reply_ctx.get('to'):
+            _send_feature_reply(dict(_gv_reply_ctx), _confirm, 'admin_connected')
         return True
 
     decision, target = _parse_admin_decision(body)
@@ -3706,8 +3649,42 @@ def load_blacklist():
         logging.error(f"Error reading blacklist: {e}")
         return None
 
+def _profanity_scan_forms(text):
+    """The text forms that must ALL be screened so nothing profane reaches the display.
+
+    The raw-text check alone was bypassable: extract_name() strips apostrophes/punctuation
+    (e.g. "Who're" -> "Whore", "f.u.c.k" -> "Fuck") when building the name that is actually
+    shown, so a slur forged by that normalization sailed past a raw-only filter and onto the
+    matrix. We therefore screen three forms:
+      1. the raw message (catches normal and multi-word profanity),
+      2. the name as DISPLAYED (extract_name - the exact string that hits the screen),
+      3. a letters-only collapse that defeats separator obfuscation ("w-h-o-r-e", "w h o r e").
+    Word boundaries in the blacklist regex keep (3) from creating false positives inside longer
+    tokens (e.g. "Scunthorpe" never matches "cunt")."""
+    raw = text or ''
+    forms = [raw]
+    try:
+        disp = extract_name(raw)
+        if disp:
+            forms.append(disp)
+    except Exception:
+        pass
+    collapsed = re.sub(r'[^a-z]', '', raw.lower())
+    if collapsed:
+        forms.append(collapsed)
+    # De-duplicate case-insensitively while preserving order.
+    seen, out = set(), []
+    for f in forms:
+        k = f.lower()
+        if k and k not in seen:
+            seen.add(k)
+            out.append(f)
+    return out
+
 def contains_profanity(text):
-    """Check for profanity using a single combined regex pattern"""
+    """True if any blacklisted word appears in the raw text OR in the name as it would be
+    DISPLAYED (see _profanity_scan_forms) - so apostrophe/punctuation stripping can't forge a
+    slur that bypasses the filter and lands on the matrix."""
     if not config['profanity_filter']:
         return False
 
@@ -3715,24 +3692,25 @@ def contains_profanity(text):
     if not pattern:
         return False
 
-    text_lower = text.lower()
-
-    if pattern.search(text_lower):
-        logging.info("🚫 Profanity detected")   # message text omitted from the log (PII)
-        return True
+    for form in _profanity_scan_forms(text):
+        if pattern.search(form.lower()):
+            logging.info("🚫 Profanity detected")   # message text omitted from the log (PII)
+            return True
 
     return False
 
 def count_profanity_words(text):
-    """Number of blacklisted-word occurrences in text (0 if the filter is off or
-    nothing matches). The combined blacklist regex has no capturing groups, so
-    findall yields one entry per matched word."""
+    """Number of blacklisted-word occurrences (0 if the filter is off or nothing matches).
+    Counts across the same forms contains_profanity() screens and takes the MAX, so a slur that
+    only appears once (including one forged by display normalization) still counts toward the
+    auto-block threshold without being double-counted when it shows up in more than one form."""
     if not config.get('profanity_filter', True):
         return 0
     pattern = load_blacklist()
     if not pattern:
         return 0
-    return len(pattern.findall(text.lower()))
+    return max((len(pattern.findall(form.lower())) for form in _profanity_scan_forms(text)),
+               default=0)
 
 def _load_profanity_strikes():
     """Read the per-day profanity tally file, or {} if missing/unreadable."""
@@ -10179,10 +10157,9 @@ def update_config():
             _ctx = load_admin_ctx()
             if _ctx and _normalize_phone(_ctx.get('phone', '')) != config['admin_phone']:
                 clear_admin_ctx()
-            # The number was just entered/changed - let the very next status poll run a
-            # fresh mailbox scan instead of waiting out the seed/verify throttle windows.
-            global _last_admin_seed_scan, _last_admin_verify_scan
-            _last_admin_seed_scan = 0.0
+            # The number was just entered/changed - let the very next status poll re-verify
+            # immediately instead of waiting out the verify throttle window.
+            global _last_admin_verify_scan
             _last_admin_verify_scan = 0.0
         if 'admin_approval_timeout_mins' in new_config:
             try:
@@ -10220,11 +10197,9 @@ def api_admin_approval_status():
     # clears the context if the thread was deleted, so the banner reverts on its own.
     if seeded:
         seeded = verify_admin_ctx()
-    # Self-heal from existing texting history: if not seeded (never was, or the thread
-    # was just cleared), scan the Gmail inbox for another Google Voice message from the
-    # admin number (throttled internally).
-    if not seeded and config.get('admin_phone', '').strip():
-        seeded = seed_admin_ctx_from_inbox()
+    # NOTE: we intentionally do NOT auto-connect from existing inbox history here. The admin
+    # must explicitly text the "admin" keyword to connect (see _maybe_handle_admin_message),
+    # so "connected" never turns on just because the admin number texted names in the past.
     return jsonify({
         "admin_phone": config.get('admin_phone', ''),
         "seeded": seeded,
@@ -11124,21 +11099,34 @@ def fseq_info():
 # query string; without a cap, Pillow would allocate the full width*height*3 image, so one
 # large value on a 512 MB board can invoke the OOM killer (which may pick fppd). A preview
 # never needs to exceed the overlay model, and 512 is comfortably larger than any overlay.
-MAX_PREVIEW_DIM = 512
+MAX_PREVIEW_DIM = 512    # longest side of the PNG we hand back (display/transport cap)
+MAX_RENDER_DIM  = 4096   # hard cap on the render BUFFER (OOM guard only). Real overlay models
+                         # are far below this, so it never distorts a legitimate preview - unlike
+                         # clamping the render to MAX_PREVIEW_DIM, which sheared wide matrices
+                         # (a 640-wide model drawn 512 wide slides every row). See #10 follow-up.
 
-def _clamp_preview_dim(v):
-    """Clamp a preview width/height to 1..MAX_PREVIEW_DIM; non-numbers collapse to the cap's
-    floor. Bounds Pillow's allocation so an unbounded query value can't OOM the board."""
+def _clamp_render_dim(v):
+    """Upper bound for the render buffer itself: generous enough that a real model's dimensions
+    pass through UNCHANGED (so the channel->pixel layout stays correct), but still caps a bogus
+    width/height so it can't OOM the board. Pair with _shrink_for_preview on the finished image."""
     try:
         v = int(v)
     except (TypeError, ValueError):
         v = 0
-    return max(1, min(v, MAX_PREVIEW_DIM))
+    return max(1, min(v, MAX_RENDER_DIM))
+
+def _shrink_for_preview(img):
+    """Downscale a finished preview image so its longest side <= MAX_PREVIEW_DIM, preserving
+    aspect ratio. Keeps the PNG small on the wire WITHOUT distorting the layout: the image was
+    built at the model's real dimensions, so the channel->pixel mapping is already correct."""
+    if max(img.size) > MAX_PREVIEW_DIM:
+        img.thumbnail((MAX_PREVIEW_DIM, MAX_PREVIEW_DIM), Image.LANCZOS)
+    return img
 
 def _preview_dim_arg(arg_name, cfg_key):
     """Read a width/height query arg (defaulting to the configured model dim), tolerating a
     non-numeric value by returning 0 so the caller resolves the model's real size. The caller
-    must still pass the result through _clamp_preview_dim before allocating any image."""
+    must still pass the result through _clamp_render_dim before allocating any image."""
     try:
         return int(request.args.get(arg_name, config.get(cfg_key, 0)))
     except (TypeError, ValueError):
@@ -11188,6 +11176,7 @@ def _render_fseq_frame_png(seq, frame_idx, model_name, width, height,
         else:
             pixels.append((0, 0, 0))
     img.putdata(pixels)
+    img = _shrink_for_preview(img)   # built at real dims (correct layout); shrink only for display
     buf = io.BytesIO()
     img.save(buf, format='PNG')
     return buf.getvalue(), None
@@ -11221,6 +11210,7 @@ def _render_media_png(media_type, filename, time_sec, width, height):
                 img = Image.new('RGB', (width, height), (32, 32, 32))
         except (FileNotFoundError, _sp.TimeoutExpired):
             img = Image.new('RGB', (width, height), (32, 32, 32))
+    img = _shrink_for_preview(img)   # resized to the model's real aspect above; shrink for display
     buf = io.BytesIO()
     img.save(buf, format='PNG')
     return buf.getvalue(), None
@@ -11240,7 +11230,9 @@ def fseq_frame():
         rw, rh = _overlay_model_dims()   # resolve the model's real size live if the form sent 0
         width  = width  if width  > 0 else rw
         height = height if height > 0 else rh
-    width, height = _clamp_preview_dim(width), _clamp_preview_dim(height)   # cap vs OOM
+    # Render at the model's REAL size (correct channel->pixel layout); _render_fseq_frame_png
+    # shrinks the finished image to MAX_PREVIEW_DIM. Only guard against an OOM-sized bogus value.
+    width, height = _clamp_render_dim(width), _clamp_render_dim(height)
     try:
         png, err = _render_fseq_frame_png(seq, frame_idx, model_name, width, height,
                                           request.args.get('start_channel', '').strip(),
@@ -11267,7 +11259,9 @@ def media_preview():
         rw, rh = _overlay_model_dims()
         width  = width  if width  > 0 else rw
         height = height if height > 0 else rh
-    width, height = _clamp_preview_dim(width), _clamp_preview_dim(height)   # cap vs OOM
+    # Resize to the model's REAL aspect (no squish); _render_media_png shrinks the finished
+    # image to MAX_PREVIEW_DIM. Only guard against an OOM-sized bogus value.
+    width, height = _clamp_render_dim(width), _clamp_render_dim(height)
     try:
         png, err = _render_media_png(media_type, filename, time_sec, width, height)
         if err:

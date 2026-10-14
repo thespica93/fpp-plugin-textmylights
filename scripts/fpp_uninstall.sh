@@ -34,20 +34,9 @@ log_and_show "✓ Service stopped"
 #   • plugin.json               — Gmail address, Twilio account SID / phone number
 #   • blocked_phones.json, queue, message history logs (phone-number PII)
 log_and_show "Removing plugin data and stored credentials..."
-rm -rf /home/fpp/media/plugindata/fpp-plugin-textmylights   # current (guideline) data dir
-rm -rf /home/fpp/media/plugin.fpp-textmylights             # pre-migration data dir
-rm -rf /home/fpp/media/plugin.fpp-sms-twilio               # pre-rename data dir (older installs)
+rm -rf /home/fpp/media/plugindata/fpp-plugin-textmylights   # plugin data dir
 
-# Legacy scattered config paths from versions before the data-dir migration.
-rm -f /home/fpp/media/config/plugin.fpp-textmylights.json
-rm -f /home/fpp/media/config/plugin.fpp-sms-twilio.json
-rm -f /home/fpp/media/config/blacklist.txt
-rm -f /home/fpp/media/config/whitelist.txt
-rm -f /home/fpp/media/config/blocked_phones.json
-rm -f /home/fpp/media/config/received_messages.json
-rm -f /home/fpp/media/config/last_message_sid.txt
-
-if [ -e /home/fpp/media/plugindata/fpp-plugin-textmylights ] || [ -e /home/fpp/media/plugin.fpp-textmylights ]; then
+if [ -e /home/fpp/media/plugindata/fpp-plugin-textmylights ]; then
     log_and_show "⚠ Could NOT fully remove the plugin data dir — check permissions/ownership"
 else
     log_and_show "✓ Plugin data and stored credentials removed"

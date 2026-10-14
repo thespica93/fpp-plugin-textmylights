@@ -180,25 +180,7 @@ fi
 # demand and treats a missing file as empty, so nothing to seed here.
 
 # Runtime data lives under the FPP-guideline location /home/fpp/media/plugindata/<repo>/.
-# Earlier versions used /home/fpp/media/plugin.fpp-textmylights; migrate that ONCE on
-# install/update by moving the whole directory (which preserves the 0700 secrets/ and all
-# PII/credentials) when the old dir exists and the new one doesn't yet.
 PLUGIN_DATA_DIR="/home/fpp/media/plugindata/fpp-plugin-textmylights"
-OLD_PLUGIN_DATA_DIR="/home/fpp/media/plugin.fpp-textmylights"
-if [ -d "$OLD_PLUGIN_DATA_DIR" ] && [ ! -d "$PLUGIN_DATA_DIR" ]; then
-    mkdir -p "$(dirname "$PLUGIN_DATA_DIR")"
-    if mv "$OLD_PLUGIN_DATA_DIR" "$PLUGIN_DATA_DIR" 2>> "$LOG"; then
-        log_and_show "Migrated plugin data to $PLUGIN_DATA_DIR"
-    else
-        # Move failed (e.g. cross-device) - fall back to copy-then-remove, preserving perms.
-        cp -a "$OLD_PLUGIN_DATA_DIR/." "$PLUGIN_DATA_DIR/" 2>> "$LOG" \
-            && rm -rf "$OLD_PLUGIN_DATA_DIR" \
-            && log_and_show "Migrated plugin data to $PLUGIN_DATA_DIR (copied)"
-    fi
-elif [ -d "$OLD_PLUGIN_DATA_DIR" ] && [ -d "$PLUGIN_DATA_DIR" ]; then
-    # Both exist (unusual) - keep the new one; leave the old in place for the operator.
-    log_and_show "NOTE: old data dir $OLD_PLUGIN_DATA_DIR still present alongside the new one; using the new one"
-fi
 
 # Create the plugin data dir and an OWNER-ONLY secrets folder for credentials
 # (Twilio auth token, Gmail app password). Kept out of plugin.json/logs/backups;

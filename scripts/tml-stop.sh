@@ -10,13 +10,8 @@
 # Shared by preStop.sh, postStart.sh (stop-before-start), the installer and the
 # uninstaller so there is exactly one stop implementation.
 #
-# The PID path mirrors PID_FILE in sms_plugin.py. Data moved to the plugindata
-# location; check it first, then the pre-migration path so a daemon still running
-# from the old dir during an upgrade is still stopped.
+# The PID path mirrors PID_FILE in sms_plugin.py.
 PID_FILE="/home/fpp/media/plugindata/fpp-plugin-textmylights/sms_plugin.pid"
-if [ ! -f "$PID_FILE" ] && [ -f "/home/fpp/media/plugin.fpp-textmylights/sms_plugin.pid" ]; then
-    PID_FILE="/home/fpp/media/plugin.fpp-textmylights/sms_plugin.pid"
-fi
 
 _wait_gone() {  # $1 = pid; returns 0 once the process is gone, 1 on timeout (~3s)
     for _i in $(seq 1 30); do kill -0 "$1" 2>/dev/null || return 0; sleep 0.1; done

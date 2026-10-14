@@ -90,20 +90,8 @@ def _stop_scroll_thread(timeout=2.0):
 PLUGIN_DIR      = os.path.dirname(os.path.abspath(__file__))
 
 # All runtime data lives under one plugin folder, at the FPP-guideline location
-# /home/fpp/media/plugindata/<repo>/. Earlier versions used
-# /home/fpp/media/plugin.fpp-textmylights; fpp_install.sh migrates the directory on
-# install. This startup fallback covers the case where the daemon starts before that
-# migration has run (e.g. a manual launch) - move the old dir intact (preserving the
-# 0700 secrets/ and all data) when the new one doesn't exist yet.
+# /home/fpp/media/plugindata/<repo>/.
 PLUGIN_DATA_DIR = "/home/fpp/media/plugindata/fpp-plugin-textmylights"
-_OLD_PLUGIN_DATA_DIR = "/home/fpp/media/plugin.fpp-textmylights"
-if os.path.isdir(_OLD_PLUGIN_DATA_DIR) and not os.path.exists(PLUGIN_DATA_DIR):
-    try:
-        os.makedirs(os.path.dirname(PLUGIN_DATA_DIR), exist_ok=True)
-        shutil.move(_OLD_PLUGIN_DATA_DIR, PLUGIN_DATA_DIR)
-    except Exception:
-        # If the move fails, fall back to the old location so data stays reachable.
-        PLUGIN_DATA_DIR = _OLD_PLUGIN_DATA_DIR
 CONFIG_FILE     = os.path.join(PLUGIN_DATA_DIR, "plugin.json")
 # Credentials live in their own owner-only directory - NOT in plugin.json, logs,
 # or backups. (True at-rest secrecy isn't possible on this hardware: an
@@ -13125,22 +13113,6 @@ def api_deactivate():
 
 
 if __name__ == '__main__':
-    # Migrate files from old scattered paths to the new plugin data directory
-    _migrations = [
-        ("/home/fpp/media/config/plugin.fpp-textmylights.json", CONFIG_FILE),
-        ("/home/fpp/media/config/blocked_phones.json",         BLOCKLIST_FILE),
-        ("/home/fpp/media/config/last_message_sid.txt",        LAST_SID_FILE),
-        ("/home/fpp/media/config/queue_pending.json",          QUEUE_FILE),
-    ]
-    for _old, _new in _migrations:
-        if not os.path.exists(_new) and os.path.exists(_old):
-            try:
-                import shutil
-                shutil.copy2(_old, _new)
-                logging.info(f"Migrated {_old} → {_new}")
-            except Exception as _e:
-                logging.error(f"Migration failed {_old}: {_e}")
-
     # Write a PID file so the stop hooks (preStop.sh → scripts/tml-stop.sh) can
     # stop exactly this process instead of `pkill -f sms_plugin.py`, which can
     # match unrelated processes. Removed on clean exit; the stop script also

@@ -108,15 +108,15 @@
 				"what": "Runs a local web service on 0.0.0.0:5000 for the settings UI and Master/Remote sync between FPP instances on your LAN."
 			},
 			{
-				"kind": "package",
+				"kind": "download",
 				"what": "Installs apt packages: fonts-freefont-ttf, fontconfig, python3-zstandard, and the Python libraries listed in dependencies."
 			},
 			{
-				"kind": "file",
+				"kind": "core-settings",
 				"what": "Copies bundled fonts to /usr/local/share/fonts/fpp-plugin-textmylights/ and installs TextMyLightsStart/Stop.sh into media/scripts."
 			},
 			{
-				"kind": "file",
+				"kind": "core-settings",
 				"what": "Config import writes into media/playlists, sequences, images and videos, and the overlay model into config/co-other.json."
 			}
 		],

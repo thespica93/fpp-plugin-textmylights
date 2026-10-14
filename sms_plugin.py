@@ -1862,6 +1862,14 @@ def _overlay_model_dims():
     return mw, mh
 
 
+def _has_local_overlay():
+    """True if THIS box has its own overlay model selected - a surface to render text/images on.
+    Text My Lights is overlay-driven: with no overlay model this box produces NO local FPP output
+    (no waiting background, no name text). It can still coordinate remotes (which display on their
+    own overlays), so 'no overlay' means 'this projector shows nothing from the plugin'."""
+    return bool((config.get('overlay_model_name', '') or '').strip())
+
+
 def _fseq_fps_for_content(content, default=30.0):
     """Resolve the frame rate to animate overlay text at, read from the FSEQ header of
     the background sequence. xLights writes the sequence's step time into the header, so
@@ -4132,7 +4140,10 @@ def send_to_fpp(name, override=None):
             push_state_to_remotes({'name': name,
                                    'content': _active_name_content,
                                    'duration': _active_display_duration})
-        overlay_model = config.get('overlay_model_name', 'Texting Matrix')
+        # Real selected model, or '' for None. No phantom default: with no overlay this box
+        # renders nothing locally (Step 1 and Step 2 below are both gated on it); the name was
+        # already pushed to remotes above, which display it on their own overlays.
+        overlay_model = (config.get('overlay_model_name', '') or '').strip()
 
         global_text_color = config.get('text_color', '#FF0000')
         if not global_text_color.startswith('#'):
@@ -4191,8 +4202,10 @@ def send_to_fpp(name, override=None):
 
         logging.info(f"🎄 Displaying '{_mask_name(name)}' (content={name_playlist or 'none'}, model={overlay_model or 'none'})")
 
-        # Step 1: Start the name display playlist/sequence/video/image (background)
-        if name_playlist:
+        # Step 1: Start the name display playlist/sequence/video/image (background). Only when this
+        # box has an overlay to show it on - without one it renders nothing locally (the name is
+        # already pushed to remotes above).
+        if name_playlist and overlay_model:
             try:
                 import urllib.parse
                 # Experiment: DON'T stop the waiting effect. The waiting FSEQ effect
@@ -4379,6 +4392,14 @@ def start_default_playlist(content=None):
     # This content becomes the base waiting layer (what names composite over / return to).
     _active_waiting_content = default_playlist
     logging.info(f"▶️  Starting waiting content: {default_playlist}")
+
+    # No local overlay model => this box renders nothing locally. Still record the active waiting
+    # content above so the master can push it to remotes (they display on their own overlays), but
+    # don't light this projector. (_switch_waiting_content / the rotator route through here too.)
+    if not _has_local_overlay():
+        logging.info("ℹ️  No overlay model on this box - not rendering waiting content locally "
+                     "(coordinating remotes only).")
+        return True
 
     try:
         if default_playlist.startswith('seq:'):
@@ -7256,27 +7277,17 @@ def index():
             // whether a click should Start (activate) or Stop (deactivate).
             var _pluginLive = false;
 
-            function pluginToggle(force) {
+            function pluginToggle() {
                 var btn = document.getElementById('btn_plugin_toggle');
                 var goingLive = !_pluginLive;
                 var url = goingLive ? '/api/activate' : '/api/deactivate';
-                if (goingLive && force) url += '?force=1';
                 btn.disabled = true; btn.textContent = '...';
                 fetch(url, {method:'POST'})
                 .then(r => r.json())
                 .then(function(d) {
+                    // Start is refused (no overlay model and no remotes = nowhere to display).
+                    // There is no "start anyway" - show why and leave the plugin stopped.
                     if (goingLive && d.success === false) {
-                        // "Nothing to render on" (no overlay + no remotes): warn, but let the
-                        // user proceed - re-send with force once they confirm.
-                        if (d.confirm_required) {
-                            btn.disabled = false;
-                            if (confirm((d.error || 'Nothing is set up to display text.') + '\\n\\nStart anyway?')) {
-                                pluginToggle(true);
-                            } else {
-                                updateLiveStatus();
-                            }
-                            return;
-                        }
                         alert('Start failed: ' + (d.error || 'Unknown error'));
                     }
                     updateLiveStatus();
@@ -10180,7 +10191,22 @@ def update_config():
         for _sk in SECRET_KEYS:
             if str(new_config.get(_sk, '')) == SECRET_SENTINEL:
                 new_config.pop(_sk, None)
+        _old_overlay = (config.get('overlay_model_name', '') or '').strip()
         config.update(new_config)
+        # Overlay model cleared to None: this box can no longer display anything locally, so stop
+        # its local output now (go dark) and clear the old model's overlay buffer. Any remotes keep
+        # running - they render on their own overlays. (Switching between two models doesn't trigger
+        # this - only clearing to None does.)
+        _new_overlay = (config.get('overlay_model_name', '') or '').strip()
+        if _old_overlay and not _new_overlay:
+            try:
+                stop_show_playback()
+                import urllib.parse as _up
+                requests.put(f"{FPP_HOST}/api/overlays/model/{_up.quote(_old_overlay)}/state",
+                             json={"State": 0}, timeout=3)
+                logging.info(f"🛑 Overlay model set to None - stopped local playback and cleared '{_old_overlay}'")
+            except Exception as _e:
+                logging.warning(f"Could not stop local playback on overlay clear: {_e}")
 
         # poll_interval: clamp to a safe range and reject non-numbers. 0 would busy-loop a
         # CPU core (on a single-core Pi, the very one fppd uses to output frames on time),
@@ -13309,18 +13335,18 @@ def api_activate():
         logging.error(msg)
         return jsonify({"success": False, "error": msg}), 400
 
-    # No visible render target? If this master has no overlay model of its own AND no remote
-    # is currently connected to render pushed names, text won't display anywhere. Warn (the UI
-    # shows a confirm); the user may still proceed with ?force=1 - SMS polling/replies work
-    # regardless, and they may be about to connect a remote.
-    _forced = (request.args.get('force') == '1') or bool((request.get_json(silent=True) or {}).get('force'))
-    if not _forced and not (config.get('overlay_model_name', '') or '').strip() and not discover_remotes():
-        msg = ("No overlay model is selected on this master, and no remote projectors are "
-               "connected. Text won't display anywhere. Select an overlay model (Settings "
-               "→ Overlay Model Name), or connect a remote projector. SMS replies will "
-               "still work if you start anyway.")
-        logging.warning("⚠️  Start: no overlay model and no remotes connected - nowhere to render")
-        return jsonify({"success": False, "confirm_required": True, "error": msg}), 200
+    # Hard requirement: text needs somewhere to display. If this master has no overlay model of
+    # its own AND no remote projector is connected to render pushed names, there is nowhere for
+    # names to show, so REFUSE to start (no "start anyway" bypass - a scheduled/script start can't
+    # answer a prompt anyway, and we never want to report a successful start that shows nothing).
+    # force=True refreshes discovery so a just-connected remote is seen.
+    if not (config.get('overlay_model_name', '') or '').strip() and not discover_remotes(force=True):
+        msg = ("Can't start Text My Lights: no overlay model is selected on this master and no "
+               "remote projectors are connected, so texted names have nowhere to display. Select "
+               "an overlay model (Settings → Overlay Model Name) or connect a remote projector, "
+               "then start again.")
+        logging.warning("⛔ Start refused: no overlay model and no remotes connected - nowhere to render")
+        return jsonify({"success": False, "error": msg}), 400
 
     config['enabled'] = True
     stop_polling = False

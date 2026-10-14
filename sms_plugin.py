@@ -7368,65 +7368,209 @@ def index():
             // layout down to smaller remotes than up. The selector is hidden when there are no
             // synced remotes with usable dimensions.
             window._previewRemote = null;            // {address,name,w,h} or null (= this box)
+            window._editTarget = null;               // same, but the EDIT/push target (null = master)
             window._previewRemotesList = [];
-            function updatePreviewRemotes(remotes) {
+            // masterOverlay = this master's own overlay model name ('' = None). With no local
+            // overlay there is no "This box" to render on, so the selector offers only remotes;
+            // with no overlay AND no remotes the preview is a blank with a message.
+            function updatePreviewRemotes(remotes, masterOverlay) {
                 var row = document.getElementById('preview_remote_row');
                 var sel = document.getElementById('preview_remote_select');
                 var note = document.getElementById('preview_remote_note');
                 if (!row || !sel) return;
+                var hasOverlay = !!(masterOverlay && String(masterOverlay).trim());
                 var usable = (remotes || []).filter(function(r){ return r.model_w > 0 && r.model_h > 0; });
                 window._previewRemotesList = usable;
-                if (usable.length === 0) {
-                    // No synced remote with a known overlay size → hide and fall back to local/assumed.
-                    if (row.style.display !== 'none') { row.style.display = 'none'; window._previewRemote = null; }
+
+                // Rebuild only when the real choices change, so the periodic poll never stomps the
+                // user's current selection or reloads the editor mid-edit.
+                var sig = (hasOverlay ? 'O|' : '-|')
+                        + usable.map(function(r){ return r.address + ':' + r.model_w + 'x' + r.model_h; }).join(',');
+                if (sig === window._previewRemotesSig) return;
+                window._previewRemotesSig = sig;
+
+                // Nothing to render on (no local overlay AND no remotes): clear any target; the
+                // preview shows its blank + message state (renderCanvasPreview / loadBgPreview).
+                if (!hasOverlay && usable.length === 0) {
+                    row.style.display = 'none';
+                    window._previewRemote = null; window._editTarget = null;
+                    if (typeof window.loadMasterIntoEditor === 'function') window.loadMasterIntoEditor();
                     return;
                 }
-                // Largest overlay by pixel area.
+                // Local overlay but no remotes: only "This box" exists, so no selector is needed.
+                if (hasOverlay && usable.length === 0) {
+                    row.style.display = 'none';
+                    if (window._editTarget) {
+                        window._editTarget = null; window._previewRemote = null;
+                        if (typeof window.loadMasterIntoEditor === 'function') window.loadMasterIntoEditor();
+                    }
+                    return;
+                }
+
+                // Largest overlay by pixel area - the easiest layout to scale down from.
                 var largest = usable.slice().sort(function(a,b){ return (b.model_w*b.model_h)-(a.model_w*a.model_h); })[0];
                 var prev = sel.value;
                 sel.innerHTML = '';
-                var optThis = document.createElement('option');
-                optThis.value = ''; optThis.textContent = 'This box (assumed 16:9)';
-                sel.appendChild(optThis);
+                if (hasOverlay) {
+                    var optThis = document.createElement('option');
+                    optThis.value = ''; optThis.textContent = 'This box (local overlay)';
+                    sel.appendChild(optThis);
+                }
                 usable.forEach(function(r){
                     var o = document.createElement('option');
                     o.value = r.address;
                     o.textContent = r.name + ' (' + r.model_w + '×' + r.model_h + ')' + (r === largest ? ' — largest' : '');
                     sel.appendChild(o);
                 });
-                // Keep the user's choice if still present; otherwise default to the largest.
-                var stillThere = usable.some(function(r){ return r.address === prev; });
-                sel.value = (prev && (prev === '' || stillThere)) ? prev : largest.address;
+                // Keep a still-valid prior choice; otherwise default. With no local overlay we must
+                // land on a remote (there is no "This box"), so default to the largest remote.
+                var validPrev = (prev === '' && hasOverlay) || usable.some(function(r){ return r.address === prev; });
+                sel.value = validPrev ? prev : (hasOverlay ? '' : largest.address);
                 row.style.display = 'block';
                 if (note) note.textContent = 'Shows what that projector will display, at its real size, using its overlay.';
-                // Apply the (possibly new default) selection once, on first populate.
-                if (!window._previewRemoteInit) { window._previewRemoteInit = true; onPreviewRemoteChange(); }
+                // Apply the resolved selection on first populate or whenever it changed.
+                if (!window._previewRemoteInit || sel.value !== prev) { window._previewRemoteInit = true; onPreviewRemoteChange(); }
             }
+
+            // The content id whose layout is currently being edited/previewed.
+            function _currentContentId() {
+                var lst = window._namesContentList || [];
+                var idx = window._namesSelectedIndex;
+                return (lst[idx] && lst[idx].content) || '';
+            }
+
+            // Is there anywhere for text to render? True when previewing a remote, or when THIS
+            // box has its own overlay model. When false (overlay None + no remote) the preview is
+            // a deliberate blank with a message - we never draw a phantom "this box".
+            function _hasRenderTarget() {
+                if (window._editTarget) return true;
+                var ov = (document.getElementById('overlay_model_name') || {}).value || '';
+                return !!ov.trim();
+            }
+
+            // Fill the 4 per-line font <select>s from a [{name,category}] list, selecting the
+            // matching entry from currentFonts. Shared by loadFonts() (this box) and the remote
+            // editor (which offers exactly the fonts the chosen projector actually has).
+            function populateFontSelects(fontObjs, currentFonts) {
+                for (var i = 1; i <= 4; i++) {
+                    var sel = document.getElementById('line_' + i + '_font');
+                    if (!sel) continue;
+                    var current = (currentFonts && currentFonts[i - 1]) || 'FreeSans';
+                    if (fontObjs && fontObjs.length) {
+                        sel.innerHTML = '<option value="">-- Select Font --</option>';
+                        var groups = {};
+                        fontObjs.forEach(function(font) {
+                            var cat = font.category || 'System';
+                            if (!groups[cat]) { groups[cat] = document.createElement('optgroup'); groups[cat].label = cat; sel.appendChild(groups[cat]); }
+                            groups[cat].appendChild(new Option(font.name, font.name, false, font.name === current));
+                        });
+                    } else {
+                        sel.innerHTML = '<option value="FreeSans">FreeSans (default)</option>';
+                    }
+                }
+            }
+            window.populateFontSelects = populateFontSelects;
+
+            function _reshapeCanvasToModel() {
+                var cv = document.getElementById('matrix_canvas');
+                if (cv && window._canvasModelW > 0 && window._canvasModelH > 0) {
+                    cv.height = Math.round(cv.width * window._canvasModelH / window._canvasModelW);
+                }
+            }
+
+            // Load a synced remote's REAL layout + fonts for the current content into the editor,
+            // so the preview is exactly what that projector will show and edits target it.
+            function loadRemoteIntoEditor() {
+                var t = window._editTarget;
+                if (!t) return;
+                var content = _currentContentId();
+                var note = document.getElementById('preview_remote_note');
+                window._loadingTarget = true;
+                if (note) note.textContent = 'Loading ' + t.name + '…';
+                fetch('/api/plugin/remote-layout?remote=' + encodeURIComponent(t.address)
+                      + '&content=' + encodeURIComponent(content))
+                  .then(function(r){ return r.json(); })
+                  .then(function(d){
+                    var fobjs = (d.fonts || []).map(function(n){ return {name: n, category: 'Fonts on ' + t.name}; });
+                    var L = d.layout || null;
+                    var cf = (L && L.line_fonts) || ['FreeSans','FreeSans','FreeSans','FreeSans'];
+                    populateFontSelects(fobjs, cf);
+                    window._fontsReady = true;
+                    window._canvasModelW = t.w || d.model_w || 480;
+                    window._canvasModelH = t.h || d.model_h || 270;
+                    _reshapeCanvasToModel();
+                    window.applyLayoutToEditor(L || undefined);   // undefined -> blank layout
+                    if (note) note.textContent = d.found
+                        ? ('Editing “' + t.name + '” — changes save to that projector.')
+                        : ('“' + t.name + '” has no layout for this content yet — your edits create it.');
+                    if (typeof window.loadBgPreview === 'function') window.loadBgPreview();
+                  })
+                  .catch(function(){ if (note) note.textContent = 'Could not reach ' + t.name + '.'; })
+                  .finally(function(){ window._loadingTarget = false; });
+            }
+            window.loadRemoteIntoEditor = loadRemoteIntoEditor;
+
+            // Restore THIS box's own content/fonts/layout into the editor ("This box", or the
+            // empty state when this box has no overlay and nothing is selected).
+            function loadMasterIntoEditor() {
+                window._loadingTarget = true;
+                var lst = window._namesContentList || []; var idx = window._namesSelectedIndex;
+                var item = (lst.length > 0 && idx >= 0 && idx < lst.length) ? lst[idx] : null;
+                populateFontSelects(window._masterFontObjs, item ? item.line_fonts : null);
+                window._fontsReady = !!(window._masterFontObjs && window._masterFontObjs.length);
+                window._canvasModelW = parseInt(document.getElementById('overlay_model_width').value) || 480;
+                window._canvasModelH = parseInt(document.getElementById('overlay_model_height').value) || 270;
+                _reshapeCanvasToModel();
+                window.applyLayoutToEditor(item || undefined);
+                if (typeof window.loadBgPreview === 'function') window.loadBgPreview();
+                window._loadingTarget = false;
+            }
+            window.loadMasterIntoEditor = loadMasterIntoEditor;
 
             function onPreviewRemoteChange() {
                 var sel = document.getElementById('preview_remote_select');
                 if (!sel) return;
                 var r = (window._previewRemotesList || []).filter(function(x){ return x.address === sel.value; })[0];
+                // Leaving "This box"? persist its current edits into its item before we overwrite
+                // the editor with the remote's layout. (flushEditorToSelected no-ops in remote mode.)
+                if (!window._editTarget && typeof window.flushEditorToSelected === 'function') window.flushEditorToSelected();
                 if (r) {
                     window._previewRemote = {address: r.address, name: r.name, w: r.model_w, h: r.model_h};
-                    window._canvasModelW = r.model_w;
-                    window._canvasModelH = r.model_h;
+                    window._editTarget   = {address: r.address, name: r.name, w: r.model_w, h: r.model_h};
+                    loadRemoteIntoEditor();
                 } else {
-                    // "This box" → preview THIS instance's own projection: restore its overlay
-                    // model dimensions (or the assumed 480×270 if it has none) so the preview's
-                    // coordinate space matches what this box actually renders. Without this it
-                    // would keep the last-selected remote's size and mis-place everything.
                     window._previewRemote = null;
-                    window._canvasModelW = parseInt(document.getElementById('overlay_model_width').value)  || 480;
-                    window._canvasModelH = parseInt(document.getElementById('overlay_model_height').value) || 270;
+                    window._editTarget   = null;
+                    loadMasterIntoEditor();
                 }
-                // Re-shape the canvas to the chosen size, then redraw the preview.
-                var canvas = document.getElementById('matrix_canvas');
-                if (canvas && window._canvasModelW > 0 && window._canvasModelH > 0) {
-                    canvas.height = Math.round(canvas.width * window._canvasModelH / window._canvasModelW);
-                }
-                if (typeof window.loadBgPreview === 'function') window.loadBgPreview();
             }
+
+            // Debounced push of the editor's current layout to the selected remote (auto-save for
+            // the "editing a projector" case; the master's own config still goes through saveConfig).
+            var _remotePushTimer = null;
+            function scheduleRemotePush() {
+                if (window._loadingTarget) return;      // don't echo a programmatic load back as an edit
+                clearTimeout(_remotePushTimer);
+                _remotePushTimer = setTimeout(_doRemotePush, 350);
+            }
+            function _doRemotePush() {
+                var t = window._editTarget; if (!t) return;
+                var content = _currentContentId();
+                var status = document.getElementById('autosave_status');
+                if (status) { status.style.color = '#888'; status.textContent = 'Saving to ' + t.name + '…'; }
+                fetch('/api/plugin/remote-config?remote=' + encodeURIComponent(t.address), {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({content: content, layout: window.collectEditorLayout()})
+                }).then(function(r){ return r.json(); })
+                  .then(function(d){
+                    if (!status) return;
+                    if (d && d.success !== false) { status.style.color = '#4CAF50'; status.textContent = '✓ Saved to ' + t.name; }
+                    else { status.style.color = '#f44336'; status.textContent = 'Save to ' + t.name + ' failed'; }
+                    setTimeout(function(){ status.textContent = ''; }, 3000);
+                  })
+                  .catch(function(){ if (status) { status.style.color = '#f44336'; status.textContent = 'Could not reach ' + t.name; } });
+            }
+            window.scheduleRemotePush = scheduleRemotePush;
 
             // Resolves a line's movement ('Center'|'L2R'|'R2L'|'T2B'|'B2T'), defaulting to Center
             function getLineMovement(i) {
@@ -7849,6 +7993,28 @@ def index():
                 function renderCanvasPreview() {
                     var mw = window._canvasModelW || 480;
                     var mh = window._canvasModelH || 270;
+
+                    // Overlay None and no remote selected => nothing to render on. Draw a blank with
+                    // a message instead of a phantom "this box", and stop here (no box/text drawn).
+                    if (typeof _hasRenderTarget === 'function' && !_hasRenderTarget()) {
+                        if (canvas && ctx) {
+                            ctx.fillStyle = '#000';
+                            ctx.fillRect(0, 0, canvas.width, canvas.height);
+                            ctx.fillStyle = '#9aa0a6';
+                            ctx.textAlign = 'center';
+                            ctx.textBaseline = 'middle';
+                            ctx.font = '14px Arial, sans-serif';
+                            var _cx = canvas.width / 2, _cy = canvas.height / 2;
+                            ctx.fillText('No overlay model and no remotes', _cx, _cy - 12);
+                            ctx.fillText('— nothing to display text on.', _cx, _cy + 6);
+                            ctx.font = '12px Arial, sans-serif';
+                            ctx.fillStyle = '#6b7178';
+                            ctx.fillText('Select an overlay model, or connect a remote projector.', _cx, _cy + 28);
+                            ctx.textAlign = 'left';
+                        }
+                        lineRects = [null, null, null, null];
+                        return;
+                    }
 
                     // Kick off loading of every line's font (no-op if already loaded/loading).
                     // ensureFontLoaded repaints when a font finishes, so a preview drawn before
@@ -8487,6 +8653,9 @@ def index():
                 // Flush the editor into the currently-selected item (mirror duration to the
                 // hidden global field when there is no list).
                 function flushEditorToSelected() {
+                    // In remote-edit mode the editor holds a REMOTE's layout, not one of this
+                    // master's list items - never capture it into the master's config.
+                    if (window._editTarget) return;
                     var lst=window._namesContentList||[];
                     var idx=window._namesSelectedIndex;
                     if (lst.length>0 && idx>=0 && idx<lst.length) {
@@ -8679,8 +8848,15 @@ def index():
                 }
                 function selectNamesItem(i) {
                     var lst=window._namesContentList; if (i<0||i>=lst.length) return;
-                    flushEditorToSelected();      // capture edits to the item we're leaving
+                    flushEditorToSelected();      // capture edits to the item we're leaving (no-op in remote mode)
                     window._namesSelectedIndex=i;
+                    if (window._editTarget) {
+                        // Editing a remote: load THAT remote's layout + background for the newly
+                        // selected content (loadRemoteIntoEditor refreshes the background itself).
+                        renderNamesList();
+                        loadRemoteIntoEditor();
+                        return;
+                    }
                     applyLayoutToEditor(lst[i]);
                     renderNamesList();
                     if (typeof window.toggleFseqPreview==='function') window.toggleFseqPreview();
@@ -9037,48 +9213,17 @@ def index():
                     loadEl.style.color = '#aaa';
                     if (scrubHint) scrubHint.style.display = (ct.type === 'img') ? 'none' : '';
 
-                    // No overlay model selected? That is valid on a master whose projector is a
-                    // remote - there are no real model dimensions here. Rather than erroring on the
-                    // background fetch, assume a 16:9 preview (480\u00d7270) so text positioning still
-                    // works, and tell the user the size is assumed. (The exact-size preview with
-                    // the live background returns once a model is selected.)
+                    // Overlay None and no remote selected: there is nowhere for text to render, so
+                    // we deliberately show a blank preview with a message instead of a phantom
+                    // "this box" at an assumed size. Clear the background; renderCanvasPreview draws
+                    // the message (and no box/text). The exact-size preview returns once an overlay
+                    // model is chosen or a remote projector is selected above.
                     if (!window._previewRemote && !((document.getElementById('overlay_model_name') || {}).value || '')) {
                         window._fseqBgImage = null;
-                        // Only FSEQ truly needs the model (to map channels \u2192 pixels). Images and
-                        // videos just get resized server-side, so they can still render at the
-                        // assumed size. The flag below tells the scrubber to skip the background
-                        // fetch for FSEQ only (text-scroll preview), not for video.
-                        window._previewAssumedSize = (ct.type === 'seq');
-                        loadEl.innerHTML = '\u26a0 No overlay model selected \u2014 preview at an assumed 16:9 size (480\u00d7270). '
-                                         + 'Select an overlay model for an exact-size, channel-accurate preview.';
-                        loadEl.style.color = '#ff9800';
-                        if (ct.type === 'seq') {
-                            // Can't render FSEQ pixels without the model's channel map \u2192 show the
-                            // text layout on black, with the scrubber driving the scroll preview.
-                            if (scrubHint) scrubHint.style.display = '';
-                            var _cap = Math.max(1, _previewCapSeconds());
-                            var _sc = document.getElementById('fseq_scrubber');
-                            _sc.max = _cap; _sc.value = 0; window._scrubSeconds = 0;
-                            document.getElementById('fseq_scrubber_row').style.display = '';
-                            document.getElementById('fseq_time_display').textContent = '0:00 / ' + fmtTime(_cap * 1000);
-                            var _st = document.getElementById('fseq_status');
-                            if (_st) _st.textContent = 'Text preview only \u2014 select an overlay model to preview the sequence background';
-                        } else if (ct.type === 'vid') {
-                            // Video frames resize fine without a model - show them + scrubber.
-                            if (scrubHint) scrubHint.style.display = '';
-                            var _cap2 = Math.max(1, _previewCapSeconds());
-                            var _sc2 = document.getElementById('fseq_scrubber');
-                            _sc2.max = _cap2; _sc2.value = 0; window._scrubSeconds = 0;
-                            document.getElementById('fseq_scrubber_row').style.display = '';
-                            document.getElementById('fseq_time_display').textContent = '0:00';
-                            doMediaFetch(0);
-                        } else {
-                            // Image - render once at the assumed size, no scrubber.
-                            if (scrubHint) scrubHint.style.display = 'none';
-                            document.getElementById('fseq_scrubber_row').style.display = 'none';
-                            window._scrubSeconds = 0;
-                            doMediaFetch(0);
-                        }
+                        window._previewAssumedSize = false;
+                        loadEl.innerHTML = '';
+                        var _sr = document.getElementById('fseq_scrubber_row'); if (_sr) _sr.style.display = 'none';
+                        if (scrubHint) scrubHint.style.display = 'none';
                         if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
                         return;
                     }
@@ -9431,26 +9576,11 @@ def index():
                 fetch('/api/fpp/fonts')
                 .then(r => r.json())
                 .then(function(fonts) {
-                    for (var i = 1; i <= 4; i++) {
-                        var sel = document.getElementById('line_' + i + '_font');
-                        if (!sel) continue;
-                        var current = currentFonts[i - 1] || 'FreeSans';
-                        if (fonts && fonts.length > 0) {
-                            sel.innerHTML = '<option value="">-- Select Font --</option>';
-                            var groups = {};
-                            fonts.forEach(function(font) {
-                                var cat = font.category || 'System';
-                                if (!groups[cat]) {
-                                    groups[cat] = document.createElement('optgroup');
-                                    groups[cat].label = cat;
-                                    sel.appendChild(groups[cat]);
-                                }
-                                groups[cat].appendChild(new Option(font.name, font.name, false, font.name === current));
-                            });
-                        } else {
-                            sel.innerHTML = '<option value="FreeSans">FreeSans (default)</option>';
-                        }
-                    }
+                    // Cache this box's own font list so returning to "This box" can restore the
+                    // dropdowns without a re-fetch (the remote editor swaps in the remote's fonts).
+                    window._masterFontObjs = fonts || [];
+                    // Don't clobber the dropdowns while the editor is showing a remote's fonts.
+                    if (!window._editTarget) populateFontSelects(fonts, currentFonts);
                     // Font dropdowns are now populated - safe for autosave to read them.
                     window._fontsReady = !!(fonts && fonts.length > 0);
                     return Promise.all(currentFonts.map(ensureFontLoaded));
@@ -9563,11 +9693,20 @@ def index():
 
 var _saveTimer = null;
             function saveConfig() {
+                // While the Preview is editing a REMOTE projector, also push the current layout to
+                // that remote (debounced). We STILL run the normal master save so non-layout
+                // settings (rules, responses, filters) persist even with a remote selected; _doSave
+                // strips the flat layout fields in that mode so the remote's layout (sitting in the
+                // editor DOM) never overwrites this master's own layout.
+                if (window._editTarget && typeof scheduleRemotePush === 'function') scheduleRemotePush();
                 clearTimeout(_saveTimer);
                 _saveTimer = setTimeout(_doSave, 300);
             }
             function _doSave() {
-                var status = document.getElementById('autosave_status');
+                // In remote-edit mode the remote push owns the status line ("Saved to <remote>"),
+                // so let this background master save run silently - a throwaway object swallows the
+                // status writes without touching the shared element.
+                var status = window._editTarget ? {style:{}} : document.getElementById('autosave_status');
                 status.style.color = '#888';
                 status.textContent = 'Saving...';
 
@@ -9667,6 +9806,16 @@ var _saveTimer = null;
                         var el = document.getElementById('line_' + (i + 1) + '_font');
                         return el && el.value ? el.value : 'FreeSans';
                     });
+                }
+
+                // Editing a remote: the editor DOM holds the REMOTE's layout, so drop the flat
+                // top-level layout fields from this master save - otherwise the remote's values
+                // would overwrite the master's own. (/api/config merges, so omitting keys keeps
+                // the stored ones. The remote's layout is pushed separately; names_content_list is
+                // the master's own and is untouched in remote mode.)
+                if (window._editTarget) {
+                    ['message_lines','line_boxes','line_colors','line_movements',
+                     'line_speeds','line_orientations','line_fonts'].forEach(function(k){ delete data[k]; });
                 }
 
                 fetch('/api/config', {
@@ -11472,6 +11621,51 @@ def api_master_layout():
         return jsonify({"found": False, "error": f"Could not reach master: {e}"}), 502
 
 
+def _synced_remote_base(addr):
+    """Master: the http base for a synced remote by address, or None if it isn't one of THIS
+    master's confirmed remotes. Validating against discover_remotes_detailed() is the SSRF guard -
+    the browser can only ever reach remotes this master already drives, never an arbitrary host."""
+    return next((r['base'] for r in discover_remotes_detailed() if r['address'] == addr), None)
+
+
+@app.route('/api/plugin/remote-layout')
+def api_plugin_remote_layout():
+    """Master (browser-facing): fetch a synced REMOTE's real layout + fonts + overlay size for a
+    content id, so the Preview can render exactly what that projector will show and edit it.
+    Proxies to the remote's /api/tml/editinfo; the remote address is validated against the synced
+    list (no SSRF), the same way /api/tml/remote-frame guards the background-frame proxy."""
+    if is_remote():
+        return jsonify({"found": False, "error": "not a master"}), 409
+    addr = request.args.get('remote', '').strip()
+    content = request.args.get('content', '')
+    base = _synced_remote_base(addr)
+    if not base:
+        return jsonify({"found": False, "error": "unknown or not-synced remote"}), 404
+    try:
+        r = requests.get(f"{base}/api/tml/editinfo", params={"content": content}, timeout=4)
+        return jsonify(r.json())
+    except Exception as e:
+        return jsonify({"found": False, "error": f"Could not reach remote: {e}"}), 502
+
+
+@app.route('/api/plugin/remote-config', methods=['POST'])
+def api_plugin_remote_config():
+    """Master (browser-facing): push an edited layout to a synced REMOTE for a content id, so the
+    operator can arrange a projector from the master. Proxies to the remote's /api/tml/remote-config;
+    the remote address is validated against the synced list (no SSRF)."""
+    if is_remote():
+        return jsonify({"success": False, "error": "not a master"}), 409
+    addr = request.args.get('remote', '').strip()
+    base = _synced_remote_base(addr)
+    if not base:
+        return jsonify({"success": False, "error": "unknown or not-synced remote"}), 404
+    try:
+        r = requests.post(f"{base}/api/tml/remote-config", json=(request.json or {}), timeout=4)
+        return jsonify(r.json()), r.status_code
+    except Exception as e:
+        return jsonify({"success": False, "error": f"Could not reach remote: {e}"}), 502
+
+
 @app.route('/api/queue/status')
 def queue_status():
     try:
@@ -12945,6 +13139,75 @@ def api_tml_layout():
         k: item.get(k) for k in ('message_lines', 'line_boxes', 'line_colors', 'line_movements',
                                  'line_speeds', 'line_fonts', 'line_orientations', 'display_duration')
     }})
+
+
+# Keys that make up a single content's text layout - the unit the master reads from and
+# writes to a remote (and the master's own names_content_list items use the same shape).
+_LAYOUT_KEYS = ('message_lines', 'line_boxes', 'line_colors', 'line_movements',
+                'line_speeds', 'line_fonts', 'line_orientations', 'display_duration')
+
+
+@app.route('/api/tml/editinfo', methods=['GET'])
+def api_tml_editinfo():
+    """Peer (master) -> this instance: everything the master needs to show/edit THIS box's real
+    layout in its Preview - the overlay model size, this box's installed font names, and the saved
+    layout for a content id. Like /api/tml/layout but adds the font list, so the master's editor
+    can offer exactly the fonts this projector actually has."""
+    content = request.args.get('content', '')
+    mw, mh = _overlay_model_dims()
+    item = next((it for it in (config.get('names_content_list', []) or [])
+                 if it.get('content') == content), None)
+    try:
+        fonts = [f['name'] for f in get_fpp_fonts()]
+    except Exception:
+        fonts = []
+    layout = {k: item.get(k) for k in _LAYOUT_KEYS} if item else None
+    return jsonify({"found": bool(item), "model_w": mw, "model_h": mh,
+                    "fonts": fonts, "overlay_model": config.get('overlay_model_name', '') or '',
+                    "layout": layout})
+
+
+@app.route('/api/tml/remote-config', methods=['POST'])
+def api_tml_remote_config():
+    """Remote: apply a text layout the master (the one this remote is pinned to) edited in its
+    Preview, for a given content id, into THIS box's own names_content_list - creating the item if
+    needed - then persist it so the next name display uses it. If that exact name is showing right
+    now, re-render it in the background so the change is visible live. Only the pinned master may
+    write (same gate as /api/tml/state), so several masters can't fight over one remote."""
+    if not is_remote():
+        return jsonify({"success": False, "error": "not in remote mode"}), 409
+    if not _push_from_selected_master():
+        return jsonify({"success": True, "ignored": "not the selected master"})
+    data = request.json or {}
+    content = str(data.get('content', '') or '')
+    layout = data.get('layout') or {}
+    if not content:
+        return jsonify({"success": False, "error": "no content id"}), 400
+    try:
+        lst = config.get('names_content_list', []) or []
+        item = next((it for it in lst if it.get('content') == content), None)
+        if item is None:
+            item = {"content": content}
+            lst.append(item)
+            config['names_content_list'] = lst
+        for k in _LAYOUT_KEYS:
+            if k in layout and layout[k] is not None:
+                item[k] = layout[k]
+        save_config()
+        # Best-effort live refresh: only if this exact name+content is on screen right now.
+        # Fire-and-forget so the push returns immediately and never blocks the master's UI.
+        try:
+            st = _remote_last_state or {}
+            if st.get('name') and st.get('content', '') == content:
+                threading.Thread(
+                    target=lambda: send_to_fpp(st['name'],
+                                               override={"content": content, "duration": None}),
+                    daemon=True).start()
+        except Exception as _e:
+            logging.debug(f"remote-config live re-render skipped: {_e}")
+        return jsonify({"success": True})
+    except Exception as e:
+        return _client_error("api_tml_remote_config", e)
 
 
 def _apply_remote_waiting(content):

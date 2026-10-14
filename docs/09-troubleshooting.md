@@ -22,7 +22,7 @@
 
 ## Can't Access Web Interface
 
-**Symptom:** Browser can't connect to `http://YOUR_FPP_IP:5000`
+**Symptom:** The plugin page won't open from the FPP web UI (Content Setup → Text My Lights)
 
 **Check 1 — Is the plugin running?**
 ```bash
@@ -36,13 +36,13 @@ ss -tlnp | grep 5000
 ```
 If nothing shows, the service stopped. Check the log:
 ```bash
-tail -50 /home/fpp/media/logs/sms_plugin.log
+tail -50 /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log
 ```
 
-**Check 3 — Firewall blocking port 5000?**
+**Check 3 — Is the plugin service running?**
 ```bash
-sudo ufw allow 5000
-sudo ufw reload
+pgrep -af sms_plugin.py
+tail -n 50 /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log
 ```
 
 **Check 4 — Are you using the right IP?**
@@ -71,13 +71,13 @@ twilio          8.10.0
 ```
 If any are missing, reinstall:
 ```bash
-cd /opt/fpp/plugins/fpp-plugin-textmylights
+cd /home/fpp/media/plugins/fpp-plugin-textmylights
 bash scripts/fpp_install.sh
 ```
 
 **Check 3 — Is there a Python error on startup?**
 ```bash
-cd /opt/fpp/plugins/fpp-plugin-textmylights
+cd /home/fpp/media/plugins/fpp-plugin-textmylights
 python3 sms_plugin.py
 ```
 Run it manually and look for error output. Press `Ctrl+C` when done.
@@ -129,7 +129,7 @@ Expected: `HTTP/2 200` or similar. If it fails, check your network connection.
 
 **Check 4 — Check the plugin log**
 ```bash
-tail -f /home/fpp/media/logs/sms_plugin.log
+tail -f /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log
 ```
 Send a test text and watch the log in real time. You should see it being received.
 
@@ -152,7 +152,7 @@ Free trial Twilio accounts can only send SMS **to** verified numbers. They can s
 - The selected model must exist in FPP: **Content Setup** → **Channel Outputs** → **Pixel Overlay Models**
 
 **Check 3 — Is the name being filtered out?**
-- Go to `http://YOUR_FPP_IP:5000/messages` and check the message status
+- Open the Message Queue (plugin UI → View Message Queue) and check the message status
 - Status `blocked_whitelist` means whitelist is enabled and the name isn't in it
 - Status `blocked_profanity` means the name hit the profanity filter
 - Status `invalid_format` means the name format wasn't recognized
@@ -171,7 +171,7 @@ Free trial Twilio accounts can only send SMS **to** verified numbers. They can s
 
 Check the log for the `📐 Overlay` line emitted on every display:
 ```bash
-grep "📐 Overlay" /home/fpp/media/logs/sms_plugin.log | tail -5
+grep "📐 Overlay" /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log | tail -5
 ```
 The line should show non-zero `overlay_size` and end with `PIL=True`. Example of a healthy line:
 ```
@@ -184,7 +184,7 @@ The line should show non-zero `overlay_size` and end with `PIL=True`. Example of
 **Check 2 — Check for shared memory permission errors**
 
 ```bash
-grep -E "Permission denied|render_to_shm|scroll_via_shm" /home/fpp/media/logs/sms_plugin.log | tail -10
+grep -E "Permission denied|render_to_shm|scroll_via_shm" /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log | tail -10
 ```
 If you see `[Errno 13] Permission denied: '/dev/shm/FPP-Model-Data-...'`, the sudoers rule that allows the plugin to fix shm permissions may not be installed. Run `bash scripts/fpp_install.sh` to install it, then restart FPP.
 
@@ -212,7 +212,7 @@ On the config page, open the canvas preview and check the position display below
 
 **Check 4 — Is the plugin log showing errors?**
 ```bash
-grep -i "response\|sms send\|error" /home/fpp/media/logs/sms_plugin.log | tail -20
+grep -i "response\|sms send\|error" /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log | tail -20
 ```
 
 ---
@@ -225,15 +225,15 @@ grep -i "response\|sms send\|error" /home/fpp/media/logs/sms_plugin.log | tail -
 
 If removals aren't sticking:
 ```bash
-cat /opt/fpp/plugins/fpp-plugin-textmylights/whitelist_removed.txt
-cat /opt/fpp/plugins/fpp-plugin-textmylights/blacklist_removed.txt
+cat /home/fpp/media/plugins/fpp-plugin-textmylights/whitelist_removed.txt
+cat /home/fpp/media/plugins/fpp-plugin-textmylights/blacklist_removed.txt
 ```
 These files should contain the names/words you've removed. If they're missing or empty, try removing the name/word again via the web UI.
 
 **Symptom:** Whitelist shows 0 names after an update
 
 ```bash
-cd /opt/fpp/plugins/fpp-plugin-textmylights
+cd /home/fpp/media/plugins/fpp-plugin-textmylights
 git checkout -- whitelist.txt
 ```
 This restores the default whitelist from git.
@@ -248,13 +248,13 @@ This can happen if the install was interrupted or the plugin was manually cloned
 
 ```bash
 # Check if plugin directory exists
-ls /opt/fpp/plugins/fpp-plugin-textmylights
+ls /home/fpp/media/plugins/fpp-plugin-textmylights
 
 # If it exists but isn't showing in FPP, restart FPP
 sudo systemctl restart fppd
 
 # Or try reinstalling
-cd /opt/fpp/plugins/fpp-plugin-textmylights
+cd /home/fpp/media/plugins/fpp-plugin-textmylights
 bash scripts/fpp_install.sh
 ```
 
@@ -268,21 +268,21 @@ The plugin log is the first place to look for any issue:
 
 ```bash
 # View last 50 lines
-tail -50 /home/fpp/media/logs/sms_plugin.log
+tail -50 /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log
 
 # Follow log in real time
-tail -f /home/fpp/media/logs/sms_plugin.log
+tail -f /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log
 
 # Search for errors
-grep -i error /home/fpp/media/logs/sms_plugin.log
+grep -i error /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log
 
 # Search for a specific phone number
-grep "+15551234567" /home/fpp/media/logs/sms_plugin.log
+grep "+15551234567" /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log
 ```
 
 The message history JSON is also useful:
 ```bash
-cat /home/fpp/media/logs/received_messages.json | python3 -m json.tool | tail -100
+cat /home/fpp/media/plugindata/fpp-plugin-textmylights/logs/messages/ | python3 -m json.tool | tail -100
 ```
 
 ---
@@ -293,23 +293,23 @@ If you need a clean slate:
 
 **Reset configuration only:**
 ```bash
-rm /home/fpp/media/config/plugin.fpp-textmylights.json
+rm /home/fpp/media/plugindata/fpp-plugin-textmylights/plugin.json
 # Restart the plugin — it will generate default config
 ```
 
 **Clear message history:**
 ```bash
-rm /home/fpp/media/logs/received_messages.json
+rm /home/fpp/media/plugindata/fpp-plugin-textmylights/logs/messages/
 ```
 
 **Clear blocked phones:**
 ```bash
-echo '{}' > /opt/fpp/plugins/fpp-plugin-textmylights/blocked_phones.json
+echo '{}' > /home/fpp/media/plugins/fpp-plugin-textmylights/blocked_phones.json
 ```
 
 **Full reinstall:**
 ```bash
-cd /opt/fpp/plugins
+cd /home/fpp/media/plugins
 rm -rf fpp-plugin-textmylights
 git clone https://github.com/thespica93/fpp-plugin-textmylights.git
 cd fpp-plugin-textmylights
@@ -325,5 +325,5 @@ bash scripts/fpp_install.sh
 
 When reporting an issue, please include:
 - Your FPP version
-- The relevant section of `/home/fpp/media/logs/sms_plugin.log`
+- The relevant section of `/home/fpp/media/logs/plugin-fpp-plugin-textmylights.log`
 - What you expected to happen vs. what actually happened

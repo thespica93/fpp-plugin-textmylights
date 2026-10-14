@@ -2,7 +2,7 @@
 
 > Prevent inappropriate words from appearing on your display.
 
-Access the Blacklist Manager at: **`http://YOUR_FPP_IP:5000/blacklist`**
+Open the Blacklist Manager from the plugin UI (**Content Setup → Text My Lights → Manage Blacklist**).
 
 ---
 
@@ -31,7 +31,7 @@ The sender receives a polite rejection SMS (if auto-responses are enabled) and t
 
 ## Enabling the Profanity Filter
 
-1. Go to the [Plugin Configuration](03-plugin-configuration.md) page (`http://YOUR_FPP_IP:5000`)
+1. Go to the [Plugin Configuration](03-plugin-configuration.md) page
 2. In the **Filters** section, check **Enable Profanity Filter**
 3. Click **💾 Save Configuration**
 
@@ -149,12 +149,12 @@ When you re-add a removed word:
 
 | File | Path | Purpose |
 |------|------|---------|
-| Main blacklist | `/opt/fpp/plugins/fpp-plugin-textmylights/blacklist.txt` | Blocked words, one per line |
-| Removals tracking | `/opt/fpp/plugins/fpp-plugin-textmylights/blacklist_removed.txt` | Words you've removed (gitignored) |
+| Main blacklist | `/home/fpp/media/plugins/fpp-plugin-textmylights/blacklist.txt` | Blocked words, one per line |
+| Removals tracking | `/home/fpp/media/plugins/fpp-plugin-textmylights/blacklist_removed.txt` | Words you've removed (gitignored) |
 
 You can also edit `blacklist.txt` directly via SSH:
 ```bash
-nano /opt/fpp/plugins/fpp-plugin-textmylights/blacklist.txt
+nano /home/fpp/media/plugins/fpp-plugin-textmylights/blacklist.txt
 ```
 One word per line, case-insensitive.
 

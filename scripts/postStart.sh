@@ -6,10 +6,9 @@
 
 PLUGIN_DIR="/home/fpp/media/plugins/fpp-plugin-textmylights"
 
-# Stop any existing service, then wait (bounded) for it to actually exit instead of a
-# flat sleep that would block fppd startup for a fixed time on every run.
-pkill -f sms_plugin.py 2>/dev/null || true
-for _i in $(seq 1 20); do pgrep -f sms_plugin.py >/dev/null 2>&1 || break; sleep 0.1; done
+# Stop any existing service via the PID file (shared helper), so we never match
+# unrelated processes. tml-stop.sh waits for the old process to actually exit.
+"$PLUGIN_DIR/scripts/tml-stop.sh" || true
 
 # NOTE: shared-memory permissions are fixed at RUNTIME (per overlay model, scoped to the
 # fpp user/group) by the root helper tml-fix-shm-perms - see render_to_shm() in sms_plugin.py.
@@ -18,6 +17,8 @@ for _i in $(seq 1 20); do pgrep -f sms_plugin.py >/dev/null 2>&1 || break; sleep
 
 # Start the service as fpp user
 cd "$PLUGIN_DIR"
-su fpp -c "cd '$PLUGIN_DIR' && nohup python3 sms_plugin.py > /dev/null 2>/home/fpp/media/logs/plugin-fpp-plugin-textmylights.log &"
+# APPEND (>>), never truncate (2>): the daemon writes this same log via a WatchedFileHandler,
+# and FPP's logrotate manages it. Truncating on every start would wipe the prior run's log.
+su fpp -c "cd '$PLUGIN_DIR' && nohup python3 sms_plugin.py >> /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log 2>&1 &"
 
 exit 0

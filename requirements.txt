@@ -1,3 +1,12 @@
-flask==3.0.0
-twilio==8.10.0
-requests==2.32.3
+# NOT used by the plugin installer. On FPP the dependencies are installed as
+# Debian packages (see pluginInfo.json dependencies.packages and scripts/
+# fpp_install.sh): python3-flask, python3-twilio, python3-requests, python3-pil,
+# python3-zstandard. FPP reference-counts those and removes them on uninstall.
+#
+# This file is only a convenience for running the plugin outside FPP in a local
+# dev virtualenv, where pip is the natural way to get the libraries.
+flask
+twilio
+requests
+pillow
+zstandard

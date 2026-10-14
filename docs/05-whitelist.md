@@ -2,7 +2,7 @@
 
 > Control exactly which names are allowed to appear on your display.
 
-Access the Whitelist Manager at: **`http://YOUR_FPP_IP:5000/whitelist`**
+Open the Whitelist Manager from the plugin UI (**Content Setup → Text My Lights → Manage Whitelist**).
 
 ---
 
@@ -33,7 +33,7 @@ The whitelist is a list of **approved names**. When enabled, only names found in
 
 ## Enabling the Whitelist
 
-1. Go to the [Plugin Configuration](03-plugin-configuration.md) page (`http://YOUR_FPP_IP:5000`)
+1. Go to the [Plugin Configuration](03-plugin-configuration.md) page
 2. In the **Filters** section, check **Enable Whitelist**
 3. Click **💾 Save Configuration**
 
@@ -182,12 +182,12 @@ When you re-add a name via the web UI:
 
 | File | Path | Purpose |
 |------|------|---------|
-| Main whitelist | `/opt/fpp/plugins/fpp-plugin-textmylights/whitelist.txt` | List of approved names, one per line |
-| Removals tracking | `/opt/fpp/plugins/fpp-plugin-textmylights/whitelist_removed.txt` | Names you've removed (gitignored) |
+| Main whitelist | `/home/fpp/media/plugins/fpp-plugin-textmylights/whitelist.txt` | List of approved names, one per line |
+| Removals tracking | `/home/fpp/media/plugins/fpp-plugin-textmylights/whitelist_removed.txt` | Names you've removed (gitignored) |
 
 You can also edit `whitelist.txt` directly via SSH if needed:
 ```bash
-nano /opt/fpp/plugins/fpp-plugin-textmylights/whitelist.txt
+nano /home/fpp/media/plugins/fpp-plugin-textmylights/whitelist.txt
 ```
 One name per line, case-insensitive.
 

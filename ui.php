@@ -1,10 +1,11 @@
 <?php
-$host = preg_replace('/:\d+$/', '', $_SERVER['HTTP_HOST']);
-// Read the plugin's network access token (minted by sms_plugin.py) and pass it
-// to the iframe so the service authorizes this browser. This page is served by
-// FPP's own web server, so only someone who can reach the FPP UI gets the token.
-$tokenFile = "/home/fpp/media/plugin.fpp-textmylights/.access_token";
-$token = is_readable($tokenFile) ? trim(file_get_contents($tokenFile)) : "";
+// The plugin UI is served SAME-ORIGIN through FPP via proxy.php (which forwards to the
+// daemon on 127.0.0.1:5000). No access token is passed to the browser: the daemon trusts
+// the loopback interface, and the proxy reaches it over loopback. This avoids the blocked
+// cross-origin iframe, HTTPS mixed content, and the token leaking under FPP's /proxy view.
+// The proxy base is RELATIVE so it resolves correctly under /proxy/<ip>/ (each box talks
+// to its own daemon).
+$proxyBase = "plugin.php?plugin=fpp-plugin-textmylights&page=proxy.php&nopage=1&p=";
 
 // Read FPP's own UI theme server-side (this PHP runs inside FPP) so the plugin, which
 // lives in a cross-origin iframe and can't see FPP's CSS, matches it exactly - 'light',
@@ -27,10 +28,8 @@ function tml_fpp_theme() {
     return '';
 }
 $fppTheme  = tml_fpp_theme();
-$pluginUrl = "http://$host:5000/" . ($token !== "" ? "?token=" . urlencode($token) : "");
-if ($fppTheme !== "") {
-    $pluginUrl .= ($token !== "" ? "&" : "?") . "theme=" . $fppTheme;
-}
+// p is empty -> proxy forwards to the daemon root ('/'); theme is forwarded as a query param.
+$pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) : "");
 ?>
 <style>
     #sms-plugin-frame {
@@ -98,6 +97,7 @@ if ($fppTheme !== "") {
             <span><strong>Content files</strong> (off by default)<br><span class="tml-desc">Copies the actual sequence / image / video files into the bundle - can be large. Leave OFF: xLights FPP Connect already distributes sequences to your Pis, so the export just records which content to use by name. Turn ON only for a fully self-contained copy.</span></span></label>
         <label class="tml-opt"><input type="checkbox" id="tml-exp-overlay" checked>
             <span><strong>Overlay model (matrix)</strong><br><span class="tml-desc">The FPP Pixel Overlay Model the names are drawn onto.</span></span></label>
+        <p class="tml-status" id="tml-exp-status"></p>
         <div class="tml-actions">
             <button type="button" id="tml-exp-cancel" class="tml-cancel" onclick="tmlHideExport()">Cancel</button>
             <button type="button" id="tml-exp-go" class="tml-go" onclick="tmlDoExport()">Export</button>
@@ -176,12 +176,10 @@ if ($fppTheme !== "") {
         if (t !== _tmlLastTheme) tmlSendTheme();
     }, 1500);
 
-    // The plugin service base + its access token (same token the iframe loads with).
-    // Lets THIS parent page talk to :5000 directly - needed so the export download
-    // is triggered by the real Export click here (user activation) instead of a
-    // postMessage inside the cross-origin iframe, which browsers block.
-    var TML_SVC   = <?php echo json_encode("http://$host:5000/"); ?>;
-    var TML_TOKEN = <?php echo json_encode($token); ?>;
+    // Same-origin proxy base for THIS parent page. Lets the Export download be triggered by
+    // the real Export click here (user activation) through the FPP proxy (loopback-trusted,
+    // no token). Relative so it works under /proxy/<ip>/.
+    var TML_PROXY = <?php echo json_encode($proxyBase); ?>;
 
     // Create the hidden download iframe ONCE, up front. Creating it and setting its
     // src in the same click handler made the browser skip that first navigation (the
@@ -197,7 +195,7 @@ if ($fppTheme !== "") {
     })();
 
     /* ---------------- Export ---------------- */
-    var _tmlExporting = false, _tmlExportTimer = null;
+    var _tmlExporting = false, _tmlExportPoll = null;
     function tmlResetExportBtn() {
         var go = document.getElementById('tml-exp-go');
         go.disabled = false; go.textContent = 'Export';
@@ -212,6 +210,7 @@ if ($fppTheme !== "") {
     }
     function tmlHideExport() {
         if (_tmlExporting) return;
+        clearInterval(_tmlExportPoll);
         document.getElementById('tml-export-modal').style.display = 'none';
     }
     function tmlDoExport() {
@@ -224,18 +223,19 @@ if ($fppTheme !== "") {
         var go = document.getElementById('tml-exp-go');
         go.disabled = true; go.textContent = 'Exporting...';
         document.getElementById('tml-exp-cancel').disabled = true;
+        var st = document.getElementById('tml-exp-status');
+        st.style.color = ''; st.textContent = '';
 
-        // Download straight from this parent page via a hidden iframe. The browser
-        // streams the (possibly very large) sequence zip to disk - it never buffers
-        // the whole file in JS memory, so the tab can't freeze. Triggering it here,
-        // from the real Export click, keeps the user activation browsers require and
-        // sidesteps the cross-origin-iframe download block. Auth via ?token; the
-        // server's Content-Disposition names the file.
-        // Cache-buster (&_ts) guarantees the iframe sees a new URL and navigates
-        // every time, even for two identical back-to-back exports.
-        var url = TML_SVC + 'api/config/export?settings=' + sel.s + '&lists=' + sel.l
+        // Download straight from this parent page via a hidden iframe. The browser streams the
+        // (possibly very large) zip to disk - never buffered in JS - so the tab can't freeze.
+        // A unique dl_token lets us POLL the service for whether the download actually started
+        // and finished, because a hidden-iframe download exposes no HTTP status to JS: a 403,
+        // 500, or an error after streaming began would otherwise close the dialog silently.
+        var token = 'dl' + Date.now() + '-' + Math.random().toString(36).slice(2);
+        var url = TML_PROXY + encodeURIComponent('api/config/export')
+                + '&settings=' + sel.s + '&lists=' + sel.l
                 + '&content=' + sel.c + '&overlay=' + sel.o
-                + (TML_TOKEN ? '&token=' + encodeURIComponent(TML_TOKEN) : '')
+                + '&dl_token=' + encodeURIComponent(token)
                 + '&_ts=' + Date.now();
         var dl = document.getElementById('tml-export-dl');
         if (!dl) {   // defensive: init IIFE should have made it already
@@ -245,14 +245,42 @@ if ($fppTheme !== "") {
             document.body.appendChild(dl);
         }
         dl.src = url;
-
-        // Keep the modal up through the hand-off so the user sees it start, then
-        // close. The browser's own download manager shows the rest of the transfer.
         go.textContent = 'Downloading...';
-        _tmlExportTimer = setTimeout(function() {
-            document.getElementById('tml-export-modal').style.display = 'none';
-            tmlResetExportBtn();
-        }, 1800);
+
+        // Poll export status; show an error instead of silently closing if it never starts or
+        // fails. 'done' = the zip was fully written; 'error' = it failed (incl. mid-stream);
+        // no response within 20s = the request never reached the service (e.g. 403/blocked).
+        var statusUrl = TML_PROXY + encodeURIComponent('api/config/export/status')
+                      + '&dl_token=' + encodeURIComponent(token);
+        var startedAt = Date.now();
+        clearInterval(_tmlExportPoll);
+        _tmlExportPoll = setInterval(function() {
+            function fail(msg) {
+                clearInterval(_tmlExportPoll);
+                tmlResetExportBtn();
+                st.style.color = '#c62828';
+                st.textContent = msg;
+            }
+            fetch(statusUrl, { cache: 'no-store' })
+                .then(function(r) { return r.json(); })
+                .then(function(s) {
+                    if (s.state === 'done') {
+                        clearInterval(_tmlExportPoll);
+                        _tmlExporting = false;
+                        go.textContent = 'Downloaded';
+                        st.style.color = '#2e7d32';
+                        st.textContent = 'Export complete.';
+                        setTimeout(function() { tmlHideExport(); tmlResetExportBtn(); }, 1200);
+                    } else if (s.state === 'error') {
+                        fail('Export failed: ' + (s.error || 'unknown error'));
+                    } else if (Date.now() - startedAt > 20000) {
+                        fail('Export did not start (no response from the plugin service).');
+                    }
+                })
+                .catch(function() {
+                    if (Date.now() - startedAt > 20000) fail('Export did not start (service unreachable).');
+                });
+        }, 600);
     }
 
     /* ---------------- Import ---------------- */

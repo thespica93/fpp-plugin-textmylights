@@ -2,7 +2,7 @@
 
 > Customize the automatic text messages sent back to your visitors.
 
-Configure auto-responses in the **📱 SMS Responses** tab at: **`http://YOUR_FPP_IP:5000`**
+Configure auto-responses in the **📱 SMS Responses** tab of the plugin (**Content Setup → Text My Lights**).
 
 ---
 
@@ -28,7 +28,7 @@ Auto-responses are **optional**. If disabled, visitors receive no reply but thei
 
 ## Enabling Auto-Responses
 
-1. Go to `http://YOUR_FPP_IP:5000`
+1. Open the plugin (**Content Setup → Text My Lights**)
 2. Click the **📱 SMS Responses** tab
 3. Check **Enable SMS Auto-Responses**
 4. Click **💾 Save Configuration**

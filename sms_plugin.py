@@ -5972,7 +5972,7 @@ def index():
                             </div>
 
                             <label>Overlay Model Name: <button type="button" onclick="refreshFPPLists(this)" style="font-size:11px;padding:2px 7px;margin-left:8px;cursor:pointer;">↻ Refresh Lists</button> <span class="help-text" style="font-weight:normal;margin-left:6px;">📝 The pixel overlay model for text (e.g., "Texting Matrix"). On a remote this is local to this projector.</span></label>
-                            <select id="overlay_model_name">
+                            <select id="overlay_model_name" onchange="if(window.refreshStartBtnState)refreshStartBtnState();">
                                 <option value="">-- None --</option>
                             </select>
                         </div>
@@ -7306,23 +7306,37 @@ def index():
             // whether a click should Start (activate) or Stop (deactivate).
             var _pluginLive = false;
 
+            // Grey out Start when this box has no overlay model - text has nowhere to display
+            // without one. When already live the button is "Stop" and stays enabled so you can
+            // always stop. Call on load, on every status poll, and when the overlay selection changes.
+            function refreshStartBtnState() {
+                var btn = document.getElementById('btn_plugin_toggle');
+                if (!btn) return;
+                var ov = ((document.getElementById('overlay_model_name') || {}).value || '').trim();
+                var block = !ov && !_pluginLive;
+                btn.disabled = block;
+                btn.style.opacity = block ? '0.45' : '';
+                btn.style.cursor = block ? 'not-allowed' : 'pointer';
+                btn.title = block ? 'Select an overlay model first — text has nowhere to display without one.' : '';
+            }
+            window.refreshStartBtnState = refreshStartBtnState;
+
             function pluginToggle() {
                 var btn = document.getElementById('btn_plugin_toggle');
+                if (btn && btn.disabled) return;   // greyed out (no overlay) - do nothing
                 var goingLive = !_pluginLive;
                 var url = goingLive ? '/api/activate' : '/api/deactivate';
                 btn.disabled = true; btn.textContent = '...';
                 fetch(url, {method:'POST'})
                 .then(r => r.json())
                 .then(function(d) {
-                    // Start is refused (no overlay model and no remotes = nowhere to display).
-                    // There is no "start anyway" - show why and leave the plugin stopped.
                     if (goingLive && d.success === false) {
                         alert('Start failed: ' + (d.error || 'Unknown error'));
                     }
                     updateLiveStatus();
                 })
                 .catch(function() { alert((goingLive ? 'Start' : 'Stop') + ' request failed.'); })
-                .finally(function() { btn.disabled = false; });
+                .finally(function() { btn.disabled = false; refreshStartBtnState(); });
             }
 
             function updateLiveStatus() {
@@ -7345,6 +7359,7 @@ def index():
                         toggle.textContent = live ? '■ Stop' : '▶ Start';
                         toggle.style.background = live ? '#c62828' : '#2e7d32';
                     }
+                    refreshStartBtnState();   // keep the no-overlay grey-out in sync with live state
 
                     // Testing tab banner (show is NOT live warning)
                     const notLiveBanner = document.getElementById('show_not_live_banner');
@@ -10252,12 +10267,6 @@ def update_config():
                 requests.put(f"{FPP_HOST}/api/overlays/model/{_up.quote(_old_overlay)}/state",
                              json={"State": 0}, timeout=3)
                 logging.info(f"🛑 Overlay model set to None - stopped local playback and cleared '{_old_overlay}'")
-                # With no overlay AND no remote there is nowhere to display, so the plugin can't be
-                # "live" - take it not-live (the same condition that refuses Start). A connected
-                # remote keeps it live (it renders there); this box just stays dark locally.
-                if config.get('enabled') and not is_remote() and not discover_remotes(force=True):
-                    config['enabled'] = False
-                    logging.info("🛑 Overlay None and no remotes - plugin set not-live (nowhere to display)")
             except Exception as _e:
                 logging.warning(f"Could not stop local playback on overlay clear: {_e}")
 
@@ -13438,32 +13447,11 @@ def api_activate():
         logging.error(msg)
         return jsonify({"success": False, "error": msg}), 400
 
-    # Hard requirement: text needs somewhere to display. If this master has no overlay model of
-    # its own AND no remote projector is connected to render pushed names, there is nowhere for
-    # names to show, so REFUSE to start (no "start anyway" bypass - a scheduled/script start can't
-    # answer a prompt anyway, and we never want to report a successful start that shows nothing).
-    # force=True refreshes discovery so a just-connected remote is seen.
-    _gate_overlay = (config.get('overlay_model_name', '') or '').strip()
-    _gate_remotes = discover_remotes(force=True)
-    logging.info(f"▶️ Start requested (build {PLUGIN_BUILD}): overlay={_gate_overlay or 'None'}, "
-                 f"remotes_found={len(_gate_remotes)} {_gate_remotes}")
-    if not _gate_overlay and not _gate_remotes:
-        msg = ("Can't start Text My Lights: no overlay model is selected on this master and no "
-               "remote projectors are connected, so texted names have nowhere to display. Select "
-               "an overlay model (Settings → Overlay Model Name) or connect a remote projector, "
-               "then start again.")
-        logging.warning("⛔ Start refused: no overlay model and no remotes connected - nowhere to render")
-        # Never leave a stale "live" state with nowhere to display: force not-live and tear down any
-        # leftover background from a prior overlay run (e.g. overlay was cleared after starting, or a
-        # persisted enabled=True carried across a reboot). This also corrects the UI on the next
-        # Start click without needing a separate Stop.
-        config['enabled'] = False
-        save_config()
-        try:
-            stop_show_playback()
-        except Exception:
-            pass
-        return jsonify({"success": False, "error": msg}), 400
+    # Needing an overlay to display text is enforced in the UI by greying out the Start button
+    # (refreshStartBtnState) - we deliberately do NOT block here, keeping this path simple. The
+    # "no overlay + no remotes" dead-end is still surfaced by the warning banner (updateRemotesIndicator).
+    logging.info(f"▶️ Start requested (build {PLUGIN_BUILD}): "
+                 f"overlay={(config.get('overlay_model_name', '') or '').strip() or 'None'}")
 
     config['enabled'] = True
     stop_polling = False
@@ -13554,27 +13542,6 @@ if __name__ == '__main__':
         except Exception as e:
             logging.warning(f"Boot scheduler-script sync failed: {e}")
     threading.Thread(target=_sync_scripts_after_boot, daemon=True).start()
-
-    # Self-heal a stale "live" state: if this MASTER persisted enabled=True (e.g. started earlier,
-    # or an old "start anyway") but now has no overlay model AND no remotes, there is nowhere to
-    # display - so it must not report "live". Deferred so MultiSync peer discovery has time to find
-    # any remotes first (never un-live a master whose only display is a remote that is still booting).
-    def _heal_stale_live_after_boot():
-        try:
-            time.sleep(12)
-            if (config.get('enabled') and not is_remote()
-                    and not (config.get('overlay_model_name', '') or '').strip()
-                    and not discover_remotes(force=True)):
-                config['enabled'] = False
-                save_config()
-                try:
-                    stop_show_playback()
-                except Exception:
-                    pass
-                logging.warning("🛑 Boot self-heal: was 'live' with no overlay and no remotes - set not-live")
-        except Exception as e:
-            logging.warning(f"Boot stale-live self-heal failed: {e}")
-    threading.Thread(target=_heal_stale_live_after_boot, daemon=True).start()
 
     # Clean up log files older than 7 days
     cleanup_old_logs()

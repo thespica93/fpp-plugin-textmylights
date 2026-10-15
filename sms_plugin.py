@@ -9241,9 +9241,15 @@ def index():
 
                     if (ct.type === 'seq') {
                         // ---- FSEQ: fetch info then show scrubber ----
-                        var model = document.getElementById('overlay_model_name').value || '';
-                        fetch('/api/fseq/info?sequence=' + encodeURIComponent(ct.file)
-                                              + '&model=' + encodeURIComponent(model))
+                        // Preview-from-remote: the .fseq lives on the REMOTE (the master may not
+                        // have it), so pull the timeline (fps/frames/duration) from that projector.
+                        // Frames themselves are rendered by the remote via doFseqFetch below.
+                        var _seqInfoUrl = window._previewRemote
+                            ? ('/api/plugin/remote-fseq-info?remote=' + encodeURIComponent(window._previewRemote.address)
+                               + '&content=' + encodeURIComponent('seq:' + ct.file))
+                            : ('/api/fseq/info?sequence=' + encodeURIComponent(ct.file)
+                               + '&model=' + encodeURIComponent(document.getElementById('overlay_model_name').value || ''));
+                        fetch(_seqInfoUrl)
                             .then(function(r) { return r.json(); })
                             .then(function(data) {
                                 if (data.error) {
@@ -10205,6 +10211,12 @@ def update_config():
                 requests.put(f"{FPP_HOST}/api/overlays/model/{_up.quote(_old_overlay)}/state",
                              json={"State": 0}, timeout=3)
                 logging.info(f"🛑 Overlay model set to None - stopped local playback and cleared '{_old_overlay}'")
+                # With no overlay AND no remote there is nowhere to display, so the plugin can't be
+                # "live" - take it not-live (the same condition that refuses Start). A connected
+                # remote keeps it live (it renders there); this box just stays dark locally.
+                if config.get('enabled') and not is_remote() and not discover_remotes(force=True):
+                    config['enabled'] = False
+                    logging.info("🛑 Overlay None and no remotes - plugin set not-live (nowhere to display)")
             except Exception as _e:
                 logging.warning(f"Could not stop local playback on overlay clear: {_e}")
 
@@ -11672,6 +11684,25 @@ def api_plugin_remote_layout():
         return jsonify(r.json())
     except Exception as e:
         return jsonify({"found": False, "error": f"Could not reach remote: {e}"}), 502
+
+
+@app.route('/api/plugin/remote-fseq-info')
+def api_plugin_remote_fseq_info():
+    """Master (browser-facing): FSEQ timeline metadata for a content on a synced REMOTE, so the
+    remote-preview scrubber is sized by the projector that actually has the .fseq (the master may
+    not). Proxies to the remote's /api/tml/fseq-info, SSRF-guarded against the synced list."""
+    if is_remote():
+        return jsonify({"error": "not a master"}), 409
+    addr = request.args.get('remote', '').strip()
+    content = request.args.get('content', '')
+    base = _synced_remote_base(addr)
+    if not base:
+        return jsonify({"error": "unknown or not-synced remote"}), 404
+    try:
+        r = requests.get(f"{base}/api/tml/fseq-info", params={"content": content}, timeout=4)
+        return jsonify(r.json()), r.status_code
+    except Exception as e:
+        return jsonify({"error": f"Could not reach remote: {e}"}), 502
 
 
 @app.route('/api/plugin/remote-config', methods=['POST'])
@@ -13193,6 +13224,26 @@ def api_tml_editinfo():
                     "layout": layout})
 
 
+@app.route('/api/tml/fseq-info', methods=['GET'])
+def api_tml_fseq_info():
+    """Peer (master) -> this instance: FSEQ timeline metadata (fps / frame_count / duration) for a
+    content id whose .fseq lives on THIS box, so the master's remote-preview can size its scrubber
+    for a projector that has the file even when the master itself does not. The frame pixels come
+    from /api/tml/render-frame; this is just the timeline."""
+    seq = (request.args.get('content', '') or '').strip()
+    name = os.path.basename(seq.removeprefix('seq:').removesuffix('.fseq'))
+    filepath = os.path.join(FSEQ_SEQUENCE_PATH, name + '.fseq')
+    if not name or not os.path.exists(filepath):
+        return jsonify({'error': f'Sequence not found: {name}.fseq'}), 404
+    try:
+        hdr = parse_fseq_header(filepath)
+        return jsonify({'frame_count': hdr['frame_count'], 'fps': round(hdr['fps'], 3),
+                        'duration_ms': hdr['duration_ms'], 'channel_count': hdr['channel_count'],
+                        'step_time_ms': hdr['step_time_ms']})
+    except Exception as e:
+        return _client_error("api_tml_fseq_info", e, 500)
+
+
 @app.route('/api/tml/remote-config', methods=['POST'])
 def api_tml_remote_config():
     """Remote: apply a text layout the master (the one this remote is pinned to) edited in its
@@ -13346,6 +13397,16 @@ def api_activate():
                "an overlay model (Settings → Overlay Model Name) or connect a remote projector, "
                "then start again.")
         logging.warning("⛔ Start refused: no overlay model and no remotes connected - nowhere to render")
+        # Never leave a stale "live" state with nowhere to display: force not-live and tear down any
+        # leftover background from a prior overlay run (e.g. overlay was cleared after starting, or a
+        # persisted enabled=True carried across a reboot). This also corrects the UI on the next
+        # Start click without needing a separate Stop.
+        config['enabled'] = False
+        save_config()
+        try:
+            stop_show_playback()
+        except Exception:
+            pass
         return jsonify({"success": False, "error": msg}), 400
 
     config['enabled'] = True
@@ -13437,6 +13498,27 @@ if __name__ == '__main__':
         except Exception as e:
             logging.warning(f"Boot scheduler-script sync failed: {e}")
     threading.Thread(target=_sync_scripts_after_boot, daemon=True).start()
+
+    # Self-heal a stale "live" state: if this MASTER persisted enabled=True (e.g. started earlier,
+    # or an old "start anyway") but now has no overlay model AND no remotes, there is nowhere to
+    # display - so it must not report "live". Deferred so MultiSync peer discovery has time to find
+    # any remotes first (never un-live a master whose only display is a remote that is still booting).
+    def _heal_stale_live_after_boot():
+        try:
+            time.sleep(12)
+            if (config.get('enabled') and not is_remote()
+                    and not (config.get('overlay_model_name', '') or '').strip()
+                    and not discover_remotes(force=True)):
+                config['enabled'] = False
+                save_config()
+                try:
+                    stop_show_playback()
+                except Exception:
+                    pass
+                logging.warning("🛑 Boot self-heal: was 'live' with no overlay and no remotes - set not-live")
+        except Exception as e:
+            logging.warning(f"Boot stale-live self-heal failed: {e}")
+    threading.Thread(target=_heal_stale_live_after_boot, daemon=True).start()
 
     # Clean up log files older than 7 days
     cleanup_old_logs()

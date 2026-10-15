@@ -7497,6 +7497,7 @@ def index():
                 var content = _currentContentId();
                 var note = document.getElementById('preview_remote_note');
                 window._loadingTarget = true;
+                window._editTargetFound = false;   // block pushes until we confirm the remote has it
                 if (note) note.textContent = 'Loading ' + t.name + '…';
                 fetch('/api/plugin/remote-layout?remote=' + encodeURIComponent(t.address)
                       + '&content=' + encodeURIComponent(content))
@@ -7511,12 +7512,16 @@ def index():
                     window._canvasModelH = t.h || d.model_h || 270;
                     _reshapeCanvasToModel();
                     window.applyLayoutToEditor(L || undefined);   // undefined -> blank layout
+                    // Only edits to content the remote ACTUALLY has are pushed back. If it doesn't
+                    // have this content, we must never push - that would overwrite/append a blank
+                    // layout on the remote (wiping its real one and churning its list).
+                    window._editTargetFound = !!d.found;
                     if (note) note.textContent = d.found
                         ? ('Editing “' + t.name + '” — changes save to that projector.')
-                        : ('“' + t.name + '” has no layout for this content yet — your edits create it.');
+                        : ('“' + t.name + '” doesn’t have this content, so there’s nothing to edit here — add/sync it on that projector first.');
                     if (typeof window.loadBgPreview === 'function') window.loadBgPreview();
                   })
-                  .catch(function(){ if (note) note.textContent = 'Could not reach ' + t.name + '.'; })
+                  .catch(function(){ window._editTargetFound = false; if (note) note.textContent = 'Could not reach ' + t.name + '.'; })
                   .finally(function(){ window._loadingTarget = false; });
             }
             window.loadRemoteIntoEditor = loadRemoteIntoEditor;
@@ -7566,6 +7571,10 @@ def index():
             }
             function _doRemotePush() {
                 var t = window._editTarget; if (!t) return;
+                // Never push for content the remote doesn't have - that would overwrite its real
+                // layout with a blank one (and churn its list). The user must add/sync the content
+                // on that projector first; then found becomes true and edits save.
+                if (!window._editTargetFound) return;
                 var content = _currentContentId();
                 var status = document.getElementById('autosave_status');
                 if (status) { status.style.color = '#888'; status.textContent = 'Saving to ' + t.name + '…'; }
@@ -8076,7 +8085,10 @@ def index():
                         if (cb.x !== -1 && cb.x + cb.w > mw) { cb.x = Math.max(0, mw - cb.w); _clampChanged = true; }
                         if (cb.y !== -1 && cb.y + cb.h > mh) { cb.y = Math.max(0, mh - cb.h); _clampChanged = true; }
                     }
-                    if (_clampChanged && typeof saveConfig === 'function') saveConfig();
+                    // Auto-clamp is a visual fix, not a user edit. When editing a REMOTE, never let
+                    // it trigger a push (the remote clamps its own boxes to its model on render);
+                    // pushing here would silently overwrite the remote. Only persist for "This box".
+                    if (_clampChanged && !window._editTarget && typeof saveConfig === 'function') saveConfig();
 
                     // Precompute each non-empty line's scaled box height for auto-stacking
                     var boxHeights = [0, 0, 0, 0], totalStackHeight = 0;

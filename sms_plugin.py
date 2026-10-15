@@ -89,6 +89,21 @@ def _stop_scroll_thread(timeout=2.0):
 # Configuration
 PLUGIN_DIR      = os.path.dirname(os.path.abspath(__file__))
 
+
+def _compute_build():
+    """Short git commit of the INSTALLED plugin, surfaced in the UI + /api/version so we can tell
+    at a glance which code a Pi is ACTUALLY running - pushing to git != deployed on the device.
+    Returns 'unknown' if this isn't a git checkout."""
+    try:
+        import subprocess
+        return (subprocess.check_output(['git', '-C', PLUGIN_DIR, 'rev-parse', '--short', 'HEAD'],
+                                        stderr=subprocess.DEVNULL, timeout=3).decode().strip() or 'unknown')
+    except Exception:
+        return 'unknown'
+
+
+PLUGIN_BUILD = _compute_build()
+
 # All runtime data lives under one plugin folder, at the FPP-guideline location
 # /home/fpp/media/plugindata/<repo>/.
 PLUGIN_DATA_DIR = "/home/fpp/media/plugindata/fpp-plugin-textmylights"
@@ -999,9 +1014,14 @@ def sync_names_content_from_master():
         if cid in existing:
             item = existing[cid]                    # keep this remote's own layout
         else:
-            item = _names_item_defaults()
+            # New content from the master: seed it from THIS remote's own standalone layout
+            # (boxes, sizes, colors, fonts, positions) rather than hardcoded center defaults, so a
+            # remote that was positioned on its own KEEPS that look the moment it connects to a
+            # master. Only the content id and (when blank) the name line are defaulted.
+            item = _names_item_from_flat_config()
             item['content'] = cid
-            item['message_lines'] = ['{name}', '', '', '']   # sensible starting layout
+            if not any((s or '').strip() for s in item.get('message_lines', [])):
+                item['message_lines'] = ['{name}', '', '', '']
         # Timing is the master's: mirror its duration so this remote's preview scrubber matches
         # (the live display already runs for the master's pushed duration). Re-syncs whenever the
         # master changes it, via the signature check below.
@@ -5694,8 +5714,17 @@ def index():
 
         <!-- SMS cost disclaimer - shown on every role (master and remote) -->
         <div style="background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn-fg); border-radius:6px; padding:10px 14px; margin:14px 0 0 0; font-size:13px; line-height:1.5;">
+            <span id="tml-build-badge" style="float:right; opacity:0.7; font-size:11px; font-weight:bold;">build …</span>
             <strong>DISCLAIMER:</strong> The author of this plugin is NOT responsible for SMS charges that may be incurred by using this plugin, or any inappropriate content that may be displayed from incorrectly configured settings.
         </div>
+        <script>
+            // Show which commit THIS box is actually running - so "did the update land?" is a
+            // glance, not a guess. Master and remote each show their own.
+            fetch('/api/version').then(function(r){return r.json();}).then(function(d){
+                var e = document.getElementById('tml-build-badge');
+                if (e) e.textContent = 'build ' + (d.build || '?') + (d.role ? ' · ' + d.role : '');
+            }).catch(function(){});
+        </script>
 
         <!-- Tab navigation -->
         <div class="tabs" style="display:flex; align-items:center; gap:2px;">
@@ -11709,11 +11738,15 @@ def api_plugin_remote_fseq_info():
     content = request.args.get('content', '')
     base = _synced_remote_base(addr)
     if not base:
+        logging.info(f"🎚️ remote-fseq-info: '{addr}' not a synced remote (have: "
+                     f"{[r['address'] for r in discover_remotes_detailed()]})")
         return jsonify({"error": "unknown or not-synced remote"}), 404
     try:
         r = requests.get(f"{base}/api/tml/fseq-info", params={"content": content}, timeout=4)
+        logging.info(f"🎚️ remote-fseq-info {addr} content={content!r} -> {r.status_code} {str(r.json())[:120]}")
         return jsonify(r.json()), r.status_code
     except Exception as e:
+        logging.warning(f"🎚️ remote-fseq-info {addr} content={content!r} FAILED: {e}")
         return jsonify({"error": f"Could not reach remote: {e}"}), 502
 
 
@@ -13124,6 +13157,13 @@ def view_messages():
 # ── Multi-instance (master/remote) endpoints ────────────────────────────────
 # Authenticated in _require_access_token by trusting known FPP MultiSync peers (no secret).
 
+@app.route('/api/version')
+def api_version():
+    """The commit this instance is running, so the UI/log can prove whether a Pi has the latest
+    code. Loopback/token-gated like the rest of the browser API."""
+    return jsonify({"build": PLUGIN_BUILD, "role": get_plugin_role()})
+
+
 @app.route('/api/tml/ping', methods=['GET'])
 def api_tml_ping():
     """Identify this instance to a discovering peer: plugin name + effective role, a friendly
@@ -13403,7 +13443,11 @@ def api_activate():
     # names to show, so REFUSE to start (no "start anyway" bypass - a scheduled/script start can't
     # answer a prompt anyway, and we never want to report a successful start that shows nothing).
     # force=True refreshes discovery so a just-connected remote is seen.
-    if not (config.get('overlay_model_name', '') or '').strip() and not discover_remotes(force=True):
+    _gate_overlay = (config.get('overlay_model_name', '') or '').strip()
+    _gate_remotes = discover_remotes(force=True)
+    logging.info(f"▶️ Start requested (build {PLUGIN_BUILD}): overlay={_gate_overlay or 'None'}, "
+                 f"remotes_found={len(_gate_remotes)} {_gate_remotes}")
+    if not _gate_overlay and not _gate_remotes:
         msg = ("Can't start Text My Lights: no overlay model is selected on this master and no "
                "remote projectors are connected, so texted names have nowhere to display. Select "
                "an overlay model (Settings → Overlay Model Name) or connect a remote projector, "

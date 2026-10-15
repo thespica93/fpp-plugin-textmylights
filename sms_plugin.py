@@ -13456,16 +13456,19 @@ def api_activate():
         return jsonify({"success": True, "playlist_started": result, "role": "remote",
                         "message": "Text My Lights remote activated"})
 
-    # Master: must have its own overlay OR at least one connected remote to render on.
-    _remotes = [] if _has_overlay else discover_remotes(force=True)
+    # Master: must have its own overlay OR at least one remote SYNCED TO THIS MASTER to render on.
+    # Use the synced-remote list (discover_remotes_detailed, same source the Start button uses) -
+    # NOT any reachable plugin-remote - so a remote pinned to a different master (or nobody) doesn't
+    # let this one start into nothing.
+    _synced = [] if _has_overlay else discover_remotes_detailed(force=True)
     logging.info(f"▶️ Start requested (build {PLUGIN_BUILD}): "
                  f"overlay={(config.get('overlay_model_name', '') or '').strip() or 'None'}, "
-                 f"remotes_found={len(_remotes)}")
-    if not _has_overlay and not _remotes:
-        msg = ("Can't start Text My Lights: no overlay model is selected and no remote projector "
-               "is connected, so texted names have nowhere to display. Select an overlay model or "
-               "connect a remote projector, then start again.")
-        logging.warning("⛔ Start refused (master): no overlay and no remotes")
+                 f"synced_remotes={len(_synced)} {[r.get('name') for r in _synced]}")
+    if not _has_overlay and not _synced:
+        msg = ("Can't start Text My Lights: no overlay model is selected and no remote projector is "
+               "synced to this master, so texted names have nowhere to display. Select an overlay "
+               "model, or pin a remote to this master (on the remote: Sync to Master), then start again.")
+        logging.warning("⛔ Start refused (master): no overlay and no synced remotes")
         return jsonify({"success": False, "error": msg}), 400
 
     # Require waiting content - a single default_playlist or a rotation list. Without one

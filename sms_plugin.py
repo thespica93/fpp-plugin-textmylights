@@ -7313,11 +7313,14 @@ def index():
                 var btn = document.getElementById('btn_plugin_toggle');
                 if (!btn) return;
                 var ov = ((document.getElementById('overlay_model_name') || {}).value || '').trim();
-                var block = !ov && !_pluginLive;
+                // A master can also render on a connected remote (set by updateRemotesIndicator), so
+                // only grey out when there is NO target at all: no local overlay AND no remote.
+                var hasTarget = ov || window._masterHasRemote;
+                var block = !hasTarget && !_pluginLive;
                 btn.disabled = block;
                 btn.style.opacity = block ? '0.45' : '';
                 btn.style.cursor = block ? 'not-allowed' : 'pointer';
-                btn.title = block ? 'Select an overlay model first — text has nowhere to display without one.' : '';
+                btn.title = block ? 'Select an overlay model, or connect a remote projector, before starting — text has nowhere to display.' : '';
             }
             window.refreshStartBtnState = refreshStartBtnState;
 
@@ -7398,6 +7401,10 @@ def index():
                 fetch('/api/tml/remotes').then(function(r){ return r.json(); }).then(function(d){
                     if (!d || d.role !== 'master') { el.style.display = 'none'; return; }
                     updatePreviewRemotes(d.remotes || [], (d.overlay_model || '').trim());
+                    // A connected remote is a valid render target, so it should un-grey Start even
+                    // with no local overlay. Feed that into the button state.
+                    window._masterHasRemote = (d.count > 0);
+                    if (typeof refreshStartBtnState === 'function') refreshStartBtnState();
                     el.style.display = 'block';
                     if (d.count > 0) {
                         var names = (d.remotes || []).map(function(x){ return x.name; }).filter(Boolean).join(', ');
@@ -13428,16 +13435,38 @@ def api_activate():
     """FPP scheduler hook: enable the plugin, start SMS polling, and start the waiting playlist."""
     global polling_thread, stop_polling
 
+    # Text needs an overlay model to display on. The UI greys out Start without one; enforce the
+    # same rule here so the scheduler SCRIPT (TextMyLightsStart, no UI to grey) can't start with
+    # nothing to display either. A master can display on its OWN overlay OR push to a connected
+    # remote; a remote displays only on its own overlay. Refuse when there's no target - no popup.
+    _has_overlay = bool((config.get('overlay_model_name', '') or '').strip())
+
     # A remote never polls/responds - it just needs to be enabled to render pushed names and
     # show its own waiting content as a fallback until the master pushes. Skip the
     # content-required check + polling for remotes.
     if is_remote():
+        if not _has_overlay:
+            logging.warning("⛔ Start refused (remote): no overlay model selected")
+            return jsonify({"success": False,
+                            "error": "Can't start: no overlay model is selected on this remote."}), 400
         config['enabled'] = True
         save_config()
         result = start_waiting_content()
         logging.info("✅ Text My Lights Start (remote) - ready to receive names from the master")
         return jsonify({"success": True, "playlist_started": result, "role": "remote",
                         "message": "Text My Lights remote activated"})
+
+    # Master: must have its own overlay OR at least one connected remote to render on.
+    _remotes = [] if _has_overlay else discover_remotes(force=True)
+    logging.info(f"▶️ Start requested (build {PLUGIN_BUILD}): "
+                 f"overlay={(config.get('overlay_model_name', '') or '').strip() or 'None'}, "
+                 f"remotes_found={len(_remotes)}")
+    if not _has_overlay and not _remotes:
+        msg = ("Can't start Text My Lights: no overlay model is selected and no remote projector "
+               "is connected, so texted names have nowhere to display. Select an overlay model or "
+               "connect a remote projector, then start again.")
+        logging.warning("⛔ Start refused (master): no overlay and no remotes")
+        return jsonify({"success": False, "error": msg}), 400
 
     # Require waiting content - a single default_playlist or a rotation list. Without one
     # the show has no defined state.
@@ -13446,12 +13475,6 @@ def api_activate():
         msg = "ERROR: No Default Waiting Content configured. Set one in the plugin settings before running Text My Lights Start."
         logging.error(msg)
         return jsonify({"success": False, "error": msg}), 400
-
-    # Needing an overlay to display text is enforced in the UI by greying out the Start button
-    # (refreshStartBtnState) - we deliberately do NOT block here, keeping this path simple. The
-    # "no overlay + no remotes" dead-end is still surfaced by the warning banner (updateRemotesIndicator).
-    logging.info(f"▶️ Start requested (build {PLUGIN_BUILD}): "
-                 f"overlay={(config.get('overlay_model_name', '') or '').strip() or 'None'}")
 
     config['enabled'] = True
     stop_polling = False

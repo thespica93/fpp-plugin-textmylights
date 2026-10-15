@@ -7570,7 +7570,19 @@ def index():
                     if (note) note.textContent = d.found
                         ? ('Editing “' + t.name + '” — changes save to that projector.')
                         : ('“' + t.name + '” doesn’t have this content, so there’s nothing to edit here — add/sync it on that projector first.');
-                    if (typeof window.loadBgPreview === 'function') window.loadBgPreview();
+                    if (typeof window.loadBgPreview === 'function') {
+                        window.loadBgPreview();
+                        // The first background/scrubber paint can be lost to an init race (the
+                        // synced-remote discovery cache warming, or the canvas settling), which is
+                        // why it used to only appear after switching tabs / refreshing. Re-run it
+                        // once shortly after so it shows on its own. Guard on still editing THIS
+                        // remote so a quick re-select doesn't double-fetch the wrong projector.
+                        var _tgtAddr = t.address;
+                        setTimeout(function(){
+                            if (window._editTarget && window._editTarget.address === _tgtAddr
+                                && typeof window.loadBgPreview === 'function') window.loadBgPreview();
+                        }, 1200);
+                    }
                   })
                   .catch(function(){ window._editTargetFound = false; if (note) note.textContent = 'Could not reach ' + t.name + '.'; })
                   .finally(function(){ window._loadingTarget = false; });
@@ -9275,7 +9287,19 @@ def index():
 
                 function loadBgPreview() {
                     var ct = getConfiguredContent();
-                    if (!ct) return;
+                    if (!ct) {
+                        // Nothing previewable behind the text (no sequence/image/video set for this
+                        // item). Say so instead of silently leaving a black background + no scrubber.
+                        var _le0 = document.getElementById('fseq_load_status');
+                        if (_le0) {
+                            _le0.textContent = window._previewRemote
+                                ? 'No sequence or image is set for this content, so there is no background to preview behind the text.'
+                                : '';
+                            _le0.style.color = '#ff9800';
+                        }
+                        var _sr0 = document.getElementById('fseq_scrubber_row'); if (_sr0) _sr0.style.display = 'none';
+                        return;
+                    }
                     _contentType = ct.type;
                     _contentFile = ct.file;
                     _fseqSeq     = (ct.type === 'seq') ? ct.file : null;

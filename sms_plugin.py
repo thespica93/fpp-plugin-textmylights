@@ -1218,6 +1218,13 @@ def _now_ms():
     return int(time.time() * 1000)
 
 
+def _master_epoch_now():
+    """Current time expressed in the MASTER's epoch-ms, on either role: the master's own clock,
+    or a remote's clock plus the measured offset. Lets the master and a remote log the SAME real
+    instant as directly comparable numbers, so a trigger-time skew between boxes is visible."""
+    return int(_now_ms() + (_master_clock_offset_ms if is_remote() else 0))
+
+
 def _master_ts_to_local_ms(ts):
     """Remote: convert a master-epoch-ms timestamp to THIS box's epoch-ms wall-clock, applying
     the measured clock offset (master_ts - offset). On the master (offset 0) this is identity."""
@@ -4450,6 +4457,13 @@ def send_to_fpp(name, override=None, preselected=_UNSET):
                     # overlay model renders on top with correct text colors.
                     seq_name = name_playlist[4:].removesuffix('.fseq')
                     effect_url = f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Start')}/{urllib.parse.quote(seq_name)}/true/true"
+                    # SYNC DIAGNOSTIC: stamp the fire instant in the MASTER's clock so the master's
+                    # and each remote's log lines are directly comparable. If these numbers match
+                    # across boxes (within ~tens of ms) the clips are co-triggered and any visible
+                    # drift is FPP effect playback, not us; if they differ by hundreds of ms the
+                    # trigger timing is the culprit. offset is this box's measured master-clock skew.
+                    logging.info(f"🎞️ NAME FSEQ '{seq_name}' fire @ master_epoch={_master_epoch_now()}ms "
+                                 f"role={get_plugin_role()} offset={_master_clock_offset_ms:.0f}ms")
                     requests.get(effect_url, timeout=3)
 
                 elif name_playlist.startswith('img:'):
@@ -4642,6 +4656,8 @@ def start_default_playlist(content=None):
             # loop=true, background=true: loops natively, auto-suppressed by foreground
             # sequences, auto-resumes when foreground stops
             effect_url = f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Start')}/{urllib.parse.quote(seq_name)}/true/true"
+            logging.info(f"🎞️ WAITING FSEQ '{seq_name}' fire @ master_epoch={_master_epoch_now()}ms "
+                         f"role={get_plugin_role()} offset={_master_clock_offset_ms:.0f}ms")
             response = requests.get(effect_url, timeout=3)
 
             if response.status_code == 200:
@@ -13618,6 +13634,31 @@ def api_tml_clock():
     master (mini-NTP: offset = t + rtt/2 - t1), so the absolute start_at/end_at timestamps the
     beacon carries line up even if the boxes' NTP isn't perfectly in step. Read-only, no state."""
     return jsonify({"t": _now_ms()})
+
+
+@app.route('/api/tml/sync-status', methods=['GET'])
+def api_tml_sync_status():
+    """Diagnostic readout of this box's sync state - hit it on the master AND each remote and
+    compare. `master_epoch_now` is this box's best estimate of the master's clock right now; the
+    values should match across boxes within tens of ms. `offset_ms` is the remote's measured
+    skew, `last_beacon_age_s` how long since the last beacon (watchdog trips at BEACON_TIMEOUT)."""
+    with _show_lock:
+        show = dict(_show_state) if _show_state else None
+        rsync = dict(_remote_sync_state) if _remote_sync_state else None
+    return jsonify({
+        "role": get_plugin_role(),
+        "now_ms": _now_ms(),
+        "master_epoch_now": _master_epoch_now(),
+        "offset_ms": round(_master_clock_offset_ms, 1),
+        "last_beacon_age_s": round(time.time() - _last_beacon_time, 2) if _last_beacon_time else None,
+        "beacon_timeout_s": BEACON_TIMEOUT,
+        "lead_ms": LEAD_MS,
+        "active_waiting_content": _active_waiting_content,
+        "active_name_content": _active_name_content,
+        "master_show_state": show,            # master only
+        "remote_applied_gen": _remote_applied_gen,   # remote only
+        "remote_sync_state": rsync,           # remote only
+    })
 
 
 @app.route('/api/tml/remotes', methods=['GET'])

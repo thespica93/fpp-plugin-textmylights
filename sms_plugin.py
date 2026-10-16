@@ -604,6 +604,31 @@ _remote_stop_requested = False   # remote side: True once the master broadcasts 
 _last_fpp_mode = None            # last-seen FPP mode role, for the auto-follow watcher
 _fpp_mode_detail = ''            # raw values _fpp_mode_role() last read, for on-device diagnosis
 
+# ── FPP-style closed-loop playback sync ──────────────────────────────────────
+# The master owns one authoritative "show state" expressed in ABSOLUTE master-epoch
+# milliseconds and asserts it to remotes ~2x/sec (master_beacon). Remotes slave to
+# it: they render whatever the latest state says, scheduling the APPEAR at start_at
+# and the DISAPPEAR at end_at, so names flip in lockstep instead of each box timing
+# itself. A monotonically increasing gen lets a remote ignore stale/duplicate pushes
+# and detect the transition it must (re-)render. See master_beacon()/remote_follower().
+_UNSET = object()                # sentinel: "argument not provided" (distinct from None)
+LEAD_MS = 600                    # how far ahead the master schedules an appear/switch so
+                                 # the beacon lands and both sides prep before start_at
+BEACON_INTERVAL = 0.5            # master: seconds between authoritative re-asserts (SYNC analog)
+BEACON_TIMEOUT = 15.0            # remote: stop the show if no beacon from the pinned master for
+                                 # this long (master crashed/off) - never loop waiting forever
+_show_lock = threading.Lock()    # guards _show_state / _show_gen (master) and _remote_sync_state
+_show_gen = 0                    # master: generation counter, bumped on every transition
+_show_state = None               # master: {gen, kind: name|waiting|stopped, content, name,
+                                 # start_at, end_at} - the current authoritative state, or None
+                                 # before the show starts
+_remote_sync_state = None        # remote: last show-state applied from the pinned master's beacon
+_last_beacon_time = 0.0          # remote: local monotonic time the last master beacon arrived
+_master_clock_offset_ms = 0.0    # remote: add to local epoch-ms to get master epoch-ms
+                                 # (master_ts - offset = local wall-clock for that instant)
+_remote_applied_gen = None       # remote: generation of the show-state currently applied (so the
+                                 # follower applies each transition once, and re-locks on a new gen)
+
 
 def _fpp_mode_role():
     """The plugin role implied by FPP's CURRENT mode - 'remote' ONLY when FPP is unambiguously
@@ -1047,15 +1072,191 @@ def sync_names_content_from_master():
     return False
 
 
+def _note_master_clock(t_master, local_recv_ms=None, rtt=None):
+    """Remote: update the master clock offset (add to local epoch-ms to get master epoch-ms).
+    Two sources feed this: an RTT-corrected GET /api/tml/clock sample (pass rtt), and - far more
+    often - the `t` piggybacked on every beacon (one-way; on a LAN latency is ~1ms). Either way
+    the newest value wins, so a master clock jump/reboot self-corrects within one beacon."""
+    global _master_clock_offset_ms
+    if t_master is None:
+        return
+    recv = local_recv_ms if local_recv_ms is not None else _now_ms()
+    _master_clock_offset_ms = t_master + (rtt / 2.0 if rtt else 0) - recv
+
+
+def _sample_master_clock():
+    """Remote: RTT-corrected bootstrap of the clock offset via GET /api/tml/clock (mini-NTP), so
+    the very first beacon already translates correctly before the beacon-carried `t` takes over.
+    No-op without a reachable pinned master."""
+    if not is_remote():
+        return
+    master = _find_master_base()
+    if not master:
+        return
+    try:
+        t0 = _now_ms()
+        r = requests.get(f"{master}/api/tml/clock", timeout=3)
+        t1 = _now_ms()
+        if r.status_code != 200:
+            return
+        t_master = int((r.json() or {}).get('t'))
+    except Exception as e:
+        logging.debug(f"_sample_master_clock: {e}")
+        return
+    _note_master_clock(t_master, local_recv_ms=t1, rtt=t1 - t0)
+    logging.debug(f"⏱️  Clock offset to master: {_master_clock_offset_ms:.0f}ms (rtt {t1 - t0}ms)")
+
+
 def remote_content_sync():
-    """Remote daemon: keep the Name-content dropdown mirrored from the master (~every 15s)."""
+    """Remote daemon: keep the Name-content dropdown mirrored from the master and the master
+    clock offset fresh (~every 15s). The offset lets the follower translate the beacon's
+    absolute master timestamps into this box's own wall-clock."""
     while True:
         try:
             if is_remote():
+                _sample_master_clock()
                 sync_names_content_from_master()
         except Exception as e:
             logging.debug(f"remote_content_sync: {e}")
         time.sleep(15)
+
+
+def remote_follower():
+    """Remote: the closed-loop slave (FPP MultiSync analog). Continuously drives THIS box to
+    match the master's latest authoritative show state (recorded by api_tml_state from the
+    beacon). A name is rendered at its absolute start_at and held until the NEXT state's start_at
+    - so names appear and disappear in lockstep with the master and every other remote, with no
+    per-box countdown to drift. Each generation is applied once; a newer gen re-locks (covers a
+    dropped packet or a remote that joined/rebooted mid-show). A beacon watchdog stops the show
+    if the master goes silent for BEACON_TIMEOUT, so a remote never loops its waiting content
+    forever after the master disappears."""
+    global _remote_applied_gen, _remote_stop_requested
+    logging.info("🛰️  Remote follower thread started")
+    stopped_by_watchdog = False
+    last_overlay_reassert = 0.0
+    while True:
+        try:
+            if not is_remote():
+                time.sleep(0.5)
+                continue
+
+            # Watchdog: pinned master went silent → stop, so we don't loop waiting forever.
+            if _last_beacon_time and (time.time() - _last_beacon_time) > BEACON_TIMEOUT:
+                if not stopped_by_watchdog:
+                    logging.warning(f"🛰️  No beacon from master for >{BEACON_TIMEOUT:.0f}s - "
+                                    f"stopping (master appears gone)")
+                    _remote_stop_requested = True
+                    stop_show_playback()
+                    stopped_by_watchdog = True
+                    _remote_applied_gen = None   # fully re-lock when beacons return
+                time.sleep(0.2)
+                continue
+            stopped_by_watchdog = False
+
+            with _show_lock:
+                st = dict(_remote_sync_state) if _remote_sync_state else None
+            if st is None:
+                time.sleep(0.05)
+                continue
+
+            gen = st.get('gen')
+            kind = st.get('kind')
+            local_start = _master_ts_to_local_ms(st.get('start_at'))
+            if local_start is None:
+                local_start = _now_ms()
+
+            # Not yet time to apply this state - hold whatever is on screen until start_at.
+            if _now_ms() < local_start:
+                time.sleep(min(0.05, max(0.005, (local_start - _now_ms()) / 1000.0)))
+                continue
+
+            if gen == _remote_applied_gen:
+                # Already applied this transition. While a name sits directly on the waiting
+                # background (no names content), FPP can reset the overlay as the background
+                # loops - re-assert State 3 every ~2s, exactly like the master's hold loop.
+                if (kind == 'name' and not (_active_name_content or '')
+                        and (config.get('overlay_model_name', '') or '')
+                        and time.time() - last_overlay_reassert > 2.0):
+                    try:
+                        import urllib.parse as _ul
+                        _m = _ul.quote(config.get('overlay_model_name', ''))
+                        requests.put(f"{FPP_HOST}/api/overlays/model/{_m}/state",
+                                     json={"State": 3}, timeout=2)
+                    except Exception:
+                        pass
+                    last_overlay_reassert = time.time()
+                time.sleep(0.05)
+                continue
+
+            # Apply the transition now (we're at/after start_at and haven't applied this gen).
+            try:
+                if kind == 'name':
+                    _remote_stop_requested = False
+                    send_to_fpp(st.get('name', ''),
+                                override={"content": st.get('content', ''), "duration": None})
+                    last_overlay_reassert = time.time()
+                elif kind == 'waiting':
+                    _remote_stop_requested = False
+                    return_to_default_playlist()                   # clear any name overlay
+                    if (st.get('content') or '') != (_active_waiting_content or ''):
+                        _apply_remote_waiting(st.get('content', ''))  # mirror a rotator switch
+                elif kind == 'stopped':
+                    _remote_stop_requested = True
+                    stop_show_playback()
+                _remote_applied_gen = gen
+            except Exception as e:
+                logging.error(f"remote_follower apply gen {gen} ({kind}): {e}")
+            time.sleep(0.02)
+        except Exception as e:
+            logging.debug(f"remote_follower: {e}")
+            time.sleep(0.2)
+
+
+def _now_ms():
+    """Local wall-clock in epoch milliseconds. The master's own clock IS the authority; a
+    remote converts master timestamps to its own clock with _master_clock_offset_ms."""
+    return int(time.time() * 1000)
+
+
+def _master_ts_to_local_ms(ts):
+    """Remote: convert a master-epoch-ms timestamp to THIS box's epoch-ms wall-clock, applying
+    the measured clock offset (master_ts - offset). On the master (offset 0) this is identity."""
+    if ts is None:
+        return None
+    return int(ts - _master_clock_offset_ms)
+
+
+def _set_show_state(kind, content='', name='', start_at=None, end_at=None, beacon=True):
+    """Master: publish a new AUTHORITATIVE show state and (by default) beacon it immediately.
+    Bumps the monotonic generation so remotes can tell transitions apart and ignore stale
+    pushes. kind is 'name' (appear at start_at, disappear at end_at), 'waiting' (switch the
+    background), or 'stopped' (tear the show down). No-op off-master. Returns the new state."""
+    global _show_gen, _show_state
+    if get_plugin_role() != 'master':
+        return None
+    with _show_lock:
+        _show_gen += 1
+        _show_state = {'gen': _show_gen, 'kind': kind, 'content': content or '',
+                       'name': name or '', 'start_at': start_at, 'end_at': end_at}
+        st = dict(_show_state)
+    if beacon:
+        _beacon_once(st)
+    return st
+
+
+def _beacon_once(state=None):
+    """Master: send one authoritative-state packet to every remote, with the master clock (`t`)
+    piggybacked so the remote can refine its offset. Defaults to the current _show_state."""
+    if get_plugin_role() != 'master':
+        return
+    if state is None:
+        with _show_lock:
+            state = dict(_show_state) if _show_state else None
+    if state is None:
+        return
+    payload = dict(state)
+    payload['t'] = _now_ms()
+    push_state_to_remotes(payload)
 
 
 def push_state_to_remotes(payload):
@@ -1082,12 +1283,14 @@ def push_state_to_remotes(payload):
 
 
 def _push_waiting_state():
-    """Master: tell remotes which waiting/background content is now active (a 'waiting event'
- - content id only, no name) so they mirror the master's rotation pick. The remote ignores
-    a push for content it's already showing, so re-sending is harmless."""
+    """Master: publish the current waiting/background content as the authoritative show state
+    so every remote mirrors the master's rotation pick. The beacon then re-asserts it, and the
+    remote no-ops when already on that content, so re-sending is harmless. Replaces the old
+    content-only push; now carries a generation + kind so it slots into the closed loop."""
     if get_plugin_role() != 'master':
         return
-    push_state_to_remotes({'content': _active_waiting_content})
+    _set_show_state('waiting', content=_active_waiting_content,
+                    start_at=_now_ms(), end_at=None)
 
 
 def broadcast_stop_to_remotes():
@@ -1111,21 +1314,24 @@ def broadcast_stop_to_remotes():
     threading.Thread(target=_worker, daemon=True).start()
 
 
-def master_sync_heartbeat():
-    """Master: re-assert the current WAITING content to remotes every few seconds so a remote
-    that joins late (rebooted, powered on after the master) converges to the same background.
-    Only fires while idle (no name showing); the remote no-ops if already on that content."""
+def master_beacon():
+    """Master: re-assert the authoritative show state to every remote ~2x/sec (BEACON_INTERVAL)
+    - the closed-loop analog of FPP MultiSync's periodic SYNC packet. Remotes re-lock to it each
+    tick, so a dropped packet or a late/rebooted remote converges within one interval instead of
+    drifting. The state carries its own kind, so a 'stopped' master keeps remotes stopped (it no
+    longer re-pushes waiting content and so can't re-arm a stopped remote), a 'name' state keeps
+    them showing the same name over the same absolute window, and a 'waiting' state keeps their
+    background mirrored. When the master goes away entirely the remote's own watchdog stops it."""
     while True:
         try:
-            # Only re-assert while the master's own show is live and idle. A STOPPED or
-            # draining master must not keep pushing waiting content - that would re-arm a
-            # remote that was just told to stop (the waiting push clears its stop flag).
-            if (get_plugin_role() == 'master' and config.get('enabled', False)
-                    and currently_displaying is None):
-                push_state_to_remotes({'content': _active_waiting_content})
+            if get_plugin_role() == 'master':
+                with _show_lock:
+                    st = dict(_show_state) if _show_state else None
+                if st is not None:
+                    _beacon_once(st)
         except Exception as e:
-            logging.debug(f"master_sync_heartbeat: {e}")
-        time.sleep(10)
+            logging.debug(f"master_beacon: {e}")
+        time.sleep(BEACON_INTERVAL)
 
 
 def _coerce_len(seq, n, fill):
@@ -4100,13 +4306,18 @@ def _content_exists_locally(content):
     return True
 
 
-def send_to_fpp(name, override=None):
+def send_to_fpp(name, override=None, preselected=_UNSET):
     """Send name to FPP - Start name sequence and display text overlay.
 
     override (remote path): {'content': <id>, 'duration': <int>} - the master's chosen
     content/timing. The remote renders it with ITS OWN layout (matched item, else flat) and
     falls back to no background switch when it lacks the pushed content. When override is
-    None (master / standalone), content is selected locally exactly as before."""
+    None (master / standalone), content is selected locally.
+
+    preselected (master path): the names-content item already chosen by display_worker (so it
+    could schedule + beacon this name BEFORE rendering). Passing it here avoids re-rolling the
+    round-robin/random cursor. _UNSET means "not provided" (choose now); None means the
+    flat-config fallback was chosen."""
     try:
         fpp_host = FPP_HOST
         # Pick which names content (with its OWN text layout + duration) to use for THIS
@@ -4125,6 +4336,9 @@ def send_to_fpp(name, override=None):
                 _forced_content = ''
             _item = next((it for it in (config.get('names_content_list', []) or [])
                           if it.get('content', '') == _forced_content), None)
+        elif preselected is not _UNSET:
+            # Master: use the item display_worker already picked (and already beaconed).
+            _item = preselected
         else:
             _item = select_names_content_item()
 
@@ -4154,13 +4368,10 @@ def send_to_fpp(name, override=None):
             if override.get('duration'):
                 _active_display_duration = int(override['duration'])
         _active_name_content = name_playlist
-        # Master: mirror this exact name + chosen content + duration to the remotes so every
-        # projector shows the same selection (incl. random/round-robin picks). Skipped when
-        # override is set (this IS a remote applying a push) so remotes never re-push.
-        if override is None and get_plugin_role() == 'master':
-            push_state_to_remotes({'name': name,
-                                   'content': _active_name_content,
-                                   'duration': _active_display_duration})
+        # send_to_fpp is now RENDER-ONLY. The master mirrors the name to remotes through the
+        # authoritative show state + beacon (see display_worker / master_beacon), scheduled on an
+        # absolute timeline so every projector appears and disappears in lockstep - not via a
+        # fire-once push timed independently on each box (the old source of drift).
         # Real selected model, or '' for None. No phantom default: with no overlay this box
         # renders nothing locally (Step 1 and Step 2 below are both gated on it); the name was
         # already pushed to remotes above, which display it on their own overlays.
@@ -4783,6 +4994,46 @@ def _stop_show_playback_locked():
         logging.warning(f"Could not stop FPP playback: {e}")
 
 
+def _sleep_until_ms(local_deadline_ms, interrupt=None):
+    """Sleep until THIS box's wall-clock reaches local_deadline_ms, waking early (every <=100ms)
+    so stop_display or the optional `interrupt` callable can cut it short. Returns True if it
+    ran to the deadline, False if interrupted."""
+    while not stop_display:
+        rem = (local_deadline_ms - _now_ms()) / 1000.0
+        if rem <= 0:
+            return True
+        if interrupt is not None and interrupt():
+            return False
+        time.sleep(min(0.1, rem))
+    return False
+
+
+def _hold_name_until_ms(local_end_ms, reenable_overlay_model, interrupt=None):
+    """Keep a name on screen until local_end_ms. When there is no names content but an overlay
+    model (text sits directly on the waiting background), FPP can reset the overlay state as the
+    waiting content loops/steps, so re-assert State 3 every ~2s to keep the text visible for the
+    whole window. Wakes early for stop_display / `interrupt`. Mirrors the old inline hold loop,
+    but times against an ABSOLUTE deadline so master and remote clear together."""
+    _surl = None
+    if reenable_overlay_model:
+        import urllib.parse as _ul
+        _surl = f"{FPP_HOST}/api/overlays/model/{_ul.quote(reenable_overlay_model)}/state"
+    while not stop_display:
+        rem = (local_end_ms - _now_ms()) / 1000.0
+        if rem <= 0:
+            return
+        if interrupt is not None and interrupt():
+            return
+        if _surl is not None:
+            try:
+                requests.put(_surl, json={"State": 3}, timeout=2)
+            except Exception:
+                pass
+            time.sleep(min(2.0, rem))
+        else:
+            time.sleep(min(0.1, rem))
+
+
 def display_worker():
     """Background worker that displays messages from the queue"""
     global currently_displaying, message_queue, stop_display
@@ -4791,6 +5042,13 @@ def display_worker():
     
     while not stop_display:
         try:
+            # On a REMOTE the output is driven by remote_follower (beacon-locked to the master),
+            # not by a local queue/timer - so the worker stays idle there and never double-drives
+            # the overlay. It owns the display only on a master / standalone box.
+            if is_remote():
+                time.sleep(0.2)
+                continue
+
             with queue_lock:
                 if len(message_queue) == 0:
                     currently_displaying = None
@@ -4805,10 +5063,10 @@ def display_worker():
             save_queue()  # item popped - remove from persistent queue before display starts
 
             currently_displaying = _next_item
-            
+
             name = currently_displaying['name']
             phone = currently_displaying['phone']
-            
+
             logging.info(f"🎬 NOW DISPLAYING: {_mask_name(name)} (from {phone[-4:]})")
 
             try:
@@ -4816,67 +5074,83 @@ def display_worker():
             except Exception as e:
                 logging.error(f"💥 Error updating status to displaying: {e}")
 
+            # ── Schedule this name on the authoritative timeline BEFORE rendering ──────────
+            # Pick the names-content item + duration up front (advances the RR cursor ONCE),
+            # compute an absolute appear/disappear window, and publish it so the beacon carries
+            # this exact name/content/window to every remote. Master and remotes then flip the
+            # overlay at the SAME wall-clock instants (start_at/end_at) - no per-box countdown,
+            # so nothing drifts. send_to_fpp is handed the same preselected item so it renders
+            # the master's own layout without re-rolling the cursor.
+            _item = select_names_content_item()
+            if _item is not None:
+                _content = _item.get('content', '') or ''
+                _duration = int(_item.get('display_duration', config.get('display_duration', 30)) or 30)
+            else:
+                _content = config.get('name_display_playlist', '') or ''
+                _duration = int(config.get('display_duration', 30) or 30)
+
+            start_at = _now_ms() + LEAD_MS
+            end_at = start_at + _duration * 1000
+            _set_show_state('name', content=_content, name=name,
+                            start_at=start_at, end_at=end_at)   # beacons immediately
+
+            # Wait out the lead so the beacon lands and remotes prep, then render locally AT
+            # start_at. The master's own clock is the authority, so start_at is already local.
+            _sleep_until_ms(start_at)
+
             try:
-                # On a remote, the item carries the master's pushed {content, duration}.
-                send_to_fpp(name, override=currently_displaying.get('override'))
+                send_to_fpp(name, preselected=_item)
             except Exception as e:
                 logging.error(f"💥 Error sending to FPP: {e}")
 
-            # Per-content duration chosen by send_to_fpp for the item actually shown.
-            display_duration = int(_active_display_duration or config.get('display_duration', 30))
-
             try:
-                name_playlist_chk = _active_name_content or ''
-                overlay_model_chk = config.get('overlay_model_name', '')
-                if not name_playlist_chk and overlay_model_chk:
-                    # No names content - FPP can reset the overlay state while the waiting
-                    # content is active (e.g. playlist steps, effect transitions).
-                    # Re-enable State 3 every 2 s to keep the text on screen for the full duration.
-                    import urllib.parse as _ul
-                    _surl = f"{FPP_HOST}/api/overlays/model/{_ul.quote(overlay_model_chk)}/state"
-                    _end = time.time() + display_duration
-                    while time.time() < _end and not stop_display:
-                        try:
-                            requests.put(_surl, json={"State": 3}, timeout=2)
-                        except Exception:
-                            pass
-                        _rem = _end - time.time()
-                        if _rem > 0:
-                            time.sleep(min(2.0, _rem))
-                else:
-                    time.sleep(display_duration)
+                # Hold until the absolute end_at (not a relative sleep). Re-assert the overlay
+                # state when text sits directly on the waiting background (no names content).
+                _reenable = config.get('overlay_model_name', '') if not (_active_name_content or '') else None
+                _hold_name_until_ms(end_at, _reenable)
             except Exception as e:
                 logging.error(f"💥 Error during display: {e}")
-            
-            # Graceful stop: if the show was stopped while names were still displaying/queued,
-            # keep showing each one, but once this was the LAST queued name, stop the waiting
-            # content instead of resuming it. A REMOTE is driven by the master, not its own
-            # `enabled` flag (it's usually never Started locally) - it only stops when the
-            # master has broadcast Stop; otherwise it always returns to its waiting content.
-            try:
-                if is_remote():
-                    stopping = _remote_stop_requested
-                else:
-                    stopping = not config.get('enabled', False)
-                with queue_lock:
-                    more_queued = len(message_queue) > 0
-                if stopping and not more_queued:
-                    logging.info("🛑 Graceful stop: last name shown - stopping waiting content")
-                    stop_show_playback()
-                else:
-                    return_to_default_playlist()
-            except Exception as e:
-                logging.error(f"💥 Error returning to default / stopping: {e}")
-            
-            logging.info(f"✅ FINISHED DISPLAYING: {_mask_name(name)}")
-            
+
             try:
                 update_message_status(phone, name, "displayed")
             except Exception as e:
                 logging.error(f"💥 Error updating status to displayed: {e}")
-            
+
+            # Decide what replaces this name - and publish it as the NEXT authoritative state so
+            # the name DISAPPEARS exactly when its replacement APPEARS, simultaneously on every
+            # box (the name stays up until the next state's start_at; no box clears on its own
+            # clock). Three cases:
+            #   stop  → publish 'stopped' (+ the one-shot broadcast) and tear this box down,
+            #   more  → leave the name up; the next loop iteration schedules the next name, which
+            #           appears at its start_at and thereby replaces this one with no gap,
+            #   idle  → schedule a 'waiting' return LEAD_MS ahead and clear to it at that instant.
+            try:
+                stopping = not config.get('enabled', False)
+                with queue_lock:
+                    more_queued = len(message_queue) > 0
+                if stopping and not more_queued:
+                    logging.info("🛑 Graceful stop: last name shown - stopping the show")
+                    _set_show_state('stopped', start_at=_now_ms())  # beacon: remotes tear down
+                    broadcast_stop_to_remotes()                     # immediate one-shot too
+                    stop_show_playback()
+                elif more_queued:
+                    # Keep this name on the output; the next name (next iteration) overwrites it
+                    # at its own start_at. Nothing to clear - that's what keeps it flash-free AND
+                    # in lockstep with the remotes, which also hold until the next state.
+                    pass
+                else:
+                    wstart = _now_ms() + LEAD_MS
+                    _set_show_state('waiting', content=_active_waiting_content,
+                                    start_at=wstart, end_at=None)   # beacon: remotes return too
+                    _sleep_until_ms(wstart)
+                    return_to_default_playlist()
+            except Exception as e:
+                logging.error(f"💥 Error scheduling next state: {e}")
+
+            logging.info(f"✅ FINISHED DISPLAYING: {_mask_name(name)}")
+
             currently_displaying = None
-            
+
         except Exception as e:
             logging.error(f"💥 Error in display worker: {e}")
             import traceback
@@ -13338,6 +13612,14 @@ def api_tml_ping():
                     "synced_to_caller": bool(is_remote() and _push_from_selected_master())})
 
 
+@app.route('/api/tml/clock', methods=['GET'])
+def api_tml_clock():
+    """Master clock in epoch milliseconds. A remote samples this to measure its offset from the
+    master (mini-NTP: offset = t + rtt/2 - t1), so the absolute start_at/end_at timestamps the
+    beacon carries line up even if the boxes' NTP isn't perfectly in step. Read-only, no state."""
+    return jsonify({"t": _now_ms()})
+
+
 @app.route('/api/tml/remotes', methods=['GET'])
 def api_tml_remotes():
     """Master: which plugin remotes are currently connected on the MultiSync network, plus
@@ -13525,32 +13807,57 @@ def _push_from_selected_master():
 
 @app.route('/api/tml/state', methods=['POST'])
 def api_tml_state():
-    """Remote: apply the master's chosen display state. A name event ({name, content,
-    duration}) shows that name over the content using THIS instance's own layout; a waiting
-    event ({content}) switches the background. Only remotes act on it, and only when the push
-    comes from the master this remote is pinned to (so several masters can coexist)."""
+    """Remote: record the master's authoritative show state (a beacon packet). The follower
+    thread (remote_follower) is what actually drives the output, scheduling the appear/disappear
+    against the absolute start_at/end_at this packet carries - so this handler just stores the
+    newest state and refreshes the clock offset; it never blocks on rendering. Only remotes act,
+    and only on packets from the master this remote is pinned to (so several masters can coexist).
+
+    Accepts both the new beacon shape ({gen, kind, content, name, start_at, end_at, t}) and, for
+    safety during a mixed-version rollout, the legacy shape ({name|content, duration}) which is
+    coerced into an equivalent state applied immediately."""
     if not is_remote():
         return jsonify({"success": False, "error": "not in remote mode"}), 409
     if not _push_from_selected_master():
         return jsonify({"success": True, "ignored": "not the selected master"})
     data = request.json or {}
-    content = str(data.get('content', '') or '')
-    name = str(data.get('name', '') or '').strip()
-    duration = data.get('duration')
-    global _remote_last_state, _remote_last_state_time, _remote_stop_requested
-    _remote_last_state = {"name": name, "content": content}
-    _remote_last_state_time = time.time()
+    recv = _now_ms()
+    global _remote_sync_state, _remote_last_state, _remote_last_state_time, _last_beacon_time
+    # Any packet from the pinned master counts as a heartbeat for the watchdog + refreshes the
+    # clock offset from the piggybacked master time (one-way; LAN latency ~1ms).
+    _last_beacon_time = time.time()
+    if data.get('t') is not None:
+        try:
+            _note_master_clock(int(data['t']), local_recv_ms=recv)
+        except (TypeError, ValueError):
+            pass
     try:
-        if name:
-            add_to_queue(name, "REMOTE", name,
-                         override={"content": content, "duration": duration})
+        if 'gen' in data and 'kind' in data:
+            # New beacon shape - store if it's newer than what we have (ignore stale/dupes).
+            gen = int(data.get('gen') or 0)
+            st = {'gen': gen, 'kind': str(data.get('kind') or 'waiting'),
+                  'content': str(data.get('content', '') or ''),
+                  'name': str(data.get('name', '') or '').strip(),
+                  'start_at': data.get('start_at'), 'end_at': data.get('end_at')}
+            with _show_lock:
+                cur = _remote_sync_state
+                if cur is None or gen >= int(cur.get('gen') or 0):
+                    _remote_sync_state = st
+            _remote_last_state = {"name": st['name'], "content": st['content']}
+            _remote_last_state_time = time.time()
         else:
-            # A waiting push with real content means the master is live - clear any prior
-            # stop request so this remote resumes returning to its waiting content between
-            # names. (An empty-content push is a stopped/cleared master; don't re-arm on it.)
-            if content:
-                _remote_stop_requested = False
-            _apply_remote_waiting(content)
+            # Legacy shape (older master): synthesize an immediate state so the follower applies
+            # it now. No gen from the sender → mint a locally-increasing one.
+            content = str(data.get('content', '') or '')
+            name = str(data.get('name', '') or '').strip()
+            with _show_lock:
+                prev = int(_remote_sync_state.get('gen') or 0) if _remote_sync_state else 0
+                _remote_sync_state = {'gen': prev + 1,
+                                      'kind': 'name' if name else 'waiting',
+                                      'content': content, 'name': name,
+                                      'start_at': recv, 'end_at': None}
+            _remote_last_state = {"name": name, "content": content}
+            _remote_last_state_time = time.time()
         return jsonify({"success": True})
     except Exception as e:
         return _client_error("api_tml_state", e)
@@ -13656,10 +13963,15 @@ def _deactivate_local():
     if draining:
         logging.info("🛑 Text My Lights Stop: draining - names still playing/queued; "
                      "waiting content will stop after they finish")
+        # The display worker publishes the 'stopped' show-state when the last name finishes, so
+        # the beacon takes the remotes down with us. Nothing to publish here mid-drain.
         return {"success": True, "draining": True,
                 "message": "Stopping after current names finish"}
 
-    # Nothing queued or displaying - stop the waiting content now.
+    # Nothing queued or displaying - stop the waiting content now. Publish 'stopped' as the
+    # authoritative state (no-op off-master) so the beacon stops every remote too and - crucially
+    # - stops RE-asserting 'waiting', which would otherwise re-arm a remote we just stopped.
+    _set_show_state('stopped', start_at=_now_ms())
     stop_show_playback()
     logging.info("🛑 Text My Lights Stop: disabled and playback stopped")
     return {"success": True, "message": "Text My Lights plugin deactivated"}
@@ -13738,14 +14050,20 @@ if __name__ == '__main__':
     rotator_thread = threading.Thread(target=waiting_rotator, daemon=True)
     rotator_thread.start()
 
-    # Master heartbeat: keeps remotes' waiting content in sync even if one joins late.
-    threading.Thread(target=master_sync_heartbeat, daemon=True).start()
+    # Master beacon: assert the authoritative show state to remotes ~2x/sec so they stay locked
+    # (names appear/disappear together) and a late/rebooted remote re-locks within one interval.
+    # No-ops off-master; runs for the whole process so a runtime role change is picked up.
+    threading.Thread(target=master_beacon, daemon=True).start()
+
+    # Remote follower: the closed-loop slave that drives this box to match the master's beacon
+    # (schedules appear/disappear on the shared absolute timeline). No-ops off-remote.
+    threading.Thread(target=remote_follower, daemon=True).start()
 
     # Follow FPP's own mode: switch the plugin role to match when FPP changes player↔remote.
     threading.Thread(target=fpp_mode_watcher, daemon=True).start()
 
     # Remote: mirror the master's Name-content list into this box's Display dropdown so each
-    # content can be given this remote's own overlay layout.
+    # content can be given this remote's own overlay layout, and keep the master clock offset fresh.
     threading.Thread(target=remote_content_sync, daemon=True).start()
 
     # Polling thread starts if the selected source is configured - runs in

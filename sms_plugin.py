@@ -924,7 +924,8 @@ def discover_masters(force=False):
                 j = pr.json()
                 if j.get('plugin') == 'textmylights' and j.get('role') == 'master':
                     found.append({"address": host, "base": base,
-                                  "name": j.get('name') or host, "phone": j.get('phone') or ''})
+                                  "name": j.get('name') or host, "phone": j.get('phone') or '',
+                                  "overlay_model": j.get('overlay_model') or ''})
         except Exception:
             pass  # unreachable / not the plugin - skip silently
     found.sort(key=lambda m: (m.get('name') or '').lower())
@@ -6242,6 +6243,20 @@ def index():
                                    : (two && two.checked) ? '2 words'
                                    : '1-2 words';
                 }
+                // "Sync from Master" copies the master's layout, which only exists if the master
+                // has its OWN overlay model. Show the button only on a remote AND when the pinned
+                // master has an overlay (updated live by the masters poll). Hides with no refresh.
+                window._selectedMasterHasOverlay = true;   // assume yes until the masters poll says otherwise
+                function updateSyncBtnVisibility(remote) {
+                    if (remote === undefined) {
+                        var _r = document.getElementById('plugin_role');
+                        remote = !!(_r && _r.value === 'remote');
+                    }
+                    var btn = document.getElementById('btn_sync_pos_master');
+                    if (btn) btn.style.display = (remote && window._selectedMasterHasOverlay) ? '' : 'none';
+                }
+                window.updateSyncBtnVisibility = updateSyncBtnVisibility;
+
                 // A Remote only displays names the Master pushes - everything else (texts,
                 // replies, limits, filters, testing, queue, Start) is handled on the Master,
                 // so hide it here to avoid confusion.
@@ -6256,7 +6271,7 @@ def index():
                     // Only the Overlay Model selector stays - it is this projector's own model.
                     showIf('waiting_config_col', !remote);
                     showIf('names_config_col', !remote);
-                    showIf('btn_sync_pos_master', remote);   // remote-only: copy master's layout
+                    updateSyncBtnVisibility(remote);         // remote-only AND master must have an overlay
                     // Timing is the Master's (it starts/stops the effect for all projectors and
                     // pushes the duration), so a remote has no duration control - show a note instead.
                     showIf('content_duration_row', !remote);
@@ -6327,7 +6342,15 @@ def index():
                 function loadMasters(force) {
                     fetch('/api/plugin/masters' + (force ? '?refresh=1' : ''))
                         .then(function(r){ return r.json(); })
-                        .then(function(d){ if (d && d.is_remote) renderMasters(d); })
+                        .then(function(d){
+                            if (!d || !d.is_remote) return;
+                            // Hide "Sync from Master" live when the pinned master has no overlay
+                            // (nothing to sync from). Missing field -> assume yes (back-compat).
+                            window._selectedMasterHasOverlay = (d.selected_master_has_overlay === undefined)
+                                ? true : !!d.selected_master_has_overlay;
+                            renderMasters(d);
+                            updateSyncBtnVisibility();
+                        })
                         .catch(function(){});
                 }
                 window.loadMasters = loadMasters;
@@ -6358,7 +6381,7 @@ def index():
                 function startMastersAutoRefresh() {
                     if (_mastersTimer) return;
                     loadMasters(false);
-                    _mastersTimer = setInterval(function(){ loadMasters(false); }, 10000);
+                    _mastersTimer = setInterval(function(){ loadMasters(false); }, 5000);
                 }
                 window.startMastersAutoRefresh = startMastersAutoRefresh;
 
@@ -6879,7 +6902,7 @@ def index():
                             <canvas id="matrix_canvas" style="width:100%; display:block; background:#000; border:2px solid #555; border-radius:4px; cursor:default;"></canvas>
                             <div style="display:flex; gap:8px; margin-top:6px; align-items:center;">
                                 <button type="button" onclick="resetAllLines()" style="background:#555; padding:6px 12px; font-size:12px;">Reset All to Center</button>
-                                <button type="button" id="btn_sync_pos_master" onclick="syncPositionFromMaster(this)" style="display:none; background:#1976d2; color:#fff; padding:6px 12px; font-size:12px;" title="Copy the Master's text layout for this content, scaled to this projector's model">🔗 Sync Position from Master</button>
+                                <button type="button" id="btn_sync_pos_master" onclick="syncPositionFromMaster(this)" style="display:none; background:#1976d2; color:#fff; padding:6px 12px; font-size:12px;" title="Copy the Master's text layout for this content, scaled to this projector's model">🔗 Sync from Master</button>
                                 <span id="pos_display" style="font-size:12px; color:var(--fg-muted);"></span>
                                 <span id="sync_pos_status" style="font-size:12px; color:var(--fg-muted);"></span>
                             </div>
@@ -9704,6 +9727,12 @@ def index():
                 requestAnimationFrame(function() {
                     window.parent.postMessage({ type: 'iframeHeight', height: document.body.scrollHeight }, '*');
                 });
+                // The canvas can't paint a background while its tab is hidden (zero size). Showing
+                // the Display tab is exactly what used to "fix" a blank remote preview, so re-run it
+                // here now that the canvas is visible - no manual refresh needed.
+                if (tabName === 'display' && typeof window.toggleFseqPreview === 'function') {
+                    requestAnimationFrame(function(){ window.toggleFseqPreview(); });
+                }
             }
 
             function refreshFPPLists(btn) {
@@ -11750,11 +11779,17 @@ def api_plugin_masters():
     # it checked without the user having to pick.
     _maybe_auto_select_single_master()
     sel = _selected_master_addr()
+    # Whether the pinned master has its OWN overlay model. "Sync from Master" copies the master's
+    # layout, which only exists if the master renders locally - so the remote UI hides that button
+    # when the master has no overlay (nothing to sync from).
+    _sel_overlay = next((m.get("overlay_model", "") for m in masters if m["address"] == sel), "")
     return jsonify({
         "is_remote": True,
         "selected": sel,
         "selected_reachable": any(m['address'] == sel for m in masters) if sel else True,
+        "selected_master_has_overlay": bool((_sel_overlay or "").strip()),
         "masters": [{"address": m["address"], "name": m["name"], "phone": m["phone"],
+                     "overlay_model": m.get("overlay_model", ""),
                      "selected": (m["address"] == sel)} for m in masters],
     })
 

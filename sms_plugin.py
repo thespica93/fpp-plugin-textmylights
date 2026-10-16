@@ -4456,12 +4456,21 @@ def send_to_fpp(name, override=None, preselected=_UNSET):
                     # FSEQ Effect (loop=true, background=true): plays as background so
                     # overlay model renders on top with correct text colors.
                     seq_name = name_playlist[4:].removesuffix('.fseq')
+                    # Force a clean FRAME-0 restart: Stop, then Start. Diagnostics proved the two
+                    # boxes call Start at the SAME instant (identical master_epoch), yet the video
+                    # drifts - because FSEQ Effect Start does NOT reset an effect that is ALREADY
+                    # running. When this clip doubles as the waiting background it has been looping
+                    # since each box started it (at different times), so both play it from different
+                    # frames. Stopping first guarantees both boxes begin at frame 0 at the (already
+                    # co-triggered) instant, so a 16s clip stays aligned for its whole run.
+                    stop_url = f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(seq_name)}"
+                    try:
+                        requests.get(stop_url, timeout=3)
+                    except Exception:
+                        pass
                     effect_url = f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Start')}/{urllib.parse.quote(seq_name)}/true/true"
-                    # SYNC DIAGNOSTIC: stamp the fire instant in the MASTER's clock so the master's
-                    # and each remote's log lines are directly comparable. If these numbers match
-                    # across boxes (within ~tens of ms) the clips are co-triggered and any visible
-                    # drift is FPP effect playback, not us; if they differ by hundreds of ms the
-                    # trigger timing is the culprit. offset is this box's measured master-clock skew.
+                    # SYNC DIAGNOSTIC: fire instant in the MASTER's clock so master's and each
+                    # remote's log lines are directly comparable (matching => co-triggered).
                     logging.info(f"🎞️ NAME FSEQ '{seq_name}' fire @ master_epoch={_master_epoch_now()}ms "
                                  f"role={get_plugin_role()} offset={_master_clock_offset_ms:.0f}ms")
                     requests.get(effect_url, timeout=3)

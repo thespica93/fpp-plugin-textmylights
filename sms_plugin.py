@@ -5715,17 +5715,8 @@ def index():
 
         <!-- SMS cost disclaimer - shown on every role (master and remote) -->
         <div style="background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn-fg); border-radius:6px; padding:10px 14px; margin:14px 0 0 0; font-size:13px; line-height:1.5;">
-            <span id="tml-build-badge" style="float:right; opacity:0.7; font-size:11px; font-weight:bold;">build …</span>
             <strong>DISCLAIMER:</strong> The author of this plugin is NOT responsible for SMS charges that may be incurred by using this plugin, or any inappropriate content that may be displayed from incorrectly configured settings.
         </div>
-        <script>
-            // Show which commit THIS box is actually running - so "did the update land?" is a
-            // glance, not a guess. Master and remote each show their own.
-            fetch('/api/version').then(function(r){return r.json();}).then(function(d){
-                var e = document.getElementById('tml-build-badge');
-                if (e) e.textContent = 'build ' + (d.build || '?') + (d.role ? ' · ' + d.role : '');
-            }).catch(function(){});
-        </script>
 
         <!-- Tab navigation -->
         <div class="tabs" style="display:flex; align-items:center; gap:2px;">

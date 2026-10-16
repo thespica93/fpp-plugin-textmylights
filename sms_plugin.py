@@ -7570,19 +7570,21 @@ def index():
                     if (note) note.textContent = d.found
                         ? ('Editing “' + t.name + '” — changes save to that projector.')
                         : ('“' + t.name + '” doesn’t have this content, so there’s nothing to edit here — add/sync it on that projector first.');
-                    if (typeof window.loadBgPreview === 'function') {
-                        window.loadBgPreview();
-                        // The first background/scrubber paint can be lost to an init race (the
-                        // synced-remote discovery cache warming, or the canvas settling), which is
-                        // why it used to only appear after switching tabs / refreshing. Re-run it
-                        // once shortly after so it shows on its own. Guard on still editing THIS
-                        // remote so a quick re-select doesn't double-fetch the wrong projector.
-                        var _tgtAddr = t.address;
-                        setTimeout(function(){
-                            if (window._editTarget && window._editTarget.address === _tgtAddr
-                                && typeof window.loadBgPreview === 'function') window.loadBgPreview();
-                        }, 1200);
+                    // Paint the background now, and keep retrying until it actually resolves. The
+                    // first attempt can no-op because the content list isn't migrated yet (flat
+                    // config), or the remote's first frame render / discovery cache is warming - any
+                    // of which used to leave it blank until a manual refresh. Retry a few times at
+                    // ~400ms, guarded to the still-current projector, and stop as soon as there IS a
+                    // previewable content resolved (getConfiguredContent) so we don't loop forever.
+                    var _tgtAddr = t.address, _tries = 0;
+                    function _paintRemoteBg() {
+                        if (!window._editTarget || window._editTarget.address !== _tgtAddr) return;
+                        if (typeof window.loadBgPreview === 'function') window.loadBgPreview();
+                        _tries++;
+                        var _haveContent = (typeof getConfiguredContent === 'function') && !!getConfiguredContent();
+                        if (_tries < 6 && !_haveContent) setTimeout(_paintRemoteBg, 400);
                     }
+                    _paintRemoteBg();
                   })
                   .catch(function(){ window._editTargetFound = false; if (note) note.textContent = 'Could not reach ' + t.name + '.'; })
                   .finally(function(){ window._loadingTarget = false; });
@@ -8707,6 +8709,22 @@ def index():
                     };
                 }
 
+                // ---- Live cross-page sync helpers (master <-> remote) ----
+                // Canonical signature of just the layout fields, so a background poll can tell when
+                // the OTHER side changed this content vs. what's in the editor right now.
+                var _LAYOUT_SIG_KEYS = ['message_lines','line_boxes','line_colors','line_movements',
+                                        'line_speeds','line_fonts','line_orientations','display_duration'];
+                function _layoutSig(o) {
+                    o = o || {};
+                    return JSON.stringify(_LAYOUT_SIG_KEYS.map(function(k){ return o[k]; }));
+                }
+                // True if the local user edited within the grace window - polls skip reloading then
+                // so a live update never stomps an in-progress drag/typing. Set in saveConfig().
+                window._lastEditAt = 0;
+                function _recentlyEdited() { return (Date.now() - (window._lastEditAt || 0)) < 3000; }
+                window._layoutSig = _layoutSig;
+                window._recentlyEdited = _recentlyEdited;
+
                 // Write a layout into the editor DOM + window buffers, then refresh preview.
                 function applyLayoutToEditor(L) {
                     L = L || _blankLayout();
@@ -8982,6 +9000,11 @@ def index():
                     }
                     if (window._namesSelectedIndex>=lst.length) window._namesSelectedIndex=lst.length-1;
                     renderNamesList();
+                    // The content list may have only just been populated/migrated here (it starts
+                    // empty on a flat-config master). If a remote is being previewed, its background
+                    // bailed earlier because getConfiguredContent() had nothing to resolve - re-run
+                    // it now that content exists, so the background/scrubber appear without a refresh.
+                    if (window._editTarget && typeof window.loadBgPreview === 'function') window.loadBgPreview();
                 }
 
                 window.openManageContentModal=openManageContentModal;
@@ -9585,6 +9608,22 @@ def index():
                     var serverIds = d.names_content_list.map(function(it){ return it.content || ''; });
                     var cur = window._namesContentList || [];
                     var localIds = cur.map(function(it){ return it.content || ''; });
+
+                    // --- Live layout sync: if the MASTER pushed a new layout for the content this
+                    //     remote is currently editing, reflect it on this open page - unless the
+                    //     local user just edited (grace window) so we never stomp an in-progress drag.
+                    var _selId = (cur[window._namesSelectedIndex] || {}).content || null;
+                    if (_selId && typeof window._recentlyEdited === 'function' && !window._recentlyEdited()
+                        && typeof collectEditorLayout === 'function' && typeof window._layoutSig === 'function') {
+                        var _srvItem = d.names_content_list.filter(function(it){ return it.content === _selId; })[0];
+                        if (_srvItem && window._layoutSig(_srvItem) !== window._layoutSig(collectEditorLayout())) {
+                            var _localItem = cur[window._namesSelectedIndex];
+                            if (_localItem) { _LAYOUT_SIG_KEYS.forEach(function(k){ _localItem[k] = _srvItem[k]; }); }
+                            if (typeof applyLayoutToEditor === 'function') applyLayoutToEditor(_srvItem);
+                            if (typeof window.toggleFseqPreview === 'function') window.toggleFseqPreview();
+                        }
+                    }
+
                     // Signature covers both MEMBERSHIP and the master's per-content duration, so a
                     // duration-only change (the master updated Display Duration) still refreshes the
                     // preview scrubber here, not just add/remove/reorder.
@@ -9615,11 +9654,38 @@ def index():
                     if (typeof window.toggleFseqPreview === 'function') window.toggleFseqPreview();
                 }).catch(function(){});
             }
-            setInterval(refreshRemoteNamesContent, 10000);
+            setInterval(refreshRemoteNamesContent, 3000);   // 3s: fast enough for live master->remote sync
             _init('liveStatus', updateLiveStatus);
             setInterval(updateLiveStatus, 5000);
             _init('remotesIndicator', updateRemotesIndicator);
             setInterval(updateRemotesIndicator, 15000);
+
+            // Master live sync: while previewing a remote, poll THAT remote's own layout for the
+            // current content and adopt it if the remote's own page changed it (and we're not loading
+            // or mid-edit), so the master's preview tracks edits made on the remote with no refresh.
+            // No-op on a remote page (never has an _editTarget). Anti-echo is automatic: right after
+            // the master pushes, the remote's layout == the editor, so the diff is empty.
+            function pollRemoteLayoutForEdits() {
+                var t = window._editTarget;
+                if (!t || window._loadingTarget) return;
+                if (typeof window._recentlyEdited === 'function' && window._recentlyEdited()) return;
+                var content = (typeof _currentContentId === 'function') ? _currentContentId() : '';
+                fetch('/api/plugin/remote-layout?remote=' + encodeURIComponent(t.address)
+                      + '&content=' + encodeURIComponent(content))
+                  .then(function(r){ return r.json(); })
+                  .then(function(d){
+                    if (!window._editTarget || window._editTarget.address !== t.address) return;   // re-selected since
+                    if (window._loadingTarget) return;
+                    if (typeof window._recentlyEdited === 'function' && window._recentlyEdited()) return;
+                    if (!d || !d.found || !d.layout) return;
+                    if (window._layoutSig(d.layout) !== window._layoutSig(collectEditorLayout())) {
+                        window._editTargetFound = true;
+                        if (typeof applyLayoutToEditor === 'function') applyLayoutToEditor(d.layout);
+                        if (typeof window.loadBgPreview === 'function') window.loadBgPreview();
+                    }
+                  }).catch(function(){});
+            }
+            setInterval(pollRemoteLayoutForEdits, 3000);
             for (var _li = 0; _li < 4; _li++) { updateLineSpeedRowVisibility(_li); updateLineOrientationRowVisibility(_li); }
             initValignButtons();
             (function() {
@@ -9797,6 +9863,9 @@ def index():
 
 var _saveTimer = null;
             function saveConfig() {
+                // Mark local activity so the live cross-page sync polls don't reload (and stomp) an
+                // in-progress edit for ~3s after the last change.
+                window._lastEditAt = Date.now();
                 // While the Preview is editing a REMOTE projector, also push the current layout to
                 // that remote (debounced). We STILL run the normal master save so non-layout
                 // settings (rules, responses, filters) persist even with a remote selected; _doSave

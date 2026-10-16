@@ -7423,7 +7423,10 @@ def index():
                 if (roleEl && roleEl.value === 'remote') { el.style.display = 'none'; return; }
                 fetch('/api/tml/remotes').then(function(r){ return r.json(); }).then(function(d){
                     if (!d || d.role !== 'master') { el.style.display = 'none'; return; }
-                    updatePreviewRemotes(d.remotes || [], (d.overlay_model || '').trim());
+                    // Use the CLIENT's live overlay selection (authoritative on this page) rather than
+                    // the server's, which can lag the autosave right after the user changes it.
+                    var _liveOverlay = ((document.getElementById('overlay_model_name') || {}).value || '').trim();
+                    updatePreviewRemotes(d.remotes || [], _liveOverlay);
                     // A connected remote is a valid render target, so it should un-grey Start even
                     // with no local overlay. Feed that into the button state.
                     window._masterHasRemote = (d.count > 0);
@@ -7467,6 +7470,12 @@ def index():
                 var usable = (remotes || []).filter(function(r){ return r.model_w > 0 && r.model_h > 0; });
                 window._previewRemotesList = usable;
 
+                // Did the master's overlay state just flip (None <-> a model)? If so we re-default the
+                // preview target to follow it: gained an overlay -> "This box"; lost it -> a remote.
+                // (A routine poll where it did NOT flip keeps the user's current selection.)
+                var overlayChanged = (window._prevHasOverlay !== undefined) && (window._prevHasOverlay !== hasOverlay);
+                window._prevHasOverlay = hasOverlay;
+
                 // Rebuild only when the real choices change, so the periodic poll never stomps the
                 // user's current selection or reloads the editor mid-edit.
                 var sig = (hasOverlay ? 'O|' : '-|')
@@ -7507,14 +7516,20 @@ def index():
                     o.textContent = r.name + ' (' + r.model_w + '×' + r.model_h + ')' + (r === largest ? ' — largest' : '');
                     sel.appendChild(o);
                 });
-                // Keep a still-valid prior choice; otherwise default. With no local overlay we must
-                // land on a remote (there is no "This box"), so default to the largest remote.
+                // When the overlay state just flipped, FOLLOW it (ignore the stale prior choice):
+                // gained an overlay -> "This box"; lost it -> the largest remote. Otherwise keep a
+                // still-valid prior choice; with no local overlay default to a remote.
                 var validPrev = (prev === '' && hasOverlay) || usable.some(function(r){ return r.address === prev; });
-                sel.value = validPrev ? prev : (hasOverlay ? '' : largest.address);
+                if (overlayChanged) {
+                    sel.value = hasOverlay ? '' : largest.address;
+                } else {
+                    sel.value = validPrev ? prev : (hasOverlay ? '' : largest.address);
+                }
                 row.style.display = 'block';
                 if (note) note.textContent = 'Shows what that projector will display, at its real size, using its overlay.';
-                // Apply the resolved selection on first populate or whenever it changed.
-                if (!window._previewRemoteInit || sel.value !== prev) { window._previewRemoteInit = true; onPreviewRemoteChange(); }
+                // Reload the editor on first populate, when the selection changed, or when the overlay
+                // flipped (so the editor + canvas follow This box <-> remote even if the value matches).
+                if (!window._previewRemoteInit || sel.value !== prev || overlayChanged) { window._previewRemoteInit = true; onPreviewRemoteChange(); }
             }
 
             // The content id whose layout is currently being edited/previewed.
@@ -9392,9 +9407,9 @@ def index():
                                 }
                                 _fseqMeta = data;
                                 if (window._previewRemote) {
-                                    loadEl.textContent = '🖥️ Preview from ' + window._previewRemote.name +
-                                                         ' (' + window._previewRemote.w + '\u00d7' + window._previewRemote.h + ')';
-                                    loadEl.style.color = '#a5d6a7';
+                                    // Projector is already named in the dropdown + "Editing X"
+                                    // note above, so don't repeat it under the scrubber.
+                                    loadEl.textContent = '';
                                 } else if (data.detected_start_channel) {
                                     loadEl.textContent = '';
                                 } else {
@@ -9871,8 +9886,18 @@ def index():
                             updateModelAspect(m.width, m.height);
                             document.getElementById('overlay_model_width').value = m.width;
                             document.getElementById('overlay_model_height').value = m.height;
+                        } else {
+                            document.getElementById('overlay_model_width').value = 0;
+                            document.getElementById('overlay_model_height').value = 0;
                         }
                         saveConfig();
+                        // Overlay changed -> re-evaluate the preview target NOW (don't wait for the 15s
+                        // poll) so the dropdown, editor layout, and canvas stay in sync: gained an
+                        // overlay -> "This box"; lost it -> a remote. Use the cached remote list + this
+                        // new overlay value (authoritative here, no server round-trip).
+                        if (typeof updatePreviewRemotes === 'function') {
+                            updatePreviewRemotes(window._previewRemotesList || [], selected);
+                        }
                     });
 
                     // Names list UI (and the modal picker) are ready - render them.

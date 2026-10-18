@@ -28,11 +28,6 @@ if [ -f "$PID_FILE" ]; then
         _wait_gone "$PID" || kill -9 "$PID" 2>/dev/null || true
     fi
     rm -f "$PID_FILE"
-else
-    # No PID file: a daemon started by a version that predates it. Fall back to a
-    # precise match (the python3 interpreter running THIS script), not a broad
-    # `-f sms_plugin.py`. This path only matters during the one-time upgrade.
-    pkill -f "python3.*sms_plugin\.py" 2>/dev/null || true
 fi
 
 exit 0

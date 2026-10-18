@@ -3,7 +3,8 @@
 # FPP SMS Twilio Plugin - Comprehensive Uninstall Script
 ###############################################################################
 
-LOG="/home/fpp/media/logs/sms_plugin_uninstall.log"
+# Uninstall log lives in the shared media/logs, so it is named after the plugin (§5).
+LOG="/home/fpp/media/logs/fpp-plugin-textmylights-uninstall.log"
 
 # Function to log and display
 log_and_show() {
@@ -42,46 +43,36 @@ else
     log_and_show "✓ Plugin data and stored credentials removed"
 fi
 
-# Remove the plugin's bundled theme fonts. These live in our OWN subdirectory of
-# /usr/local/share/fonts (plus the old flat copies some early versions dropped
-# directly into it), so we only ever delete fonts this plugin installed — FPP
-# core fonts and other plugins' fonts in that shared directory are left intact.
+# Remove the plugin's bundled theme fonts. These live ONLY in our OWN subdirectory of the
+# shared /usr/local/share/fonts, so removing that folder deletes exactly the fonts this plugin
+# installed and never touches FPP core fonts or fonts other plugins / the user put there.
 log_and_show "Removing bundled theme fonts..."
 rm -rf /usr/local/share/fonts/fpp-plugin-textmylights
-# Clean up old flat copies by exact filename for installs that predate the
-# subdirectory move (never a blanket delete of *.ttf in the shared directory).
-if [ -d /home/fpp/media/plugins/fpp-plugin-textmylights/fonts ]; then
-    find /home/fpp/media/plugins/fpp-plugin-textmylights/fonts -type f \
-        \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.pfb' \) -printf '%f\n' 2>/dev/null \
-        | while IFS= read -r f; do rm -f "/usr/local/share/fonts/$f"; done 2>> "$LOG" || true
-fi
-# Old marker location from the flat-install versions (new marker lives inside the
-# subdirectory removed above).
-rm -f /usr/local/share/fonts/.tml-fonts-hash
 command -v fc-cache >/dev/null 2>&1 && fc-cache -f /usr/local/share/fonts >> "$LOG" 2>&1 || true
 log_and_show "✓ Bundled theme fonts removed"
 
-# Remove the system integration this plugin added outside its own directory: the
-# sudoers rule and the root-owned shared-memory permission helper. Leaving the
-# sudoers rule behind would keep granting the fpp user a root command after the
-# plugin is gone.
+# Remove the system integration this plugin added outside its own directory: the sudoers rule
+# and the root-owned shared-memory permission helper (both the current plugin-named files and the
+# pre-rename ones earlier builds installed). Leaving the sudoers rule behind would keep granting
+# the fpp user a root command after the plugin is gone.
 log_and_show "Removing sudoers rule and privileged helper..."
-rm -f /etc/sudoers.d/90-fpp-sms-shm
-rm -f /usr/local/bin/tml-fix-shm-perms
+rm -f /etc/sudoers.d/fpp-plugin-textmylights /etc/sudoers.d/90-fpp-sms-shm
+rm -f /usr/local/bin/fpp-plugin-textmylights-fix-shm-perms /usr/local/bin/tml-fix-shm-perms
 log_and_show "✓ Sudoers rule and helper removed"
 
-# Remove the FPP scheduler command scripts the installer dropped into media/scripts so they
-# stop appearing in FPP's Run Script dropdown after uninstall.
+# Remove the FPP scheduler command scripts the installer dropped into media/scripts (current and
+# pre-rename names) so they stop appearing in FPP's Run Script dropdown after uninstall.
 log_and_show "Removing scheduler command scripts..."
-rm -f /home/fpp/media/scripts/TextMyLightsStart.sh /home/fpp/media/scripts/TextMyLightsStop.sh
+rm -f /home/fpp/media/scripts/fpp-plugin-textmylights-Start.sh /home/fpp/media/scripts/fpp-plugin-textmylights-Stop.sh \
+      /home/fpp/media/scripts/TextMyLightsStart.sh /home/fpp/media/scripts/TextMyLightsStop.sh
 log_and_show "✓ Scheduler command scripts removed"
 
-# Remove log files
+# Remove this plugin's OWN log files from the shared media/logs (current plugin-named files, plus
+# the pre-rename install log earlier builds wrote). We do NOT delete generically-named files like
+# sms_plugin.log or received_messages.json: those are not plugin-named and may not be ours.
 log_and_show "Removing log files..."
 rm -f /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log
-rm -f /home/fpp/media/logs/sms_plugin.log
-rm -f /home/fpp/media/logs/sms_plugin_install.log
-rm -f /home/fpp/media/logs/received_messages.json
+rm -f /home/fpp/media/logs/fpp-plugin-textmylights-install.log
 log_and_show "✓ Log files removed"
 
 log_and_show "========================================"

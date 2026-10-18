@@ -13,9 +13,10 @@ set -e
 . ${FPPDIR}/scripts/common
 
 # Create directories FIRST before any logging to files
-mkdir -p /home/fpp/media/config /home/fpp/media/logs
+mkdir -p /home/fpp/media/logs
 
-LOG="/home/fpp/media/logs/sms_plugin_install.log"
+# Install log lives in the shared media/logs, so it is named after the plugin (§5).
+LOG="/home/fpp/media/logs/fpp-plugin-textmylights-install.log"
 PLUGIN_DIR="/home/fpp/media/plugins/fpp-plugin-textmylights"
 
 # Log to both file and stdout so FPP UI shows progress
@@ -137,11 +138,9 @@ else
     if ! command -v fc-cache &> /dev/null; then
         apt_install_safe fontconfig || true
     fi
-    # Migrate away from older versions that copied our bundled fonts FLAT into
-    # /usr/local/share/fonts: remove ONLY the exact filenames we ship, never a
-    # blanket delete, so fonts owned by FPP core / other plugins are untouched.
-    find "$PLUGIN_DIR/fonts" -type f \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.pfb' \) -printf '%f\n' 2>/dev/null \
-        | while IFS= read -r f; do rm -f "/usr/local/share/fonts/$f"; done 2>> "$LOG" || true
+    # Our fonts live ONLY in our own subdirectory (recreated below). We do NOT touch files
+    # directly in the shared /usr/local/share/fonts: deleting there by filename could remove a
+    # same-named font a user uploaded (e.g. via another plugin), which the plugin doesn't own.
     # Clear and recreate OUR subdirectory so it always exactly mirrors the repo —
     # otherwise a renamed/removed bundled font (e.g. "Santa Christmas" ->
     # "Present Snow") leaves its old file behind forever, and _enumerate_fonts()
@@ -217,11 +216,17 @@ chmod 664 "$PLUGIN_DIR/whitelist.txt" "$PLUGIN_DIR/blacklist.txt" 2>/dev/null ||
 # arbitrary files), we install a small ROOT-OWNED wrapper that validates its argument and
 # only ever touches a single file inside /dev/shm (giving it to the fpp user/group,
 # group-writable only), and grant sudo to that wrapper alone.
-SHM_HELPER="/usr/local/bin/tml-fix-shm-perms"
+# Files this plugin installs into shared system folders are named after the plugin (§5) so it
+# is clear they belong to Text My Lights. Remove the pre-rename copies this plugin created in
+# earlier builds (own files only), including the old sudoers rule - otherwise it would keep
+# granting fpp a root command for a helper we no longer ship.
+rm -f /etc/sudoers.d/90-fpp-sms-shm /usr/local/bin/tml-fix-shm-perms
+
+SHM_HELPER="/usr/local/bin/fpp-plugin-textmylights-fix-shm-perms"
 install -o root -g root -m 0755 "$PLUGIN_DIR/scripts/tml-fix-shm-perms" "$SHM_HELPER" 2>/dev/null \
     || { cp "$PLUGIN_DIR/scripts/tml-fix-shm-perms" "$SHM_HELPER"; chown root:root "$SHM_HELPER"; chmod 0755 "$SHM_HELPER"; }
 
-SUDOERS_FILE="/etc/sudoers.d/90-fpp-sms-shm"
+SUDOERS_FILE="/etc/sudoers.d/fpp-plugin-textmylights"
 echo "fpp ALL=(ALL) NOPASSWD: $SHM_HELPER" > "$SUDOERS_FILE"
 chmod 0440 "$SUDOERS_FILE"
 # Validate the sudoers file; remove it if malformed so we never wedge sudo.
@@ -239,28 +244,25 @@ fi
 # files are handled individually - plugindata at the secrets step above, and our log file just
 # below - so there is nothing of ours left to fix here.
 # FPP log viewer recognizes logs named plugin-<pluginname>.log in logDirectory.
-# Remove the old pre-convention name so it stops lingering after an update.
-rm -f /home/fpp/media/logs/sms_plugin.log
 touch /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log
 # 0644, not world-writable: the plugin (fpp) writes it and FPP's log viewer reads it, but no
 # other local user should be able to tamper with it. Contains texter phone numbers.
 chmod 644 /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log
 chown fpp:fpp /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log || true
 
-# Install scheduler scripts into FPP's scripts directory so they appear in
-# the scheduler under: Command → Run Script → TextMyLightsStart / TextMyLightsStop
+# Install scheduler scripts into FPP's scripts directory so they appear in the scheduler under:
+# Command → Run Script. They live in the shared media/scripts, so they are named after the
+# plugin (§5): fpp-plugin-textmylights-Start.sh / -Stop.sh.
 mkdir -p /home/fpp/media/scripts
-# Remove the old Twilio-named scripts from before the rename (full rename),
-# including the TwilioStart/StopBeta.sh left over from the reverted beta/stable
-# coexistence attempt, so they stop appearing in FPP's Run Script dropdown.
-# NOTE: update your FPP scheduler to run TextMyLightsStart.sh / TextMyLightsStop.sh.
-rm -f /home/fpp/media/scripts/TwilioStart.sh /home/fpp/media/scripts/TwilioStop.sh \
-      /home/fpp/media/scripts/TwilioStartBeta.sh /home/fpp/media/scripts/TwilioStopBeta.sh
-cp "$PLUGIN_DIR/scripts/fpp_activate.sh"   /home/fpp/media/scripts/TextMyLightsStart.sh
-cp "$PLUGIN_DIR/scripts/fpp_deactivate.sh" /home/fpp/media/scripts/TextMyLightsStop.sh
-chmod +x /home/fpp/media/scripts/TextMyLightsStart.sh /home/fpp/media/scripts/TextMyLightsStop.sh
-chown fpp:fpp /home/fpp/media/scripts/TextMyLightsStart.sh /home/fpp/media/scripts/TextMyLightsStop.sh || true
-log_and_show "Scheduler scripts installed: TextMyLightsStart.sh / TextMyLightsStop.sh"
+# Remove the pre-rename copies this plugin created in earlier builds (own files only) so they
+# stop appearing in FPP's Run Script dropdown. NOTE: update your FPP scheduler to run the new
+# fpp-plugin-textmylights-Start.sh / -Stop.sh entries.
+rm -f /home/fpp/media/scripts/TextMyLightsStart.sh /home/fpp/media/scripts/TextMyLightsStop.sh
+cp "$PLUGIN_DIR/scripts/fpp_activate.sh"   /home/fpp/media/scripts/fpp-plugin-textmylights-Start.sh
+cp "$PLUGIN_DIR/scripts/fpp_deactivate.sh" /home/fpp/media/scripts/fpp-plugin-textmylights-Stop.sh
+chmod +x /home/fpp/media/scripts/fpp-plugin-textmylights-Start.sh /home/fpp/media/scripts/fpp-plugin-textmylights-Stop.sh
+chown fpp:fpp /home/fpp/media/scripts/fpp-plugin-textmylights-Start.sh /home/fpp/media/scripts/fpp-plugin-textmylights-Stop.sh || true
+log_and_show "Scheduler scripts installed: fpp-plugin-textmylights-Start.sh / -Stop.sh"
 
 log_and_show "========================================"
 log_and_show "Installation complete!"

@@ -158,7 +158,7 @@ FPP_IMAGES_PATH    = '/home/fpp/media/images'
 # /dev/shm/FPP-Model-Data-<model> file writable by the fpp user. The plugin may only
 # invoke THIS via sudo - never `chmod` directly - so a model name can never be abused to
 # change permissions on files outside /dev/shm. The helper re-validates its argument.
-SHM_PERMS_HELPER = '/usr/local/bin/tml-fix-shm-perms'
+SHM_PERMS_HELPER = '/usr/local/bin/fpp-plugin-textmylights-fix-shm-perms'
 # NOTE: this plugin deliberately keeps NO path into FPP's config dir or playlists dir. Per the
 # FPP plugin guidelines (§3.4, §5) it never reads or writes FPP's own data files (overlay model
 # configs, playlists, sequences, media). The overlay model is configured in FPP and resolved
@@ -778,12 +778,16 @@ def is_remote():
 
 
 # FPP auto-lists every script in this directory under Scheduler → Command → Run Script.
-# The Start/Stop scheduler scripts map to fpp_activate.sh / fpp_deactivate.sh.
+# The Start/Stop scheduler scripts map to fpp_activate.sh / fpp_deactivate.sh. They live in the
+# shared media/scripts, so they are named after the plugin (§5).
 FPP_SCRIPTS_DIR  = "/home/fpp/media/scripts"
 SCHEDULER_SCRIPTS = (
-    ("fpp_activate.sh",   "TextMyLightsStart.sh"),
-    ("fpp_deactivate.sh", "TextMyLightsStop.sh"),
+    ("fpp_activate.sh",   "fpp-plugin-textmylights-Start.sh"),
+    ("fpp_deactivate.sh", "fpp-plugin-textmylights-Stop.sh"),
 )
+# Pre-rename names this plugin installed in earlier builds; removed on sync so they stop
+# appearing in FPP's Run Script dropdown (own files only).
+SCHEDULER_SCRIPTS_LEGACY = ("TextMyLightsStart.sh", "TextMyLightsStop.sh")
 
 
 def sync_scheduler_scripts():
@@ -793,6 +797,15 @@ def sync_scheduler_scripts():
     A master (or an unset/auto role) keeps them, (re)installed from the plugin's bundled copies.
     Best-effort and idempotent: on a non-FPP box (no scripts dir) it quietly no-ops."""
     try:
+        # Migrate: drop the pre-rename copies this plugin installed in earlier builds (own files).
+        for _old in SCHEDULER_SCRIPTS_LEGACY:
+            try:
+                _oldp = os.path.join(FPP_SCRIPTS_DIR, _old)
+                if os.path.exists(_oldp):
+                    os.remove(_oldp)
+                    logging.info(f"Removed legacy scheduler script {_old}")
+            except OSError:
+                pass
         remote = is_remote()
         for src_name, dest_name in SCHEDULER_SCRIPTS:
             dest = os.path.join(FPP_SCRIPTS_DIR, dest_name)
@@ -6886,7 +6899,7 @@ def index():
                     // Fallback (page opened directly): confirm + import inline.
                     tmlConfirm('Import configuration from "' + file.name + '"? '
                         + 'This overwrites the plugin settings and block/whitelist on THIS Pi. '
-                        + 'FPP\'s sequences, media and overlay model are not touched. Your saved '
+                        + 'FPP sequences, media and the overlay model are not touched. Your saved '
                         + 'credentials are kept. Continue?', { danger: true, okText: 'Import' }).then(function(ok) {
                       if (!ok) { _tmlImportFile = null; return; }
                       var status = document.getElementById('import_status');
@@ -6948,8 +6961,10 @@ def index():
                             .reset-line-btn { background:var(--tab-bg); border:none; color:var(--fg); padding:2px 7px; font-size:12px; border-radius:3px; cursor:pointer; flex-shrink:0; }
                             .reset-line-btn:hover { background:var(--tab-hover); }
                             .line-color-group { position:relative; display:flex; align-items:center; flex-shrink:0; }
-                            .line-color-swatch { width:24px; height:24px; padding:0; border:1px solid var(--border); border-radius:4px 0 0 4px; cursor:pointer; background:none; }
-                            .color-palette-btn { width:16px; height:24px; padding:0; border:1px solid var(--border); border-left:none; border-radius:0 4px 4px 0; background:var(--tab-bg); color:var(--fg); font-size:9px; cursor:pointer; }
+                            /* !important: FPP's Bootstrap input styling would otherwise stretch these
+                               color inputs to full width / taller rows. Keep them as compact swatches. */
+                            .line-color-swatch { width:24px !important; height:24px !important; min-width:24px; padding:0 !important; margin:0 !important; border:1px solid var(--border); border-radius:4px 0 0 4px; cursor:pointer; background:none; flex:0 0 auto; display:inline-block; box-sizing:border-box; }
+                            .color-palette-btn { width:16px !important; height:24px !important; min-width:16px; padding:0 !important; margin:0 !important; border:1px solid var(--border); border-left:none; border-radius:0 4px 4px 0; background:var(--tab-bg); color:var(--fg); font-size:9px; cursor:pointer; flex:0 0 auto; box-sizing:border-box; }
                             .color-palette-btn:hover { background:var(--tab-hover); }
                             .color-palette-popover { position:absolute; top:28px; right:0; z-index:50; background:var(--card-bg); border:1px solid var(--border); border-radius:5px; padding:8px; width:140px; box-shadow:0 4px 12px var(--shadow); }
                             .color-palette-swatches { display:flex; flex-wrap:wrap; gap:4px; }
@@ -13677,7 +13692,7 @@ def api_activate():
     global polling_thread, stop_polling
 
     # Text needs an overlay model to display on. The UI greys out Start without one; enforce the
-    # same rule here so the scheduler SCRIPT (TextMyLightsStart, no UI to grey) can't start with
+    # same rule here so the scheduler SCRIPT (Start, no UI to grey) can't start with
     # nothing to display either. A master can display on its OWN overlay OR push to a connected
     # remote; a remote displays only on its own overlay. Refuse when there's no target - no popup.
     _has_overlay = bool((config.get('overlay_model_name', '') or '').strip())

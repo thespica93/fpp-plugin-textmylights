@@ -4,7 +4,7 @@
 #
 # Makes ONE FPP overlay-model shared-memory file writable by the fpp user so the
 # plugin can draw text/images into it. This is the ONLY privileged action the
-# plugin is allowed to run as root (see /etc/sudoers.d/90-fpp-sms-shm), replacing
+# plugin is allowed to run as root (see /etc/sudoers.d/fpp-plugin-textmylights), replacing
 # an earlier broad world-writable rule over all FPP-Model-Data files.
 #
 # The file is given to the fpp user/group (group-writable, NOT world) so only the

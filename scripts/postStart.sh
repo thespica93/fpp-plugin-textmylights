@@ -11,7 +11,7 @@ PLUGIN_DIR="/home/fpp/media/plugins/fpp-plugin-textmylights"
 "$PLUGIN_DIR/scripts/tml-stop.sh" || true
 
 # NOTE: shared-memory permissions are fixed at RUNTIME (per overlay model, scoped to the
-# fpp user/group) by the root helper tml-fix-shm-perms - see render_to_shm() in sms_plugin.py.
+# fpp user/group) by the root helper fpp-plugin-textmylights-fix-shm-perms - see render_to_shm() in sms_plugin.py.
 # FPP creates /dev/shm/FPP-Model-Data-* as root AFTER this script runs, so there is nothing
 # to chmod here anyway.
 

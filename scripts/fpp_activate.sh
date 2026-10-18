@@ -1,7 +1,7 @@
 #!/bin/bash
 # Text My Lights Plugin - Activate
 # Enables the plugin, starts SMS polling, and starts the default waiting playlist.
-# FPP Scheduler: Command → Run Script → TextMyLightsStart
+# FPP Scheduler: Command → Run Script → fpp-plugin-textmylights-Start.sh
 
 PLUGIN_URL="http://127.0.0.1:5000/api/activate"
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Text My Lights Plugin - Deactivate
 # Disables the plugin, stops SMS polling, and stops the current playlist/sequence.
-# FPP Scheduler: Command → Run Script → TextMyLightsStop
+# FPP Scheduler: Command → Run Script → fpp-plugin-textmylights-Stop.sh
 
 PLUGIN_URL="http://127.0.0.1:5000/api/deactivate"
 

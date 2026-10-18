@@ -159,42 +159,11 @@ FPP_IMAGES_PATH    = '/home/fpp/media/images'
 # invoke THIS via sudo - never `chmod` directly - so a model name can never be abused to
 # change permissions on files outside /dev/shm. The helper re-validates its argument.
 SHM_PERMS_HELPER = '/usr/local/bin/tml-fix-shm-perms'
-FPP_PLAYLISTS_PATH = '/home/fpp/media/playlists'
-FPP_CONFIG_DIR     = '/home/fpp/media/config'
-# FPP keeps Pixel Overlay Models (the "matrix" the plugin draws text onto) as
-# "Other" channel outputs, stored in co-other.json - NOT a dedicated
-# model-overlays.json (which doesn't exist on standard installs). Confirmed via
-# the on-device overlay diagnostic. Export finds the file dynamically
-# (_find_overlay_config_file) so it adapts if a setup differs.
-OVERLAY_MODELS_FILE = os.path.join(FPP_CONFIG_DIR, 'co-other.json')
-
-def _find_overlay_config_file():
-    """Return the FPP config file that actually holds the overlay model. Pixel
-    Overlay Models live in co-other.json on standard installs; to be robust we
-    also scan the config dir for the configured model name and prefer whatever
-    file contains it. Returns None if nothing is found."""
-    model = ''
-    try:
-        model = config.get('overlay_model_name', '') or ''
-    except Exception:
-        pass
-    if model:
-        try:
-            for fn in sorted(os.listdir(FPP_CONFIG_DIR)):
-                fp = os.path.join(FPP_CONFIG_DIR, fn)
-                if not os.path.isfile(fp) or not fn.endswith('.json'):
-                    continue
-                if os.path.getsize(fp) > 2_000_000:
-                    continue
-                try:
-                    with open(fp, 'r', errors='ignore') as f:
-                        if model in f.read():
-                            return fp
-                except Exception:
-                    pass
-        except Exception:
-            pass
-    return OVERLAY_MODELS_FILE if os.path.isfile(OVERLAY_MODELS_FILE) else None
+# NOTE: this plugin deliberately keeps NO path into FPP's config dir or playlists dir. Per the
+# FPP plugin guidelines (§3.4, §5) it never reads or writes FPP's own data files (overlay model
+# configs, playlists, sequences, media). The overlay model is configured in FPP and resolved
+# live through FPP's API where needed (see _overlay_model_dims / get_model_channel_info), and
+# export/import carry only the plugin's OWN data (settings + block/word lists).
 
 # Whitelist/blacklist source files stay in the plugin git repo directory
 BLACKLIST_FILE = os.path.join(PLUGIN_DIR, "blacklist.txt")
@@ -357,6 +326,51 @@ IFRAME_RESIZE_SCRIPT = """<script>
 })();
 </script>"""
 
+# FPP-native notifications and confirms, injected on every plugin page (§8.1 "behaves like FPP").
+# tmlNotify -> FPP's jGrowl toast (loaded in the parent); tmlConfirm -> a parent-owned Bootstrap
+# modal (ui.php). Both go through the parent because these pages live in an auto-resizing iframe:
+# a modal built INSIDE the iframe would center on the iframe's full content height, not the
+# visible viewport (exactly why the export/import modals are parent-owned). On a direct :5000
+# load there is no parent, so both fall back to the browser's native alert()/confirm().
+TML_UI_HELPERS = """<script>
+(function(){
+    function P(){ try { return (window.parent && window.parent !== window) ? window.parent : null; } catch(e){ return null; } }
+    window.tmlNotify = function(msg, type){
+        msg = String(msg == null ? '' : msg);
+        try {
+            var p = P();
+            if (p && p.jQuery && p.jQuery.jGrowl) {
+                p.jQuery.jGrowl(msg, { life: (type === 'danger' ? 7000 : 4000),
+                    theme: 'tml-jg' + (type ? ' tml-jg-' + type : '') });
+                return;
+            }
+        } catch(e){}
+        try { alert(msg); } catch(e){}
+    };
+    var _seq = 0, _pending = {};
+    window.tmlConfirm = function(message, opts){
+        message = String(message == null ? '' : message);
+        opts = opts || {};
+        var p = P();
+        if (p) {
+            return new Promise(function(resolve){
+                var id = 'c' + (++_seq) + '_' + Date.now();
+                _pending[id] = resolve;
+                try { p.postMessage({ type: 'tml_confirm', id: id, message: message, opts: opts }, '*'); }
+                catch(e){ delete _pending[id]; resolve(window.confirm(message)); }
+            });
+        }
+        return Promise.resolve(window.confirm(message));
+    };
+    window.addEventListener('message', function(e){
+        var d = e.data;
+        if (d && d.type === 'tml_confirm_result' && d.id && _pending[d.id]) {
+            var r = _pending[d.id]; delete _pending[d.id]; r(!!d.ok);
+        }
+    });
+})();
+</script>"""
+
 def _tml_base_shim(proxy_base):
     """A tiny <head> script that makes every root-absolute /api... call in the SPA come back
     through the FPP same-origin proxy. window.TML_BASE is the proxy prefix (empty for a direct
@@ -375,6 +389,30 @@ def _tml_base_shim(proxy_base):
         "}})();</script>"
     )
 
+# FPP's own stylesheets + theme hook, injected into every plugin page so it looks and themes
+# like FPP's native pages (§8). The pages are served SAME-ORIGIN through FPP's proxy, so these
+# root-absolute /css/... paths resolve to FPP's web server (exact files/order mirror FPP's
+# common/menuHead.inc). Dark mode is Bootstrap 5.3 native: FPP toggles data-bs-theme on <html>,
+# so we set the same attribute (from the ?theme= forwarded by the parent, a tml_theme postMessage,
+# or the OS preference) and every element driven by a --bs-* variable follows FPP's theme. On a
+# direct :5000 load (dev only) these 404 harmlessly; the palette's var() fallbacks keep it legible.
+FPP_THEME_HEAD = (
+    '<link rel="stylesheet" href="/css/fpp-bootstrap/dist/fpp-bootstrap-5-3.css">'
+    '<link rel="stylesheet" href="/css/fpp-system-design.css">'
+    '<link rel="stylesheet" href="/css/fpp.css">'
+    '<link rel="stylesheet" href="/css/fpp-dark.css">'
+    '<script>(function(){'
+    'function apply(t){try{var r=document.documentElement;'
+    'r.setAttribute("data-bs-theme",t);r.style.colorScheme=t;}catch(e){}}'
+    'try{var p=new URLSearchParams(location.search).get("theme");'
+    'var t=(p==="dark"||p==="light")?p:'
+    '((window.matchMedia&&window.matchMedia("(prefers-color-scheme: dark)").matches)?"dark":"light");'
+    'apply(t);}catch(e){}'
+    'window.addEventListener("message",function(e){'
+    'if(e.data&&e.data.type==="tml_theme"&&(e.data.theme==="dark"||e.data.theme==="light"))apply(e.data.theme);'
+    '});})();</script>'
+)
+
 @app.after_request
 def inject_iframe_resize(response):
     # Persist the access token as a cookie once a valid ?token= is presented, so
@@ -386,12 +424,14 @@ def inject_iframe_resize(response):
         body = response.get_data(as_text=True)
         # Proxy URL-rewrite shim FIRST (into <head>), so fetch/XHR are wrapped before any
         # page script runs. X-TML-Proxy-Base is set by proxy.php when served through FPP.
+        # FPP's stylesheets + theme hook go in right after, BEFORE each page's own <style>,
+        # so FPP provides the base look/theme and our page CSS still overrides where needed.
         shim = _tml_base_shim(request.headers.get('X-TML-Proxy-Base', ''))
         if '<head>' in body:
-            body = body.replace('<head>', '<head>' + shim, 1)
+            body = body.replace('<head>', '<head>' + shim + FPP_THEME_HEAD, 1)
         else:
-            body = shim + body
-        body = body.replace('</body>', IFRAME_RESIZE_SCRIPT + '</body>')
+            body = shim + FPP_THEME_HEAD + body
+        body = body.replace('</body>', IFRAME_RESIZE_SCRIPT + TML_UI_HELPERS + '</body>')
         response.set_data(body)
     return response
 
@@ -5905,51 +5945,47 @@ def index():
     <head>
         <title>Text My Lights - Configuration</title>
         <style>
-            /* Theme palette. Light defaults; the [data-theme="dark"] override is applied by
-               the head script below (from a ?theme= param forwarded by FPP, or the browser
-               preference). Brand accent colors (#4CAF50 etc.) are intentionally theme-agnostic. */
+            /* Brand accent colors (#4CAF50 etc.) are intentionally theme-agnostic. */
+            /* Palette mapped onto FPP's Bootstrap 5.3 theme variables so every element below
+               follows FPP's light/dark automatically (driven by data-bs-theme on <html>, set by
+               the injected FPP theme hook). The value after each comma is a fallback that keeps a
+               direct :5000 dev load legible when FPP's CSS isn't present. No separate dark block
+               is needed - the --bs-* values themselves change when the theme flips. */
             :root {
-              --bg:#ffffff; --fg:#333333; --fg-muted:#666666;
-              --card-bg:#ffffff; --section-bg:#f8f8f8;
-              --border:#dddddd; --border-strong:#cccccc; --input-bg:#ffffff;
-              --warn-bg:#fff3cd; --warn-fg:#856404; --warn-border:#ffc107;
-              --note-bg:#e3f2fd; --note-fg:#0d47a1; --note-border:#90caf9;
-              --tab-bg:#f0f0f0; --tab-fg:#555555; --tab-hover:#e8e8e8;
-              --queue-bg:#f3e5f5; --queue-border:#ce93d8;
-              --ok-bg:#e8f5e9; --ok-border:#c8e6c9;
-              --row-alt:#f5f5f5; --shadow:rgba(0,0,0,0.35);
-            }
-            :root[data-theme="dark"] {
-              --bg:#1e2127; --fg:#e6e6e6; --fg-muted:#a0a6b0;
-              --card-bg:#262a31; --section-bg:#23262d;
-              --border:#3a3f47; --border-strong:#4a5059; --input-bg:#2d323a;
-              --warn-bg:#4a3c0a; --warn-fg:#ffd98a; --warn-border:#8a6d00;
-              --note-bg:#0e2a40; --note-fg:#9fd0ff; --note-border:#2b5c82;
-              --tab-bg:#2a2e35; --tab-fg:#b8bec8; --tab-hover:#343941;
-              --queue-bg:#33263a; --queue-border:#6a4a78;
-              --ok-bg:#16341c; --ok-border:#2d5a37;
-              --row-alt:#262a31; --shadow:rgba(0,0,0,0.6);
-            }
-            @media (prefers-color-scheme: dark) {
-              :root:not([data-theme="light"]) {
-                --bg:#1e2127; --fg:#e6e6e6; --fg-muted:#a0a6b0;
-                --card-bg:#262a31; --section-bg:#23262d;
-                --border:#3a3f47; --border-strong:#4a5059; --input-bg:#2d323a;
-                --warn-bg:#4a3c0a; --warn-fg:#ffd98a; --warn-border:#8a6d00;
-                --note-bg:#0e2a40; --note-fg:#9fd0ff; --note-border:#2b5c82;
-                --tab-bg:#2a2e35; --tab-fg:#b8bec8; --tab-hover:#343941;
-                --queue-bg:#33263a; --queue-border:#6a4a78;
-                --ok-bg:#16341c; --ok-border:#2d5a37;
-                --row-alt:#262a31; --shadow:rgba(0,0,0,0.6);
-              }
+              --bg: var(--bs-body-bg, #ffffff);
+              --fg: var(--bs-body-color, #333333);
+              --fg-muted: var(--bs-secondary-color, #666666);
+              --card-bg: var(--bs-body-bg, #ffffff);
+              --section-bg: var(--bs-tertiary-bg, #f8f8f8);
+              --border: var(--bs-border-color, #dddddd);
+              --border-strong: var(--bs-border-color, #cccccc);
+              --input-bg: var(--bs-body-bg, #ffffff);
+              --warn-bg: var(--bs-warning-bg-subtle, #fff3cd);
+              --warn-fg: var(--bs-warning-text-emphasis, #856404);
+              --warn-border: var(--bs-warning-border-subtle, #ffc107);
+              --note-bg: var(--bs-info-bg-subtle, #e3f2fd);
+              --note-fg: var(--bs-info-text-emphasis, #0d47a1);
+              --note-border: var(--bs-info-border-subtle, #90caf9);
+              --tab-bg: var(--bs-tertiary-bg, #f0f0f0);
+              --tab-fg: var(--bs-secondary-color, #555555);
+              --tab-hover: var(--bs-secondary-bg, #e8e8e8);
+              --queue-bg: var(--bs-tertiary-bg, #f3e5f5);
+              --queue-border: var(--bs-border-color, #ce93d8);
+              --ok-bg: var(--bs-success-bg-subtle, #e8f5e9);
+              --ok-border: var(--bs-success-border-subtle, #c8e6c9);
+              --row-alt: var(--bs-tertiary-bg, #f5f5f5);
+              --shadow: rgba(0,0,0,0.35);
             }
             body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: var(--bg); color: var(--fg); }
             h1 { color: #4CAF50; }
             .section { background: var(--section-bg); padding: 20px; margin: 20px 0; border-radius: 5px; border: 1px solid var(--border); }
             label { display: block; margin: 10px 0 5px; font-weight: bold; }
             input, select, textarea { width: 100%; padding: 8px; margin-bottom: 10px; border: 1px solid var(--border-strong); border-radius: 4px; background: var(--input-bg); color: var(--fg); box-sizing: border-box; }
-            button { background: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin: 5px; }
+            /* Bootstrap-style focus ring so form fields read as FPP-native in both themes. */
+            input:focus, select:focus, textarea:focus { outline: none; border-color: #4CAF50; box-shadow: 0 0 0 .2rem rgba(76,175,80,.25); }
+            button { background: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin: 5px; transition: background .15s ease-in-out; }
             button:hover { background: #45a049; }
+            button:focus-visible { outline: none; box-shadow: 0 0 0 .2rem rgba(76,175,80,.35); }
             .test-btn { background: #2196F3; }
             .test-btn:hover { background: #0b7dda; }
             .view-btn { background: #FF9800; }
@@ -6017,18 +6053,18 @@ def index():
             <button class="view-btn" id="btn_view_queue" onclick="viewMessages()" style="margin:0 0 0 10px; padding:7px 14px; font-size:13px;">📋 View Message Queue</button>
             <span id="autosave_status" style="font-size:13px; margin-left:8px;"></span>
             <div style="margin-left:auto; display:flex; gap:4px; align-items:center;">
-                <button id="btn_plugin_toggle" onclick="pluginToggle()" style="background:#2e7d32; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-size:12px; font-weight:bold; cursor:pointer;">▶ Start</button>
+                <button id="btn_plugin_toggle" onclick="pluginToggle()" style="background:var(--bs-success, #2e7d32); color:#fff; border:none; padding:6px 12px; border-radius:4px; font-size:12px; font-weight:bold; cursor:pointer;">▶ Start</button>
             </div>
         </div>
 
         <!-- Plugin Live Banner -->
-        <div id="plugin_live_banner" style="display:none; background:#1b5e20; color:#fff; padding:10px 16px; border-radius:5px; margin-top:10px; font-size:14px; font-weight:bold; align-items:center; gap:10px;">
+        <div id="plugin_live_banner" style="display:none; background:var(--bs-success, #1b5e20); color:#fff; padding:10px 16px; border-radius:5px; margin-top:10px; font-size:14px; font-weight:bold; align-items:center; gap:10px;">
             <span style="display:inline-block; width:12px; height:12px; background:#69f0ae; border-radius:50%; box-shadow:0 0 6px #69f0ae;"></span>
             Plugin is Live - Press Stop or run the "Text My Lights Stop" script to stop displaying incoming messages.
         </div>
 
         <!-- Plugin Not Live Banner -->
-        <div id="plugin_not_live_banner" style="display:none; background:#b71c1c; color:#fff; padding:10px 16px; border-radius:5px; margin-top:10px; font-size:14px; font-weight:bold; align-items:center; gap:10px;">
+        <div id="plugin_not_live_banner" style="display:none; background:var(--bs-danger, #b71c1c); color:#fff; padding:10px 16px; border-radius:5px; margin-top:10px; font-size:14px; font-weight:bold; align-items:center; gap:10px;">
             <span style="display:inline-block; width:12px; height:12px; background:#ff8a80; border-radius:50%; box-shadow:0 0 6px #ff8a80;"></span>
             <span>Plugin is Not Live - Press Start or run the "Text My Lights Start" script to display incoming messages.<br>
             <span style="font-weight:normal; font-size:12px;">Note: Viewers can still send messages, messaging rates will apply, but no messages will be displayed.</span></span>
@@ -6077,7 +6113,7 @@ def index():
                         <!-- Twilio credentials - shown when Message Source = Twilio -->
                         <div id="twilio_creds">
                             <h3 style="margin:14px 0 6px;">Twilio Settings</h3>
-                            <div style="background:#f8d7da; border:2px solid #f5c6cb; color:#721c24; border-radius:6px; padding:12px 16px; margin:4px 0 12px; font-size:13px;">
+                            <div style="background:var(--bs-danger-bg-subtle, #f8d7da); border:2px solid var(--bs-danger-border-subtle, #f5c6cb); color:var(--bs-danger-text-emphasis, #721c24); border-radius:6px; padding:12px 16px; margin:4px 0 12px; font-size:13px;">
                                 &#9940; <strong>Twilio SMS auto-responses are not enabled.</strong>
                                 <span style="font-weight:normal; display:block; margin-top:6px;">
                                     Sending reply texts from a Twilio number requires A2P 10DLC brand &amp; campaign registration (or toll-free verification), which is not set up for this plugin. Receiving texted names still works and they will appear on your display, but no SMS replies are sent. Use Google Voice if you need auto-responses.
@@ -6118,20 +6154,20 @@ def index():
 
                         <!-- Live Name Approval - Google Voice only; shown/hidden by updateSourceUI() -->
                         <div id="gv_approval" style="display:none;">
-                            <hr style="border:none; border-top:1px solid #444; margin:16px 0;">
+                            <hr style="border:none; border-top:1px solid var(--border); margin:16px 0;">
                             <h3 style="margin:14px 0 6px;">🙋 Live Name Approval (optional) <span id="live_approval_wl_state" style="font-size:13px; font-weight:normal; margin-left:6px; padding:2px 8px; border-radius:10px;"></span></h3>
                             <p class="help-text" style="margin:4px 0 8px;">When the whitelist is on and the show is live, a texter who sends a name that is not on the list can be approved by you over text. Leave the number blank to turn this off. </p>
 
-                            <div id="admin_no_gv_warning" style="{{ '' if (config.get('admin_phone','') and not admin_gv_linked) else 'display:none;' }} background:#fdecea; border:1px solid #f44336; color:#b71c1c; border-radius:6px; padding:10px 14px; margin-bottom:10px; font-size:13px;">
+                            <div id="admin_no_gv_warning" style="{{ '' if (config.get('admin_phone','') and not admin_gv_linked) else 'display:none;' }} background:var(--bs-danger-bg-subtle, #fdecea); border:1px solid #f44336; color:var(--bs-danger-text-emphasis, #b71c1c); border-radius:6px; padding:10px 14px; margin-bottom:10px; font-size:13px;">
                                 🔴 <strong>No Google Voice account linked.</strong> Enter and test your Gmail address and App Password above first. Until a Google Voice account is connected there is no number to text, so live approvals cannot be set up.
                             </div>
                             <div id="admin_bootstrap_banner" style="{{ '' if (config.get('admin_phone','') and not admin_ctx_seeded and admin_gv_linked) else 'display:none;' }} background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn-fg); border-radius:6px; padding:10px 14px; margin-bottom:10px; font-size:13px;">
                                 ⚠️ <strong>Action needed:</strong> from the admin phone (<span id="admin_banner_num">{{ config.get('admin_phone','') }}</span>), text the word <strong>admin</strong> to your Google Voice number to connect. You will not receive approval requests until you do. The word "admin" is never shown on the display.
                             </div>
-                            <div id="admin_connected_note" style="{{ '' if (config.get('admin_phone','') and admin_ctx_seeded) else 'display:none;' }} background:var(--ok-bg); border:1px solid #66bb6a; color:#2e7d32; border-radius:6px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
+                            <div id="admin_connected_note" style="{{ '' if (config.get('admin_phone','') and admin_ctx_seeded) else 'display:none;' }} background:var(--ok-bg); border:1px solid #66bb6a; color:var(--bs-success-text-emphasis, #2e7d32); border-radius:6px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
                                 ✅ Admin phone connected - live approvals are active.
                             </div>
-                            <div id="admin_thread_warning" style="{{ '' if (config.get('admin_phone','') and admin_gv_linked) else 'display:none;' }} background:#fdecea; border:1px solid #f44336; color:#b71c1c; border-radius:6px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
+                            <div id="admin_thread_warning" style="{{ '' if (config.get('admin_phone','') and admin_gv_linked) else 'display:none;' }} background:var(--bs-danger-bg-subtle, #fdecea); border:1px solid #f44336; color:var(--bs-danger-text-emphasis, #b71c1c); border-radius:6px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
                                 🔴 <strong>Keep the "admin" email:</strong> Google Voice does not have the ability to send outbound messages without an exisiting email thread. The "admin" email must remain in your Gmail inbox for approvals to work.
                             </div>
 
@@ -6145,7 +6181,7 @@ def index():
                     <div class="section">
                         <h2 style="margin-top: 0;">FPP Display Settings</h2>
 
-                        <div id="fpp_content_live_warning" style="display:none; background:#b71c1c; color:#fff; border-radius:5px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
+                        <div id="fpp_content_live_warning" style="display:none; background:var(--bs-danger, #b71c1c); color:#fff; border-radius:5px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
                             🔴 <strong>Plugin is Live</strong>; run Text My Lights Stop or press Stop to edit
                         </div>
                         <div id="fpp_content_inputs">
@@ -6218,7 +6254,7 @@ def index():
                                         </div>
                                     </div>
                                     <div style="margin-top:16px; display:flex; justify-content:flex-end; gap:8px;">
-                                        <button type="button" onclick="closeManageContentModal()" style="background:#2e7d32; color:#fff; padding:8px 20px; border:none; border-radius:4px; cursor:pointer;">Done</button>
+                                        <button type="button" onclick="closeManageContentModal()" style="background:var(--bs-success, #2e7d32); color:#fff; padding:8px 20px; border:none; border-radius:4px; cursor:pointer;">Done</button>
                                     </div>
                                 </div>
                             </div>
@@ -6248,7 +6284,7 @@ def index():
                                         </div>
                                     </div>
                                     <div style="margin-top:16px; display:flex; justify-content:flex-end; gap:8px;">
-                                        <button type="button" onclick="closeManageWaitingModal()" style="background:#2e7d32; color:#fff; padding:8px 20px; border:none; border-radius:4px; cursor:pointer;">Done</button>
+                                        <button type="button" onclick="closeManageWaitingModal()" style="background:var(--bs-success, #2e7d32); color:#fff; padding:8px 20px; border:none; border-radius:4px; cursor:pointer;">Done</button>
                                     </div>
                                 </div>
                             </div>
@@ -6303,14 +6339,14 @@ def index():
                             </div>
                             <p class="help-text" style="margin-top:4px;">ℹ️ When a sender texts this many blacklisted words in one day, their number is added to the Phone Blocklist (only you can release it). The daily tally resets at midnight. Set to <strong>0</strong> to turn off auto-blocking.</p>
                         </div>
-                        <div id="profanity_disabled_warning" style="display:none; background:#f8d7da; border:1px solid #f5c6cb; color:#721c24; border-radius:5px; padding:8px 12px; margin-top:8px; font-size:13px;">
+                        <div id="profanity_disabled_warning" style="display:none; background:var(--bs-danger-bg-subtle, #f8d7da); border:1px solid var(--bs-danger-border-subtle, #f5c6cb); color:var(--bs-danger-text-emphasis, #721c24); border-radius:5px; padding:8px 12px; margin-top:8px; font-size:13px;">
                             ⚠️ <strong>Profanity filter is disabled</strong> - this is not recommended. Re-enable it to filter names against the Blacklist.
                         </div>
-                        <div id="whitelist_profanity_note" style="display:none; background:#d4edda; border:1px solid #c3e6cb; color:#155724; border-radius:5px; padding:8px 12px; margin-top:8px; font-size:13px;">
+                        <div id="whitelist_profanity_note" style="display:none; background:var(--bs-success-bg-subtle, #d4edda); border:1px solid #c3e6cb; color:var(--bs-success-text-emphasis, #155724); border-radius:5px; padding:8px 12px; margin-top:8px; font-size:13px;">
                             ℹ️ With the whitelist on, the profanity filter screens names that are <strong>not</strong> on the list: a blacklisted word gets the Profanity response (and is never sent to the admin for approval) and still counts toward the sender's daily profanity threshold.
                         </div>
 
-                        <hr style="border:none; border-top:1px solid #444; margin:15px 0;">
+                        <hr style="border:none; border-top:1px solid var(--border); margin:15px 0;">
 
                         <label class="toggle-switch"><input type="checkbox" id="use_whitelist" {{ 'checked' if config.get('use_whitelist', False) else '' }} onchange="updateFormatRules(); checkFiltersState(); checkWhitelistResponseState(); updateLiveApprovalWlState(); updateAdminApprovalUI(); saveConfig();"><span class="toggle-slider"></span></label>
                         <label class="checkbox-label">Enable Name Whitelist - only allow approved names</label><br>
@@ -6333,7 +6369,7 @@ def index():
                                        onchange="if(this.checked) document.getElementById('one_word_only').checked = false; checkFormatWarning(); updateWordsPreview(); saveConfig();"><span class="toggle-slider"></span></label>
                                 <label class="checkbox-label">Two Words Maximum (e.g., "John Smith" ✓, sentences ✗)</label><br>
 
-                                <div id="format_warning" style="display:none; background:#f8d7da; border:1px solid #f5c6cb; color:#721c24; border-radius:5px; padding:10px 14px; margin:8px 0; font-size:13px;">
+                                <div id="format_warning" style="display:none; background:var(--bs-danger-bg-subtle, #f8d7da); border:1px solid var(--bs-danger-border-subtle, #f5c6cb); color:var(--bs-danger-text-emphasis, #721c24); border-radius:5px; padding:10px 14px; margin:8px 0; font-size:13px;">
                                     ⚠️ <strong>Warning:</strong> With no format rules enabled, viewers can send any message up to your Max Message Length. This is not recommended.
                                 </div>
                             </div>
@@ -6346,7 +6382,7 @@ def index():
                         <label style="font-weight:bold; margin-bottom:4px;">Phone Blocklist</label>
                         <button onclick="tmlGo('/blocklist')" style="background:#f44336; margin-top:4px; display:block;">🚫 View Blocklist</button>
 
-                        <hr style="border:none; border-top:1px solid #444; margin:15px 0;">
+                        <hr style="border:none; border-top:1px solid var(--border); margin:15px 0;">
 
                         <label class="toggle-switch"><input type="checkbox" id="allow_duplicate_names" {{ 'checked' if config.get('allow_duplicate_names', False) else '' }} onchange="checkDuplicateState(); saveConfig();"><span class="toggle-slider"></span></label>
                         <label class="checkbox-label">Allow Duplicate Names - same phone number can submit the same name multiple times per day</label>
@@ -6355,7 +6391,7 @@ def index():
                 </div>
 
                 <!-- Multiple names (grouped texts) explainer -->
-                <div style="background:#e7f3ff; border:1px solid #4a90d9; color:#1a3d5c; border-radius:6px; padding:10px 14px; margin-top:14px; font-size:13px; line-height:1.55;">
+                <div style="background:var(--bs-info-bg-subtle, #e7f3ff); border:1px solid #4a90d9; color:var(--bs-info-text-emphasis, #1a3d5c); border-radius:6px; padding:10px 14px; margin-top:14px; font-size:13px; line-height:1.55;">
                     <strong>📝 Multiple names in one text</strong><br>
                     Texters can submit several names at once, separated by <strong>commas or line breaks</strong>
                     (e.g. <em>"Alex, Sam, Jordan"</em>). Multi-word names like <em>"Mary Jane"</em> stay intact -
@@ -6616,7 +6652,7 @@ def index():
                              +  '</label>';
                     });
                     if (d.selected && d.selected_reachable === false) {
-                        html += '<p class="help-text" style="color:#c62828;">warning: the selected master is not reachable right now.</p>';
+                        html += '<p class="help-text" style="color:var(--bs-danger-text-emphasis, #c62828);">warning: the selected master is not reachable right now.</p>';
                     }
                     box.innerHTML = html;
                 }
@@ -6694,7 +6730,7 @@ def index():
             <!-- Backup & Restore -->
             <div class="section">
                 <h2>💾 Backup &amp; Restore</h2>
-                <p class="help-text" style="margin-bottom:12px;">Export the plugin settings, block/word lists, and overlay model into one small file, then import it on another Pi to reproduce this setup. Heavy content files (sequences/videos) are <strong>not</strong> bundled by default - those are distributed by xLights FPP Connect; the export just records which content to use by name. <strong>Credentials are not included</strong>; re-enter them after importing. <a id="backup_help_link" href="#" target="_top">Learn more</a></p>
+                <p class="help-text" style="margin-bottom:12px;">Export the plugin settings and block/word lists into one small file, then import it on another Pi to reproduce this setup. This bundles only the plugin's <strong>own</strong> data - sequences, images, videos and the overlay model belong to FPP and are not included (distribute sequences with xLights FPP Connect and set the overlay model in FPP). <strong>Credentials are not included</strong>; re-enter them after importing. <a id="backup_help_link" href="#" target="_top">Learn more</a></p>
                 <div id="backup_actions" style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
                     <button type="button" class="test-btn" onclick="openExportModal()"
                        style="background:#4CAF50;">⬇️ Export Config</button>
@@ -6717,22 +6753,14 @@ def index():
             <div id="export_modal" onclick="if(event.target===this)closeExportModal()" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:100000; align-items:center; justify-content:center;">
                 <div id="export_dialog" style="background:var(--card-bg); color:var(--fg); max-width:460px; width:92%; border-radius:8px; padding:22px; box-shadow:0 8px 30px rgba(0,0,0,0.35); max-height:88vh; overflow-y:auto; box-sizing:border-box;">
                     <h3 style="margin:0 0 6px; color:var(--fg);">Export Config</h3>
-                    <p class="help-text" style="margin:0 0 14px;">Choose what to include. Only the content <strong>this plugin is set to use</strong> is exported - never all of FPP's files. <strong>Credentials are never included.</strong></p>
+                    <p class="help-text" style="margin:0 0 14px;">This exports only the plugin's <strong>own</strong> data. FPP's sequences, images, videos and the overlay model are not included (distribute sequences with xLights FPP Connect; set the overlay model in FPP). <strong>Credentials are never included.</strong></p>
                     <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 12px;">
                         <input type="checkbox" id="exp_settings" checked style="width:auto; margin:3px 0 0;">
-                        <span><strong>Plugin settings</strong><br><span class="help-text">Display lines, message rules, response text, filters, poll interval, selected content &amp; overlay model.</span></span>
-                    </label>
-                    <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 12px;">
-                        <input type="checkbox" id="exp_lists" checked style="width:auto; margin:3px 0 0;">
-                        <span><strong>Blocked numbers &amp; word lists</strong><br><span class="help-text">Blocked phone numbers and your whitelist / blacklist words.</span></span>
-                    </label>
-                    <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 12px;">
-                        <input type="checkbox" id="exp_content" style="width:auto; margin:3px 0 0;">
-                        <span><strong>Content files</strong> (off by default)<br><span class="help-text">Copies the actual Waiting / Name Display sequence, image, and video files into the bundle - can be large. Leave OFF: xLights FPP Connect already distributes sequences to your Pis, so the export just records which content to use by name. Turn ON only for a fully self-contained copy.</span></span>
+                        <span><strong>Plugin settings</strong><br><span class="help-text">Display lines, message rules, response text, filters, poll interval, and the selected content &amp; overlay model <em>names</em>.</span></span>
                     </label>
                     <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 18px;">
-                        <input type="checkbox" id="exp_overlay" checked style="width:auto; margin:3px 0 0;">
-                        <span><strong>Overlay model (matrix)</strong><br><span class="help-text">The FPP Pixel Overlay Model the names are drawn onto.</span></span>
+                        <input type="checkbox" id="exp_lists" checked style="width:auto; margin:3px 0 0;">
+                        <span><strong>Blocked numbers &amp; word lists</strong><br><span class="help-text">Blocked phone numbers and your whitelist / blacklist words.</span></span>
                     </label>
                     <div style="display:flex; gap:10px; justify-content:flex-end;">
                         <button type="button" id="exp_cancel" onclick="closeExportModal()" style="background:#9e9e9e;">Cancel</button>
@@ -6760,8 +6788,7 @@ def index():
                 // has fully downloaded and surface server errors. Returns a Promise.
                 function _tmlDownload(sel) {
                     var url = '/api/config/export?settings=' + (sel.s ? 1 : 0)
-                            + '&lists=' + (sel.l ? 1 : 0) + '&content=' + (sel.c ? 1 : 0)
-                            + '&overlay=' + (sel.o ? 1 : 0);
+                            + '&lists=' + (sel.l ? 1 : 0);
                     // Stream the download NATIVELY: a plain anchor lets the browser write
                     // the (potentially very large) zip straight to disk. The old
                     // fetch().blob() buffered the ENTIRE zip into JS memory first, which
@@ -6809,11 +6836,9 @@ def index():
                     if (window._tmlExporting) return;
                     var sel = {
                         s: document.getElementById('exp_settings').checked,
-                        l: document.getElementById('exp_lists').checked,
-                        c: document.getElementById('exp_content').checked,
-                        o: document.getElementById('exp_overlay').checked
+                        l: document.getElementById('exp_lists').checked
                     };
-                    if (!sel.s && !sel.l && !sel.c && !sel.o) { alert('Select at least one thing to export.'); return; }
+                    if (!sel.s && !sel.l) { tmlNotify('Select at least one thing to export.', 'warning'); return; }
                     var go = document.getElementById('exp_go');
                     window._tmlExporting = true;
                     go.disabled = true; go.textContent = 'Exporting...';
@@ -6830,7 +6855,7 @@ def index():
                         window._tmlExporting = false;
                         go.disabled = false; go.textContent = 'Export';
                         document.getElementById('exp_cancel').disabled = false;
-                        alert('Export failed: ' + ((err && err.message) || err));
+                        tmlNotify('Export failed: ' + ((err && err.message) || err), 'danger');
                     });
                 };
                 // Holds the file the user picked, until they confirm the import in
@@ -6859,24 +6884,26 @@ def index():
                         try { window.parent.postMessage({ type: 'tml_openImport', name: file.name }, '*'); return; } catch (e) {}
                     }
                     // Fallback (page opened directly): confirm + import inline.
-                    if (!confirm('Import configuration from "' + file.name + '"? '
-                        + 'This overwrites the plugin settings, block/whitelist, the referenced '
-                        + 'content files, and the overlay model on THIS Pi. Your saved credentials '
-                        + 'are kept. Continue?')) { _tmlImportFile = null; return; }
-                    var status = document.getElementById('import_status');
-                    status.style.color = '#555'; status.textContent = 'Importing...';
-                    _tmlDoImport(file).then(function(d) {
+                    tmlConfirm('Import configuration from "' + file.name + '"? '
+                        + 'This overwrites the plugin settings and block/whitelist on THIS Pi. '
+                        + 'FPP\'s sequences, media and overlay model are not touched. Your saved '
+                        + 'credentials are kept. Continue?', { danger: true, okText: 'Import' }).then(function(ok) {
+                      if (!ok) { _tmlImportFile = null; return; }
+                      var status = document.getElementById('import_status');
+                      status.style.color = '#555'; status.textContent = 'Importing...';
+                      _tmlDoImport(file).then(function(d) {
                         if (d.success) {
-                            status.style.color = '#2e7d32';
+                            status.style.color = 'var(--bs-success-text-emphasis, #2e7d32)';
                             status.textContent = 'Imported. Reloading...';
                             setTimeout(function() { location.reload(); }, 1400);
                         } else {
-                            status.style.color = '#c62828';
+                            status.style.color = 'var(--bs-danger-text-emphasis, #c62828)';
                             status.textContent = 'Error: ' + (d.error || 'Import failed');
                         }
-                    }).catch(function() {
-                        status.style.color = '#c62828';
+                      }).catch(function() {
+                        status.style.color = 'var(--bs-danger-text-emphasis, #c62828)';
                         status.textContent = 'Import request failed.';
+                      });
                     });
                 };
 
@@ -6913,28 +6940,28 @@ def index():
 
                         <label style="font-size:11px; color:var(--fg-muted); font-weight:bold;">Use {name} as placeholder for texts in any line. Empty lines are skipped.</label>
                         <style>
-                            .line-card { background:#3a3a3a; border:1px solid #555; border-radius:5px; padding:8px 8px 6px; margin-bottom:6px; }
+                            .line-card { background:var(--section-bg); border:1px solid var(--border); border-radius:5px; padding:8px 8px 6px; margin-bottom:6px; }
                             .line-row { display:flex; align-items:center; gap:6px; }
                             .line-row input[type="text"] { margin-bottom:0; padding:6px; }
-                            .line-label { width:46px; font-size:12px; color:#aaa; flex-shrink:0; }
+                            .line-label { width:46px; font-size:12px; color:var(--fg-muted); flex-shrink:0; }
                             .pos-badge { font-size:11px; color:var(--fg-muted); white-space:nowrap; min-width:80px; text-align:right; font-family:monospace; }
-                            .reset-line-btn { background:#444; border:none; color:#ccc; padding:2px 7px; font-size:12px; border-radius:3px; cursor:pointer; flex-shrink:0; }
-                            .reset-line-btn:hover { background:#666; }
+                            .reset-line-btn { background:var(--tab-bg); border:none; color:var(--fg); padding:2px 7px; font-size:12px; border-radius:3px; cursor:pointer; flex-shrink:0; }
+                            .reset-line-btn:hover { background:var(--tab-hover); }
                             .line-color-group { position:relative; display:flex; align-items:center; flex-shrink:0; }
-                            .line-color-swatch { width:24px; height:24px; padding:0; border:1px solid #666; border-radius:4px 0 0 4px; cursor:pointer; background:none; }
-                            .color-palette-btn { width:16px; height:24px; padding:0; border:1px solid #666; border-left:none; border-radius:0 4px 4px 0; background:#444; color:#ccc; font-size:9px; cursor:pointer; }
-                            .color-palette-btn:hover { background:#666; }
-                            .color-palette-popover { position:absolute; top:28px; right:0; z-index:50; background:#2a2a2a; border:1px solid #666; border-radius:5px; padding:8px; width:140px; box-shadow:0 4px 12px rgba(0,0,0,0.5); }
+                            .line-color-swatch { width:24px; height:24px; padding:0; border:1px solid var(--border); border-radius:4px 0 0 4px; cursor:pointer; background:none; }
+                            .color-palette-btn { width:16px; height:24px; padding:0; border:1px solid var(--border); border-left:none; border-radius:0 4px 4px 0; background:var(--tab-bg); color:var(--fg); font-size:9px; cursor:pointer; }
+                            .color-palette-btn:hover { background:var(--tab-hover); }
+                            .color-palette-popover { position:absolute; top:28px; right:0; z-index:50; background:var(--card-bg); border:1px solid var(--border); border-radius:5px; padding:8px; width:140px; box-shadow:0 4px 12px var(--shadow); }
                             .color-palette-swatches { display:flex; flex-wrap:wrap; gap:4px; }
-                            .color-palette-swatch { width:20px; height:20px; border:1px solid #666; border-radius:3px; padding:0; cursor:pointer; }
-                            .color-palette-save-btn { margin-top:6px; width:100%; font-size:11px; background:#444; color:#ccc; border:1px dashed #888; border-radius:3px; padding:4px; cursor:pointer; }
+                            .color-palette-swatch { width:20px; height:20px; border:1px solid var(--border); border-radius:3px; padding:0; cursor:pointer; }
+                            .color-palette-save-btn { margin-top:6px; width:100%; font-size:11px; background:var(--tab-bg); color:var(--fg); border:1px dashed var(--border-strong); border-radius:3px; padding:4px; cursor:pointer; }
                             .color-palette-empty { font-size:10px; color:var(--fg-muted); text-align:center; padding:4px 0; }
-                            .line-movement-row { margin-top:5px; padding-top:5px; border-top:1px solid #555; }
-                            .line-mini-label { font-weight:normal; font-size:12px; color:#aaa; flex-shrink:0; }
+                            .line-movement-row { margin-top:5px; padding-top:5px; border-top:1px solid var(--border); }
+                            .line-mini-label { font-weight:normal; font-size:12px; color:var(--fg-muted); flex-shrink:0; }
                             .line-group-controls { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
                             .line-group-controls select { width:auto; margin-bottom:0; padding:6px; flex:1; min-width:160px; }
                             .line-speed-row { display:flex; align-items:center; gap:6px; }
-                            .line-speed-row label { margin:0; font-weight:normal; font-size:12px; color:#aaa; }
+                            .line-speed-row label { margin:0; font-weight:normal; font-size:12px; color:var(--fg-muted); }
                             .line-speed-row input[type="number"] { width:56px; margin-bottom:0; padding:6px; }
                             .line-speed-auto { display:inline-flex; align-items:center; gap:4px; cursor:pointer; white-space:nowrap; }
                             .line-speed-auto input[type="checkbox"] { width:auto; margin:0; cursor:pointer; }
@@ -7178,11 +7205,11 @@ def index():
 
                         <!-- Canvas: per-line drag in static mode; block preview in scroll modes -->
                         <div id="canvas_section">
-                            <p id="canvas_hint" style="font-weight:bold; font-size:13px; color:#4fc3f7; margin:4px 0 8px;">🖱️ Click a line to select it, then drag inside its box to move it, or drag an edge/corner to resize. Text auto-sizes to fill the box - the box is the MAX size text can be.</p>
+                            <p id="canvas_hint" style="font-weight:bold; font-size:13px; color:var(--bs-info-text-emphasis, #4fc3f7); margin:4px 0 8px;">🖱️ Click a line to select it, then drag inside its box to move it, or drag an edge/corner to resize. Text auto-sizes to fill the box - the box is the MAX size text can be.</p>
                             <p class="help-text" style="margin:-4px 0 8px;">↔️ For scrolling text (Left/Right/Top/Bottom movement), the box is also where the text is allowed to show - it enters and exits at the box's own edges, not the display's, and always starts fully off-page before scrolling in.</p>
-                            <canvas id="matrix_canvas" style="width:100%; display:block; background:#000; border:2px solid #555; border-radius:4px; cursor:default;"></canvas>
+                            <canvas id="matrix_canvas" style="width:100%; display:block; background:#000; border:2px solid var(--border); border-radius:4px; cursor:default;"></canvas>
                             <div style="display:flex; gap:8px; margin-top:6px; align-items:center;">
-                                <button type="button" onclick="resetAllLines()" style="background:#555; padding:6px 12px; font-size:12px;">Reset All to Center</button>
+                                <button type="button" onclick="resetAllLines()" style="background:var(--bs-secondary, #6c757d); color:#fff; padding:6px 12px; font-size:12px;">Reset All to Center</button>
                                 <button type="button" id="btn_sync_pos_master" onclick="syncPositionFromMaster(this)" style="display:none; background:#1976d2; color:#fff; padding:6px 12px; font-size:12px;" title="Copy the Master's text layout for this content, scaled to this projector's model">🔗 Sync from Master</button>
                                 <span id="pos_display" style="font-size:12px; color:var(--fg-muted);"></span>
                                 <span id="sync_pos_status" style="font-size:12px; color:var(--fg-muted);"></span>
@@ -7199,32 +7226,32 @@ def index():
                             <p class="help-text" id="content_duration_remote_note" style="display:none; margin:6px 0 0;">⏱ Display duration is controlled by the Master (it starts and stops the effect for every projector). Scrolling lines set to "Fit to time" use the Master's duration as their scroll window.</p>
 
                             <!-- Canvas background preview (FSEQ / video / image) -->
-                            <div style="margin-top:10px; padding:10px; background:#616161; border:1px solid #777; border-radius:4px;">
-                                <span style="font-size:13px; font-weight:bold; color:#eee;">Background Preview</span>
-                                <span id="fseq_scrub_hint" style="font-weight:normal; font-size:11px; color:#bbb; margin-left:6px;">Use scroll bar to move preview.</span>
+                            <div style="margin-top:10px; padding:10px; background:var(--section-bg); border:1px solid var(--border); border-radius:4px;">
+                                <span style="font-size:13px; font-weight:bold; color:var(--fg);">Background Preview</span>
+                                <span id="fseq_scrub_hint" style="font-weight:normal; font-size:11px; color:var(--fg-muted); margin-left:6px;">Use scroll bar to move preview.</span>
                                 <div id="fseq_preview_controls" style="margin-top:8px;">
 
                                     <!-- Master with no local projector: preview using a synced remote's
                                          overlay (its real size + its rendered background). Shown only on a
                                          master that has synced remotes; defaults to the largest overlay. -->
-                                    <div id="preview_remote_row" style="display:none; margin-bottom:8px; padding:8px; background:#3a3a3a; border:1px solid #555; border-radius:4px;">
-                                        <label style="display:block; margin:0 0 4px; font-size:12px; color:#eee;">🖥️ Preview from projector:</label>
+                                    <div id="preview_remote_row" style="display:none; margin-bottom:8px; padding:8px; background:var(--section-bg); border:1px solid var(--border); border-radius:4px;">
+                                        <label style="display:block; margin:0 0 4px; font-size:12px; color:var(--fg);">🖥️ Preview from projector:</label>
                                         <select id="preview_remote_select" onchange="onPreviewRemoteChange()" style="width:100%;"></select>
-                                        <p class="help-text" id="preview_remote_note" style="margin:4px 0 0; color:#bbb;"></p>
+                                        <p class="help-text" id="preview_remote_note" style="margin:4px 0 0; color:var(--fg-muted);"></p>
                                     </div>
 
                                     <!-- Per-content editor: pick which Names content's text you are
                                          arranging/previewing. Shown only when >1 content is configured. -->
-                                    <div id="preview_content_row" style="display:none; margin-bottom:8px; padding:8px; background:#3a3a3a; border:1px solid #555; border-radius:4px;">
+                                    <div id="preview_content_row" style="display:none; margin-bottom:8px; padding:8px; background:var(--section-bg); border:1px solid var(--border); border-radius:4px;">
                                         <select id="preview_content_select" onchange="onPreviewContentChange()" style="width:100%;"></select>
                                     </div>
 
                                     <div id="fseq_scrubber_row" style="display:none;">
                                         <div style="display:flex; align-items:center; gap:8px;">
-                                            <span id="fseq_time_display" style="font-size:12px; color:#aaa; min-width:85px; white-space:nowrap;">0:00 / 0:00</span>
+                                            <span id="fseq_time_display" style="font-size:12px; color:var(--fg-muted); min-width:85px; white-space:nowrap;">0:00 / 0:00</span>
                                             <input type="range" id="fseq_scrubber" min="0" max="100" value="0" step="1"
                                                    style="flex:1;" oninput="fseqScrub(this.value)">
-                                            <button type="button" onclick="clearFseqPreview()" style="padding:4px 8px; font-size:11px; background:#555; color:#fff; border:none; border-radius:3px; cursor:pointer;">Clear</button>
+                                            <button type="button" onclick="clearFseqPreview()" style="padding:4px 8px; font-size:11px; background:var(--bs-secondary, #6c757d); color:#fff; border:none; border-radius:3px; cursor:pointer;">Clear</button>
                                         </div>
                                         <div id="fseq_status" style="font-size:11px; color:var(--fg-muted); margin-top:4px; min-height:16px;"></div>
                                     </div>
@@ -7272,7 +7299,7 @@ def index():
                     <div style="background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn-fg); border-radius:5px; padding:10px 14px; margin:10px 0; font-size:13px;">
                         ⚠️ <strong>Message &amp; data rates may apply.</strong>
                     </div>
-                    <div style="background:#f8d7da; border:2px solid #f5c6cb; color:#721c24; border-radius:6px; padding:12px 16px; margin:10px 0; font-size:14px; font-weight:bold;">
+                    <div style="background:var(--bs-danger-bg-subtle, #f8d7da); border:2px solid var(--bs-danger-border-subtle, #f5c6cb); color:var(--bs-danger-text-emphasis, #721c24); border-radius:6px; padding:12px 16px; margin:10px 0; font-size:14px; font-weight:bold;">
                         ⛔ SMS responses will NOT be delivered unless your Twilio number is registered:<br>
                         <span style="font-weight:normal; font-size:13px; display:block; margin-top:6px;">
                             • <strong>Local 10-digit number</strong> - requires a valid A2P 10DLC brand &amp; campaign approval<br>
@@ -7495,10 +7522,10 @@ def index():
                         if (!el || !wl) return;
                         if (wl.checked) {
                             el.textContent = 'Whitelist is On';
-                            el.style.background = 'var(--ok-bg)'; el.style.color = '#2e7d32';
+                            el.style.background = 'var(--ok-bg)'; el.style.color = 'var(--bs-success-text-emphasis, #2e7d32)';
                         } else {
                             el.textContent = 'Whitelist is Off';
-                            el.style.background = '#fdecea'; el.style.color = '#b71c1c';
+                            el.style.background = 'var(--bs-danger-bg-subtle, #fdecea)'; el.style.color = 'var(--bs-danger-text-emphasis, #b71c1c)';
                         }
                     }
                     window.updateLiveApprovalWlState = updateLiveApprovalWlState;
@@ -7589,7 +7616,7 @@ def index():
             <div id="test_message_section" class="section" style="border: 2px solid #FF9800; margin-top: 20px;">
                 <h2>🧪 Message Testing</h2>
 
-                <div id="show_not_live_banner" style="display:none; background:#ffecb3; border:1px solid #FF9800; border-radius:6px; padding:10px 14px; margin-bottom:14px; color:#7a4f00; font-size:14px;">
+                <div id="show_not_live_banner" style="display:none; background:var(--bs-warning-bg-subtle, #ffecb3); border:1px solid #FF9800; border-radius:6px; padding:10px 14px; margin-bottom:14px; color:var(--bs-warning-text-emphasis, #7a4f00); font-size:14px;">
                     🔴 Show is not live - press <strong>Start</strong> or run the <strong>Text My Lights Start</strong> script to activate the display before testing.
                 </div>
 
@@ -7642,11 +7669,11 @@ def index():
                 .then(r => r.json())
                 .then(function(d) {
                     if (goingLive && d.success === false) {
-                        alert('Start failed: ' + (d.error || 'Unknown error'));
+                        tmlNotify('Start failed: ' + (d.error || 'Unknown error'), 'danger');
                     }
                     updateLiveStatus();
                 })
-                .catch(function() { alert((goingLive ? 'Start' : 'Stop') + ' request failed.'); })
+                .catch(function() { tmlNotify((goingLive ? 'Start' : 'Stop') + ' request failed.', 'danger'); })
                 .finally(function() { btn.disabled = false; refreshStartBtnState(); });
             }
 
@@ -7668,7 +7695,7 @@ def index():
                     const toggle = document.getElementById('btn_plugin_toggle');
                     if (toggle) {
                         toggle.textContent = live ? '■ Stop' : '▶ Start';
-                        toggle.style.background = live ? '#c62828' : '#2e7d32';
+                        toggle.style.background = live ? 'var(--bs-danger-text-emphasis, #c62828)' : 'var(--bs-success-text-emphasis, #2e7d32)';
                     }
                     refreshStartBtnState();   // keep the no-overlay grey-out in sync with live state
 
@@ -9106,7 +9133,7 @@ def index():
                     if (box) {
                         box.innerHTML='';
                         if (lst.length===0) {
-                            box.innerHTML='<div style="font-size:13px;color:#777;">No content added - names show over the Waiting content.</div>';
+                            box.innerHTML='<div style="font-size:13px;color:var(--fg-muted);">No content added - names show over the Waiting content.</div>';
                         } else {
                             lst.forEach(function(it, i){
                                 var row=document.createElement('div');
@@ -9413,7 +9440,7 @@ def index():
                     if (box) {
                         box.innerHTML='';
                         if (lst.length===0) {
-                            box.innerHTML='<div style="font-size:13px;color:#777;">No content added yet - click below to choose the sequence(s) that loop while waiting.</div>';
+                            box.innerHTML='<div style="font-size:13px;color:var(--fg-muted);">No content added yet - click below to choose the sequence(s) that loop while waiting.</div>';
                         } else {
                             lst.forEach(function(it, i){
                                 var row=document.createElement('div');
@@ -9422,7 +9449,7 @@ def index():
                                 label.style.cssText='flex:1;font-size:13px;color:var(--fg);';
                                 var miss=_waitingIsMissing(it.content);
                                 label.textContent=(i+1)+'. '+(it.content||'(none)')+(miss?'  ⚠ missing':'');
-                                if (miss) label.style.color='#c62828';
+                                if (miss) label.style.color='var(--bs-danger-text-emphasis, #c62828)';
                                 row.appendChild(label);
                                 // Duration control: sequences play their full length; images have
                                 // no natural length, so expose an editable seconds field (default 30).
@@ -9444,7 +9471,7 @@ def index():
                                     row.appendChild(dwrap);
                                 } else if ((it.content||'').indexOf('seq:')===0) {
                                     var note=document.createElement('span');
-                                    note.style.cssText='font-size:11px;color:#999;';
+                                    note.style.cssText='font-size:11px;color:var(--fg-muted);';
                                     note.textContent='full length';
                                     row.appendChild(note);
                                 }
@@ -9654,7 +9681,7 @@ def index():
                     var loadEl = document.getElementById('fseq_load_status');
                     var scrubHint = document.getElementById('fseq_scrub_hint');
                     loadEl.textContent = 'Loading\u2026';
-                    loadEl.style.color = '#aaa';
+                    loadEl.style.color = 'var(--fg-muted)';
                     if (scrubHint) scrubHint.style.display = (ct.type === 'img') ? 'none' : '';
 
                     // Overlay None and no remote selected: there is nowhere for text to render, so
@@ -10573,7 +10600,7 @@ var _saveTimer = null;
                     } else {
                         resultDiv.innerHTML = '<p class="error">❌ ' + data.error + '</p>';
                         if (data.reason) {
-                            resultDiv.innerHTML += '<p style="font-size: 12px; color: #666;">Reason: ' + data.reason + '</p>';
+                            resultDiv.innerHTML += '<p style="font-size: 12px; color: var(--fg-muted);">Reason: ' + data.reason + '</p>';
                         }
                     }
                 });
@@ -10680,11 +10707,11 @@ var _saveTimer = null;
 
         <!-- Blacklist content-warning modal -->
         <div id="blacklist-warning-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:1000; align-items:center; justify-content:center;">
-            <div style="background:#2a2a2a; color:#eee; border-radius:8px; padding:24px; max-width:420px; width:90%; box-shadow:0 4px 20px rgba(0,0,0,0.5);">
+            <div style="background:var(--card-bg); color:var(--fg); border-radius:8px; padding:24px; max-width:420px; width:90%; box-shadow:0 4px 20px var(--shadow);">
                 <h3 style="margin-top:0; color:#ffc107;">⚠️ Warning</h3>
                 <p style="margin-bottom:20px;">Blacklist contains profanity, and sexual related messaging. Viewer discretion is advised.</p>
                 <div style="display:flex; gap:10px; justify-content:flex-end;">
-                    <button onclick="hideBlacklistWarning()" style="background:#555; color:#fff; padding:10px 18px; border:none; border-radius:5px; cursor:pointer;">Return</button>
+                    <button onclick="hideBlacklistWarning()" style="background:var(--bs-secondary, #6c757d); color:#fff; padding:10px 18px; border:none; border-radius:5px; cursor:pointer;">Return</button>
                     <button onclick="proceedToBlacklist()" style="background:#f44336; color:#fff; padding:10px 18px; border:none; border-radius:5px; cursor:pointer;">Proceed</button>
                 </div>
             </div>
@@ -10912,102 +10939,6 @@ def api_admin_approval_status():
 BUNDLE_MARKER  = "textmylights-config"
 BUNDLE_FORMAT  = 1
 
-def _safe_content_join(base_dir, name):
-    """Resolve `name` to a file INSIDE base_dir with no path traversal. Strips any directory
-    components (basename) AND verifies the realpath stays within base_dir (defends against a
-    symlink pointing out). Returns the absolute path, or None if empty or escaping.
-
-    This is the export's defense against a crafted content value - e.g.
-    `img:../plugindata/fpp-plugin-textmylights/secrets/credentials.json` or a playlist named
-    `../.../secrets/credentials` - which (via /api/config, an imported plugin.json, or a
-    master push) would otherwise pull the Twilio token / Gmail app password into the zip."""
-    safe = os.path.basename((name or '').strip())
-    if not safe or safe in ('.', '..'):
-        return None
-    base_real = os.path.realpath(base_dir)
-    full = os.path.realpath(os.path.join(base_real, safe))
-    if full != base_real and not full.startswith(base_real + os.sep):
-        return None
-    return full
-
-def _content_source_files(content_value, warnings):
-    """Resolve a plugin content setting (default_playlist / name_display_playlist)
-    to a list of (arc_subdir, absolute_path) files to include in the export.
-
-    A content value is one of:
-      • ''            -> nothing
-      • 'seq:NAME'    -> a sequence file in the sequences dir
-      • 'img:NAME'    -> an image file in the images dir
-      • 'NAME'        -> an FPP playlist; its .json plus every sequence/media
-                         item it references
-
-    Every NAME is resolved via _safe_content_join - basename + realpath containment - so a
-    traversal value can never reach a file outside its media directory.
-    """
-    files = []
-    if not content_value:
-        return files
-
-    if content_value.startswith('seq:'):
-        name = content_value[4:]
-        if not name.endswith('.fseq'):
-            name += '.fseq'
-        p = _safe_content_join(FSEQ_SEQUENCE_PATH, name)
-        if p:
-            files.append(('content/sequences', p))
-        else:
-            warnings.append("Ignored unsafe sequence content path")
-        return files
-
-    if content_value.startswith('img:'):
-        p = _safe_content_join(FPP_IMAGES_PATH, content_value[4:])
-        if p:
-            files.append(('content/images', p))
-        else:
-            warnings.append("Ignored unsafe image content path")
-        return files
-
-    # Otherwise it's a playlist name.
-    pl_path = _safe_content_join(FPP_PLAYLISTS_PATH, content_value + '.json')
-    if not pl_path or not os.path.isfile(pl_path):
-        warnings.append(f"Playlist '{content_value}' not found on disk - skipped")
-        return files
-    files.append(('content/playlists', pl_path))
-
-    # Walk the playlist for referenced sequences and media so the target Pi has
-    # the actual files, not just the playlist that names them. The playlist JSON can be
-    # crafted/imported, so its names go through the same safe join.
-    try:
-        with open(pl_path, 'r') as f:
-            pl = json.load(f)
-        sections = []
-        for key in ('leadIn', 'mainPlaylist', 'leadOut'):
-            if isinstance(pl.get(key), list):
-                sections.extend(pl[key])
-        for entry in sections:
-            if not isinstance(entry, dict):
-                continue
-            seq = entry.get('sequenceName')
-            if seq:
-                sp = _safe_content_join(FSEQ_SEQUENCE_PATH, seq)
-                if sp:
-                    files.append(('content/sequences', sp))
-            media = entry.get('mediaName')
-            if media:
-                # Media may be a video or an image; include whichever exists.
-                vid = _safe_content_join(FPP_VIDEOS_PATH, media)
-                img = _safe_content_join(FPP_IMAGES_PATH, media)
-                if vid and os.path.isfile(vid):
-                    files.append(('content/videos', vid))
-                elif img and os.path.isfile(img):
-                    files.append(('content/images', img))
-                else:
-                    warnings.append(f"Media '{media}' (in playlist '{content_value}') not found - skipped")
-    except Exception as e:
-        warnings.append(f"Could not read playlist '{content_value}': {e}")
-
-    return files
-
 # Export runs as a streamed download in a hidden iframe, so the browser can't read its HTTP
 # status or body. We record progress per client-supplied dl_token here and expose it at
 # /api/config/export/status, so the UI can tell a real download from a 403/500/failed-start
@@ -11036,13 +10967,15 @@ def export_status():
 
 @app.route('/api/config/export')
 def export_config():
-    """Build and stream a .zip bundle of the selected plugin configuration.
+    """Build and stream a .zip bundle of the plugin's OWN configuration.
 
-    The export modal sends section flags as query params (settings/lists/content/
-    overlay = 1|0). settings/lists/overlay default to included when absent; content
-    defaults to EXCLUDED (it's the only group that could carry a traversal path, and
-    bundles are shared between operators). An optional dl_token lets the UI poll
-    /api/config/export/status to confirm the download actually started/finished."""
+    Per the FPP plugin guidelines (§3.4, §5) a plugin exports only its own data -
+    plugin settings (credentials stripped) plus the block/word lists - and NEVER FPP's
+    sequences, playlists, media, or the overlay model. Those belong to FPP: sequences
+    and media are distributed by xLights FPP Connect, and the overlay model is set up in
+    FPP's own UI. The modal sends settings/lists=1|0 (both default to included). An
+    optional dl_token lets the UI poll /api/config/export/status to confirm the download
+    actually started/finished."""
     tmp = None
     dl_token = request.args.get('dl_token', '')
     _set_export_status(dl_token, 'started')
@@ -11050,11 +10983,6 @@ def export_config():
         want = lambda k: request.args.get(k, '1') == '1'
         inc_settings = want('settings')
         inc_lists    = want('lists')
-        # Content defaults OFF on the server too (matching the UI's unticked default): the
-        # content files are the only group that could carry a traversal path, and bundles are
-        # shared between operators, so a plain GET must NOT bundle content unless asked.
-        inc_content  = request.args.get('content', '0') == '1'
-        inc_overlay  = want('overlay')
 
         warnings = []
         # Settings (plugin.json on disk is already secrets-free) and the block /
@@ -11082,30 +11010,11 @@ def export_config():
                 ('settings', BLACKLIST_REMOVED_FILE),
             ]
 
-        # Referenced content ONLY - the Waiting + Name Display content this plugin
-        # is set to use and the files they reference. Never all of FPP's media.
-        content_files = []
-        if inc_content:
-            _list_content = [it.get('content', '') for it in (config.get('names_content_list', []) or [])]
-            _wait_content = [it.get('content', '') for it in (config.get('default_content_list', []) or [])]
-            _seen_cv = set()
-            for cv in [config.get('default_playlist', ''), config.get('name_display_playlist', ''), *_wait_content, *_list_content]:
-                if cv and cv not in _seen_cv:
-                    _seen_cv.add(cv)
-                    content_files.extend(_content_source_files(cv, warnings))
-
-        # Overlay model ("matrix") - just the selected model's entry, not the whole
-        # channel-output config (written to the zip as a small JSON payload below).
-        overlay_payload = _extract_overlay_model(warnings) if inc_overlay else None
-
         # Stream the zip straight to the HTTP response AS it is built - we never
-        # write an intermediate copy to the SD card first. This is what makes a
-        # large sequence export fast and start instantly, the way xLights' FPP
-        # Connect pushes files: the download's headers flush before the body, so it
-        # begins immediately, and each file is read only once (at read/network
-        # speed) instead of paying for a build-the-whole-zip-to-SD-then-resend round
-        # trip. ZIP_STORED since FSEQ is already compressed; a write-only (non
-        # seekable) sink makes zipfile emit a streamable archive (data descriptors).
+        # write an intermediate copy to the SD card first. The download's headers flush
+        # before the body, so it begins immediately, and each file is read only once.
+        # ZIP_STORED (files are small text/JSON); a write-only (non seekable) sink makes
+        # zipfile emit a streamable archive (data descriptors).
         stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
         download_name = f"textmylights-config-{stamp}.zip"
         seen = set()
@@ -11129,7 +11038,7 @@ def export_config():
                     return out
                 return b''
             with zipfile.ZipFile(sink, 'w', zipfile.ZIP_STORED, allowZip64=True) as zf:
-                for arc_dir, path in settings_files + content_files:
+                for arc_dir, path in settings_files:
                     if not path or not os.path.isfile(path):
                         continue
                     arcname = f"{arc_dir}/{os.path.basename(path)}"
@@ -11158,14 +11067,6 @@ def export_config():
                     if data:
                         yield data
 
-                # Single-model overlay payload (not a file on disk).
-                if overlay_payload:
-                    zf.writestr('overlay/overlay-model.json', overlay_payload)
-                    included.append('overlay/overlay-model.json')
-                    data = drain()
-                    if data:
-                        yield data
-
                 manifest = {
                     "bundle": BUNDLE_MARKER,
                     "format": BUNDLE_FORMAT,
@@ -11173,13 +11074,8 @@ def export_config():
                     "includes": {
                         "settings": inc_settings,
                         "lists": inc_lists,
-                        "content": bool(content_files),
-                        "overlay_model": bool(overlay_payload),
                         "credentials": False,
                     },
-                    "overlay_model_name": config.get('overlay_model_name', ''),
-                    "default_playlist": config.get('default_playlist', ''),
-                    "name_display_playlist": config.get('name_display_playlist', ''),
                     "files": included,
                     "warnings": warnings,
                 }
@@ -11215,164 +11111,6 @@ def export_config():
         _set_export_status(dl_token, 'error', str(e))
         return jsonify({"success": False, "error": str(e)}), 500
 
-def _overlay_items(data):
-    """Return (container_key, list) for the array of outputs/models inside an FPP
-    channel-output config. co-other.json uses 'channelOutputs'; some files use
-    'models'; a few are a bare list. container_key is None for a bare list."""
-    if isinstance(data, dict):
-        for k in ('channelOutputs', 'models'):
-            if isinstance(data.get(k), list):
-                return k, data[k]
-    if isinstance(data, list):
-        return None, data
-    return None, None
-
-def _extract_overlay_model(warnings):
-    """Build a minimal bundle payload containing ONLY the currently-selected
-    overlay model's entry (plus the metadata needed to merge it back), so export
-    never ships the whole channel-output config. Returns bytes, or None if the
-    model can't be located. The matching entry is found by any string field that
-    equals the configured model name (robust to FPP's field naming)."""
-    model = (config.get('overlay_model_name', '') or '').strip()
-    if not model:
-        warnings.append("No overlay model selected - overlay model not exported")
-        return None
-    ovl_file = _find_overlay_config_file()
-    if not ovl_file:
-        warnings.append("Overlay model config not found - overlay model not exported")
-        return None
-    try:
-        with open(ovl_file, 'r') as f:
-            data = json.load(f)
-    except Exception as e:
-        warnings.append(f"Could not read overlay config: {e}")
-        return None
-    container_key, items = _overlay_items(data)
-    if items is None:
-        warnings.append("Overlay config had an unexpected shape - overlay model not exported")
-        return None
-    entry, name_field = None, None
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        for k, v in it.items():
-            if isinstance(v, str) and v == model:
-                entry, name_field = it, k
-                break
-        if entry is not None:
-            break
-    if entry is None:
-        warnings.append(f"Overlay model '{model}' not found in the config - not exported")
-        return None
-    payload = {
-        "__tml_overlay__": 1,
-        "dest_file": os.path.basename(ovl_file),   # e.g. co-other.json
-        "container_key": container_key,            # e.g. channelOutputs (or null=bare list)
-        "name_field": name_field,                  # which field names the model
-        "model": entry,
-    }
-    return json.dumps(payload, indent=2).encode('utf-8')
-
-def _set_restart_flag():
-    """Raise FPP's 'Restart needed' banner so channel-output (overlay model) changes
-    take effect. Python equivalent of `setSetting restartFlag 1` in fpp_install.sh."""
-    try:
-        r = requests.put(f"{FPP_HOST}/api/settings/restartFlag", data="1", timeout=3)
-        logging.info(f"Set restartFlag (FPPD restart needed): {r.status_code}")
-        return r.status_code == 200
-    except Exception as e:
-        logging.warning(f"Could not set restartFlag: {e}")
-        return False
-
-# The ONLY file in FPP's config dir this plugin will ever write an overlay model into.
-# Pixel Overlay Models are stored as "Other" channel outputs in co-other.json. We NEVER
-# let an imported bundle choose the destination: basename() alone stops path traversal,
-# but a crafted bundle's dest_file could still create or append to ANY other core config
-# in config/ (settings.json, co-universes.json, schedule.json, ...). Pinning the write
-# target to this one file is the allowlist.
-_OVERLAY_DEST_BASENAME = 'co-other.json'
-
-def _merge_overlay_model(payload_bytes, warnings):
-    """Add (or update) just the one exported overlay model into THIS Pi's channel-output
-    config (always co-other.json - never a path the bundle dictates), leaving every other
-    output on that Pi untouched. Backs up the target file first. Falls back to a full
-    replace only for legacy bundles that shipped a whole config file. Returns True if the
-    config was written (caller sets restartFlag), False otherwise."""
-    try:
-        payload = json.loads(payload_bytes)
-    except Exception:
-        warnings.append("Overlay model in bundle was not valid JSON - skipped")
-        return False
-
-    # The destination is ALWAYS co-other.json on this Pi - the bundle cannot choose it.
-    dest_path = os.path.join(FPP_CONFIG_DIR, _OVERLAY_DEST_BASENAME)
-
-    # Legacy bundle (a whole config file, pre single-model export): full replace.
-    if not (isinstance(payload, dict) and payload.get("__tml_overlay__")):
-        os.makedirs(FPP_CONFIG_DIR, exist_ok=True)
-        if os.path.isfile(dest_path):
-            try:
-                shutil.copy2(dest_path, dest_path + '.tml-bak')
-            except OSError:
-                pass
-        with open(dest_path, 'wb') as f:
-            f.write(payload_bytes)
-        warnings.append("Imported a legacy overlay bundle by full replace (previous kept as .tml-bak)")
-        return True
-
-    # Warn if the bundle tried to target a different file, but never honor it.
-    requested = os.path.basename(payload.get('dest_file') or '')
-    if requested and requested != _OVERLAY_DEST_BASENAME:
-        warnings.append(f"Overlay bundle targeted '{requested}', which is not an allowed "
-                        f"overlay-config file - wrote to {_OVERLAY_DEST_BASENAME} instead")
-
-    key        = payload.get('container_key')
-    name_field = payload.get('name_field') or 'description'
-    entry      = payload.get('model')
-    if not isinstance(entry, dict):
-        warnings.append("Overlay model entry missing from bundle - skipped")
-        return False
-    model_name = entry.get(name_field)
-
-    # Load the target config (or start fresh if it doesn't exist yet).
-    dest = None
-    if os.path.isfile(dest_path):
-        try:
-            with open(dest_path, 'r') as f:
-                dest = json.load(f)
-        except Exception:
-            warnings.append(f"Target {_OVERLAY_DEST_BASENAME} was unreadable - overlay model skipped")
-            return False
-
-    if key:
-        if not isinstance(dest, dict):
-            dest = {}
-        items = dest.get(key)
-        if not isinstance(items, list):
-            items = []
-            dest[key] = items
-    else:
-        if not isinstance(dest, list):
-            dest = []
-        items = dest
-
-    # Back up before writing.
-    os.makedirs(FPP_CONFIG_DIR, exist_ok=True)
-    if os.path.isfile(dest_path):
-        try:
-            shutil.copy2(dest_path, dest_path + '.tml-bak')
-        except OSError:
-            pass
-
-    # Replace an existing entry of the same name (update), else append (add).
-    items[:] = [it for it in items
-                if not (isinstance(it, dict) and it.get(name_field) == model_name)]
-    items.append(entry)
-
-    with open(dest_path, 'w') as f:
-        json.dump(dest, f, indent=2)
-    return True
-
 @app.route('/api/config/import', methods=['POST'])
 def import_config():
     """Restore a configuration bundle produced by /api/config/export.
@@ -11404,16 +11142,8 @@ def import_config():
             return jsonify({"success": False, "error": "This .zip is not a Text My Lights config bundle"}), 400
 
         warnings = []
-        summary = {"settings": False, "content": 0, "overlay_model": False}
+        summary = {"settings": False, "lists": 0}
 
-        # Map each export subdir to its destination directory on this Pi. basename
-        # is used for every write (zip-slip safe - no attacker-controlled paths).
-        dest_dirs = {
-            'content/playlists':  FPP_PLAYLISTS_PATH,
-            'content/sequences':  FSEQ_SEQUENCE_PATH,
-            'content/images':     FPP_IMAGES_PATH,
-            'content/videos':     FPP_VIDEOS_PATH,
-        }
         # settings files land at their known individual paths, keyed by basename.
         settings_targets = {
             os.path.basename(CONFIG_FILE):            None,  # handled specially below
@@ -11432,10 +11162,11 @@ def import_config():
             return jsonify({"success": False,
                             "error": "Bundle contents are too large - refusing to import"}), 400
 
-        # Accept ONLY bundles whose every entry is a file this plugin itself writes on
-        # export (settings we know, our content subdirs, or the overlay payload). If the
-        # archive contains anything else, reject the WHOLE import rather than partially
-        # applying it - so a hand-built or tampered .zip can't smuggle stray files in.
+        # An import may only ever change the plugin's OWN files, so accept ONLY the settings/list
+        # files this plugin writes on export. Anything else - FPP's sequences/media/overlay model
+        # (which belong to FPP's own backup / file manager / xLights FPP Connect), or a hand-built
+        # or tampered .zip - means this is not a clean export, so reject the WHOLE import rather
+        # than partially applying it.
         def _entry_allowed(entry):
             if entry.endswith('/') or entry == 'manifest.json':
                 return True
@@ -11443,12 +11174,14 @@ def import_config():
             base = os.path.basename(entry)
             if arc_dir == 'settings':
                 return base in settings_targets
-            return arc_dir in dest_dirs or arc_dir == 'overlay'
+            return False
         bad = [e for e in names if not _entry_allowed(e)]
         if bad:
             return jsonify({"success": False,
-                            "error": "Bundle contains unexpected files - not a clean "
-                                     "Text My Lights export; import cancelled.",
+                            "error": "Bundle contains files that are not plugin settings - not a "
+                                     "clean Text My Lights export; import cancelled. (FPP sequences, "
+                                     "media and overlay models are handled by FPP's own backup / "
+                                     "file manager / xLights FPP Connect, not this import.)",
                             "unexpected": sorted(bad)[:10]}), 400
 
         for entry in names:
@@ -11485,48 +11218,27 @@ def import_config():
                     os.makedirs(os.path.dirname(target), exist_ok=True)
                     with open(target, 'wb') as f:
                         f.write(zf.read(entry))
+                    summary["lists"] += 1
                 else:
                     warnings.append(f"Unknown settings file '{base}' - skipped")
-
-            elif arc_dir in dest_dirs:
-                target_dir = dest_dirs[arc_dir]
-                os.makedirs(target_dir, exist_ok=True)
-                with open(os.path.join(target_dir, base), 'wb') as f:
-                    f.write(zf.read(entry))
-                summary["content"] += 1
-
-            elif arc_dir == 'overlay':
-                # Add/update just the one exported model in the target's channel-
-                # output config, leaving the target's other outputs untouched.
-                if _merge_overlay_model(zf.read(entry), warnings):
-                    summary["overlay_model"] = True
 
             else:
                 warnings.append(f"Unrecognized entry '{entry}' - skipped")
 
-        # Warn about content this config references that is NOT present on this Pi.
-        # Config-only bundles (the default) don't carry the heavy sequence/video
-        # files - they're distributed by xLights FPP Connect - so flag any the
-        # target is missing instead of letting the display silently fail later.
+        # The overlay model belongs to FPP (restore it with FPP's own backup, which includes
+        # co-other.json / model-overlays.json). We only imported the model NAME in the settings,
+        # so if this box doesn't actually have that overlay model, tell the operator to create it
+        # in FPP - otherwise the plugin would have nowhere to draw text. Checked via FPP's API.
         try:
-            _list_c = [it.get('content', '') for it in (config.get('names_content_list', []) or [])]
-            _wait_c = [it.get('content', '') for it in (config.get('default_content_list', []) or [])]
-            _missing = []
-            _checked_cv = set()
-            for cv in [config.get('default_playlist', ''), config.get('name_display_playlist', ''), *_wait_c, *_list_c]:
-                if not cv or cv in _checked_cv:
-                    continue
-                _checked_cv.add(cv)
-                for _, _p in _content_source_files(cv, []):
-                    if _p and not os.path.isfile(_p):
-                        _missing.append(os.path.basename(_p))
-            if _missing:
-                _miss = sorted(set(_missing))
-                warnings.append("Referenced content not on this Pi - push it with xLights "
-                                "FPP Connect: " + ", ".join(_miss[:10])
-                                + (f" (+{len(_miss) - 10} more)" if len(_miss) > 10 else ""))
-        except Exception as _we:
-            logging.warning(f"Import content-presence check failed: {_we}")
+            _want_model = (config.get('overlay_model_name', '') or '').strip()
+            if _want_model:
+                _have = {m.get('name') for m in get_fpp_models()}
+                if _want_model not in _have:
+                    warnings.append(f"This box has no Pixel Overlay Model named '{_want_model}'. "
+                                    "Create it in FPP (Input/Output Setup → Pixel Overlay Models), "
+                                    "or restore it from FPP's own backup, then pick it here.")
+        except Exception as _me:
+            logging.warning(f"Import overlay-model presence check failed: {_me}")
 
         # Refresh in-memory state: force cache reloads and re-sync Twilio client.
         _blocklist_cache = None
@@ -11538,21 +11250,11 @@ def import_config():
         except Exception:
             pass
 
-        # Writing the overlay model edits a channel-output config (co-other.json), which FPPD
-        # only re-reads on restart. Raise FPP's "Restart needed" banner so the note below is
-        # actionable instead of just advisory.
-        restart_needed = bool(summary.get("overlay_model"))
-        if restart_needed:
-            _set_restart_flag()
-
-        resp = {
+        return jsonify({
             "success": True,
             "summary": summary,
             "warnings": warnings,
-        }
-        if restart_needed:
-            resp["note"] = "Overlay model changes take effect after an FPPD restart."
-        return jsonify(resp)
+        })
     except Exception as e:
         logging.error(f"import_config failed: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
@@ -12567,40 +12269,35 @@ def view_whitelist():
                 document.documentElement.setAttribute('data-theme',e.data.theme); }); })();
         </script>
         <style>
+            /* Palette mapped onto FPP's Bootstrap 5.3 theme variables so every element below
+               follows FPP's light/dark automatically (driven by data-bs-theme on <html>, set by
+               the injected FPP theme hook). The value after each comma is a fallback that keeps a
+               direct :5000 dev load legible when FPP's CSS isn't present. No separate dark block
+               is needed - the --bs-* values themselves change when the theme flips. */
             :root {
-              --bg:#ffffff; --fg:#333333; --fg-muted:#666666;
-              --card-bg:#ffffff; --section-bg:#f8f8f8;
-              --border:#dddddd; --border-strong:#cccccc; --input-bg:#ffffff;
-              --warn-bg:#fff3cd; --warn-fg:#856404; --warn-border:#ffc107;
-              --note-bg:#e3f2fd; --note-fg:#0d47a1; --note-border:#90caf9;
-              --tab-bg:#f0f0f0; --tab-fg:#555555; --tab-hover:#e8e8e8;
-              --queue-bg:#f3e5f5; --queue-border:#ce93d8;
-              --ok-bg:#e8f5e9; --ok-border:#c8e6c9;
-              --row-alt:#f5f5f5; --shadow:rgba(0,0,0,0.35);
-            }
-            :root[data-theme="dark"] {
-              --bg:#1e2127; --fg:#e6e6e6; --fg-muted:#a0a6b0;
-              --card-bg:#262a31; --section-bg:#23262d;
-              --border:#3a3f47; --border-strong:#4a5059; --input-bg:#2d323a;
-              --warn-bg:#4a3c0a; --warn-fg:#ffd98a; --warn-border:#8a6d00;
-              --note-bg:#0e2a40; --note-fg:#9fd0ff; --note-border:#2b5c82;
-              --tab-bg:#2a2e35; --tab-fg:#b8bec8; --tab-hover:#343941;
-              --queue-bg:#33263a; --queue-border:#6a4a78;
-              --ok-bg:#16341c; --ok-border:#2d5a37;
-              --row-alt:#262a31; --shadow:rgba(0,0,0,0.6);
-            }
-            @media (prefers-color-scheme: dark) {
-              :root:not([data-theme="light"]) {
-                --bg:#1e2127; --fg:#e6e6e6; --fg-muted:#a0a6b0;
-                --card-bg:#262a31; --section-bg:#23262d;
-                --border:#3a3f47; --border-strong:#4a5059; --input-bg:#2d323a;
-                --warn-bg:#4a3c0a; --warn-fg:#ffd98a; --warn-border:#8a6d00;
-                --note-bg:#0e2a40; --note-fg:#9fd0ff; --note-border:#2b5c82;
-                --tab-bg:#2a2e35; --tab-fg:#b8bec8; --tab-hover:#343941;
-                --queue-bg:#33263a; --queue-border:#6a4a78;
-                --ok-bg:#16341c; --ok-border:#2d5a37;
-                --row-alt:#262a31; --shadow:rgba(0,0,0,0.6);
-              }
+              --bg: var(--bs-body-bg, #ffffff);
+              --fg: var(--bs-body-color, #333333);
+              --fg-muted: var(--bs-secondary-color, #666666);
+              --card-bg: var(--bs-body-bg, #ffffff);
+              --section-bg: var(--bs-tertiary-bg, #f8f8f8);
+              --border: var(--bs-border-color, #dddddd);
+              --border-strong: var(--bs-border-color, #cccccc);
+              --input-bg: var(--bs-body-bg, #ffffff);
+              --warn-bg: var(--bs-warning-bg-subtle, #fff3cd);
+              --warn-fg: var(--bs-warning-text-emphasis, #856404);
+              --warn-border: var(--bs-warning-border-subtle, #ffc107);
+              --note-bg: var(--bs-info-bg-subtle, #e3f2fd);
+              --note-fg: var(--bs-info-text-emphasis, #0d47a1);
+              --note-border: var(--bs-info-border-subtle, #90caf9);
+              --tab-bg: var(--bs-tertiary-bg, #f0f0f0);
+              --tab-fg: var(--bs-secondary-color, #555555);
+              --tab-hover: var(--bs-secondary-bg, #e8e8e8);
+              --queue-bg: var(--bs-tertiary-bg, #f3e5f5);
+              --queue-border: var(--bs-border-color, #ce93d8);
+              --ok-bg: var(--bs-success-bg-subtle, #e8f5e9);
+              --ok-border: var(--bs-success-border-subtle, #c8e6c9);
+              --row-alt: var(--bs-tertiary-bg, #f5f5f5);
+              --shadow: rgba(0,0,0,0.35);
             }
             body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: var(--bg); color: var(--fg); }
             h1 { color: #4CAF50; }
@@ -12636,7 +12333,7 @@ def view_whitelist():
             <button onclick="toggleSetting('use_whitelist', true)" style="background:#4CAF50; color:white; border:none; padding:6px 14px; border-radius:4px; cursor:pointer; font-size:13px; white-space:nowrap;">✓ Enable Whitelist</button>
         </div>
         {% else %}
-        <div style="background:var(--ok-bg); border:1px solid #a5d6a7; color:#2e7d32; padding:10px 14px; border-radius:5px; margin:10px 0; font-size:14px; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+        <div style="background:var(--ok-bg); border:1px solid #a5d6a7; color:var(--bs-success-text-emphasis, #2e7d32); padding:10px 14px; border-radius:5px; margin:10px 0; font-size:14px; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
             <span>✅ <strong>Whitelist is enabled</strong></span>
             <button onclick="toggleSetting('use_whitelist', false)" style="background:#f44336; color:white; border:none; padding:6px 14px; border-radius:4px; cursor:pointer; font-size:13px; white-space:nowrap;">✗ Disable Whitelist</button>
         </div>
@@ -12791,14 +12488,16 @@ def view_whitelist():
             }
 
             function removeName(name) {
-                if (!confirm('Remove "' + name + '" from the whitelist?')) return;
-                fetch('/api/whitelist/remove', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({name: name})
-                })
-                .then(r => r.json())
-                .then(() => loadWhitelist());
+                tmlConfirm('Remove "' + name + '" from the whitelist?', { danger: true, okText: 'Remove' }).then(function(ok) {
+                    if (!ok) return;
+                    fetch('/api/whitelist/remove', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({name: name})
+                    })
+                    .then(r => r.json())
+                    .then(() => loadWhitelist());
+                });
             }
 
             loadWhitelist();
@@ -12825,40 +12524,35 @@ def view_blacklist_page():
                 document.documentElement.setAttribute('data-theme',e.data.theme); }); })();
         </script>
         <style>
+            /* Palette mapped onto FPP's Bootstrap 5.3 theme variables so every element below
+               follows FPP's light/dark automatically (driven by data-bs-theme on <html>, set by
+               the injected FPP theme hook). The value after each comma is a fallback that keeps a
+               direct :5000 dev load legible when FPP's CSS isn't present. No separate dark block
+               is needed - the --bs-* values themselves change when the theme flips. */
             :root {
-              --bg:#ffffff; --fg:#333333; --fg-muted:#666666;
-              --card-bg:#ffffff; --section-bg:#f8f8f8;
-              --border:#dddddd; --border-strong:#cccccc; --input-bg:#ffffff;
-              --warn-bg:#fff3cd; --warn-fg:#856404; --warn-border:#ffc107;
-              --note-bg:#e3f2fd; --note-fg:#0d47a1; --note-border:#90caf9;
-              --tab-bg:#f0f0f0; --tab-fg:#555555; --tab-hover:#e8e8e8;
-              --queue-bg:#f3e5f5; --queue-border:#ce93d8;
-              --ok-bg:#e8f5e9; --ok-border:#c8e6c9;
-              --row-alt:#f5f5f5; --shadow:rgba(0,0,0,0.35);
-            }
-            :root[data-theme="dark"] {
-              --bg:#1e2127; --fg:#e6e6e6; --fg-muted:#a0a6b0;
-              --card-bg:#262a31; --section-bg:#23262d;
-              --border:#3a3f47; --border-strong:#4a5059; --input-bg:#2d323a;
-              --warn-bg:#4a3c0a; --warn-fg:#ffd98a; --warn-border:#8a6d00;
-              --note-bg:#0e2a40; --note-fg:#9fd0ff; --note-border:#2b5c82;
-              --tab-bg:#2a2e35; --tab-fg:#b8bec8; --tab-hover:#343941;
-              --queue-bg:#33263a; --queue-border:#6a4a78;
-              --ok-bg:#16341c; --ok-border:#2d5a37;
-              --row-alt:#262a31; --shadow:rgba(0,0,0,0.6);
-            }
-            @media (prefers-color-scheme: dark) {
-              :root:not([data-theme="light"]) {
-                --bg:#1e2127; --fg:#e6e6e6; --fg-muted:#a0a6b0;
-                --card-bg:#262a31; --section-bg:#23262d;
-                --border:#3a3f47; --border-strong:#4a5059; --input-bg:#2d323a;
-                --warn-bg:#4a3c0a; --warn-fg:#ffd98a; --warn-border:#8a6d00;
-                --note-bg:#0e2a40; --note-fg:#9fd0ff; --note-border:#2b5c82;
-                --tab-bg:#2a2e35; --tab-fg:#b8bec8; --tab-hover:#343941;
-                --queue-bg:#33263a; --queue-border:#6a4a78;
-                --ok-bg:#16341c; --ok-border:#2d5a37;
-                --row-alt:#262a31; --shadow:rgba(0,0,0,0.6);
-              }
+              --bg: var(--bs-body-bg, #ffffff);
+              --fg: var(--bs-body-color, #333333);
+              --fg-muted: var(--bs-secondary-color, #666666);
+              --card-bg: var(--bs-body-bg, #ffffff);
+              --section-bg: var(--bs-tertiary-bg, #f8f8f8);
+              --border: var(--bs-border-color, #dddddd);
+              --border-strong: var(--bs-border-color, #cccccc);
+              --input-bg: var(--bs-body-bg, #ffffff);
+              --warn-bg: var(--bs-warning-bg-subtle, #fff3cd);
+              --warn-fg: var(--bs-warning-text-emphasis, #856404);
+              --warn-border: var(--bs-warning-border-subtle, #ffc107);
+              --note-bg: var(--bs-info-bg-subtle, #e3f2fd);
+              --note-fg: var(--bs-info-text-emphasis, #0d47a1);
+              --note-border: var(--bs-info-border-subtle, #90caf9);
+              --tab-bg: var(--bs-tertiary-bg, #f0f0f0);
+              --tab-fg: var(--bs-secondary-color, #555555);
+              --tab-hover: var(--bs-secondary-bg, #e8e8e8);
+              --queue-bg: var(--bs-tertiary-bg, #f3e5f5);
+              --queue-border: var(--bs-border-color, #ce93d8);
+              --ok-bg: var(--bs-success-bg-subtle, #e8f5e9);
+              --ok-border: var(--bs-success-border-subtle, #c8e6c9);
+              --row-alt: var(--bs-tertiary-bg, #f5f5f5);
+              --shadow: rgba(0,0,0,0.35);
             }
             body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: var(--bg); color: var(--fg); }
             h1 { color: #f44336; }
@@ -12872,7 +12566,7 @@ def view_blacklist_page():
             .remove-btn:hover { background: #d32f2f; }
             .add-btn { background: #2196F3; }
             .add-btn:hover { background: #0b7dda; }
-            .info { background: #fce4e4; padding: 10px; border-radius: 5px; margin: 10px 0; font-size: 14px; border: 1px solid #f5c6c6; }
+            .info { background: var(--bs-danger-bg-subtle, #fce4e4); padding: 10px; border-radius: 5px; margin: 10px 0; font-size: 14px; border: 1px solid var(--bs-danger-border-subtle, #f5c6c6); }
             .add-row { display: flex; gap: 10px; margin: 12px 0; }
             .add-row input { flex: 1; padding: 10px; border: 1px solid var(--border-strong); border-radius: 4px; font-size: 14px; }
             .search-row { display: flex; gap: 10px; margin: 12px 0; }
@@ -12894,7 +12588,7 @@ def view_blacklist_page():
             <button onclick="toggleSetting('profanity_filter', true)" style="background:#4CAF50; color:white; border:none; padding:6px 14px; border-radius:4px; cursor:pointer; font-size:13px; white-space:nowrap;">✓ Enable Profanity Filter</button>
         </div>
         {% else %}
-        <div style="background:var(--ok-bg); border:1px solid #a5d6a7; color:#2e7d32; padding:10px 14px; border-radius:5px; margin:10px 0; font-size:14px; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+        <div style="background:var(--ok-bg); border:1px solid #a5d6a7; color:var(--bs-success-text-emphasis, #2e7d32); padding:10px 14px; border-radius:5px; margin:10px 0; font-size:14px; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
             <span>✅ <strong>Profanity Filter is enabled</strong></span>
             <button onclick="toggleSetting('profanity_filter', false)" style="background:#f44336; color:white; border:none; padding:6px 14px; border-radius:4px; cursor:pointer; font-size:13px; white-space:nowrap;">✗ Disable Profanity Filter</button>
         </div>
@@ -13049,14 +12743,16 @@ def view_blacklist_page():
             }
 
             function removeWord(word) {
-                if (!confirm('Remove "' + word + '" from the blacklist?')) return;
-                fetch('/api/blacklist/remove', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({word: word})
-                })
-                .then(r => r.json())
-                .then(() => loadBlacklist());
+                tmlConfirm('Remove "' + word + '" from the blacklist?', { danger: true, okText: 'Remove' }).then(function(ok) {
+                    if (!ok) return;
+                    fetch('/api/blacklist/remove', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({word: word})
+                    })
+                    .then(r => r.json())
+                    .then(() => loadBlacklist());
+                });
             }
 
             loadBlacklist();
@@ -13084,40 +12780,35 @@ def view_blocklist():
                 document.documentElement.setAttribute('data-theme',e.data.theme); }); })();
         </script>
         <style>
+            /* Palette mapped onto FPP's Bootstrap 5.3 theme variables so every element below
+               follows FPP's light/dark automatically (driven by data-bs-theme on <html>, set by
+               the injected FPP theme hook). The value after each comma is a fallback that keeps a
+               direct :5000 dev load legible when FPP's CSS isn't present. No separate dark block
+               is needed - the --bs-* values themselves change when the theme flips. */
             :root {
-              --bg:#ffffff; --fg:#333333; --fg-muted:#666666;
-              --card-bg:#ffffff; --section-bg:#f8f8f8;
-              --border:#dddddd; --border-strong:#cccccc; --input-bg:#ffffff;
-              --warn-bg:#fff3cd; --warn-fg:#856404; --warn-border:#ffc107;
-              --note-bg:#e3f2fd; --note-fg:#0d47a1; --note-border:#90caf9;
-              --tab-bg:#f0f0f0; --tab-fg:#555555; --tab-hover:#e8e8e8;
-              --queue-bg:#f3e5f5; --queue-border:#ce93d8;
-              --ok-bg:#e8f5e9; --ok-border:#c8e6c9;
-              --row-alt:#f5f5f5; --shadow:rgba(0,0,0,0.35);
-            }
-            :root[data-theme="dark"] {
-              --bg:#1e2127; --fg:#e6e6e6; --fg-muted:#a0a6b0;
-              --card-bg:#262a31; --section-bg:#23262d;
-              --border:#3a3f47; --border-strong:#4a5059; --input-bg:#2d323a;
-              --warn-bg:#4a3c0a; --warn-fg:#ffd98a; --warn-border:#8a6d00;
-              --note-bg:#0e2a40; --note-fg:#9fd0ff; --note-border:#2b5c82;
-              --tab-bg:#2a2e35; --tab-fg:#b8bec8; --tab-hover:#343941;
-              --queue-bg:#33263a; --queue-border:#6a4a78;
-              --ok-bg:#16341c; --ok-border:#2d5a37;
-              --row-alt:#262a31; --shadow:rgba(0,0,0,0.6);
-            }
-            @media (prefers-color-scheme: dark) {
-              :root:not([data-theme="light"]) {
-                --bg:#1e2127; --fg:#e6e6e6; --fg-muted:#a0a6b0;
-                --card-bg:#262a31; --section-bg:#23262d;
-                --border:#3a3f47; --border-strong:#4a5059; --input-bg:#2d323a;
-                --warn-bg:#4a3c0a; --warn-fg:#ffd98a; --warn-border:#8a6d00;
-                --note-bg:#0e2a40; --note-fg:#9fd0ff; --note-border:#2b5c82;
-                --tab-bg:#2a2e35; --tab-fg:#b8bec8; --tab-hover:#343941;
-                --queue-bg:#33263a; --queue-border:#6a4a78;
-                --ok-bg:#16341c; --ok-border:#2d5a37;
-                --row-alt:#262a31; --shadow:rgba(0,0,0,0.6);
-              }
+              --bg: var(--bs-body-bg, #ffffff);
+              --fg: var(--bs-body-color, #333333);
+              --fg-muted: var(--bs-secondary-color, #666666);
+              --card-bg: var(--bs-body-bg, #ffffff);
+              --section-bg: var(--bs-tertiary-bg, #f8f8f8);
+              --border: var(--bs-border-color, #dddddd);
+              --border-strong: var(--bs-border-color, #cccccc);
+              --input-bg: var(--bs-body-bg, #ffffff);
+              --warn-bg: var(--bs-warning-bg-subtle, #fff3cd);
+              --warn-fg: var(--bs-warning-text-emphasis, #856404);
+              --warn-border: var(--bs-warning-border-subtle, #ffc107);
+              --note-bg: var(--bs-info-bg-subtle, #e3f2fd);
+              --note-fg: var(--bs-info-text-emphasis, #0d47a1);
+              --note-border: var(--bs-info-border-subtle, #90caf9);
+              --tab-bg: var(--bs-tertiary-bg, #f0f0f0);
+              --tab-fg: var(--bs-secondary-color, #555555);
+              --tab-hover: var(--bs-secondary-bg, #e8e8e8);
+              --queue-bg: var(--bs-tertiary-bg, #f3e5f5);
+              --queue-border: var(--bs-border-color, #ce93d8);
+              --ok-bg: var(--bs-success-bg-subtle, #e8f5e9);
+              --ok-border: var(--bs-success-border-subtle, #c8e6c9);
+              --row-alt: var(--bs-tertiary-bg, #f5f5f5);
+              --shadow: rgba(0,0,0,0.35);
             }
             body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: var(--bg); color: var(--fg); }
             h1 { color: #f44336; }
@@ -13127,7 +12818,7 @@ def view_blocklist():
             tr:nth-child(even) { background: var(--row-alt); }
             button { background: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin: 10px 5px 10px 0; }
             .unblock-btn { background: #4CAF50; padding: 5px 10px; font-size: 12px; }
-            .info { background: #ffebee; padding: 10px; border-radius: 5px; margin: 10px 0; font-size: 14px; border: 1px solid #ffcdd2; color: var(--fg); }
+            .info { background: var(--bs-danger-bg-subtle, #ffebee); padding: 10px; border-radius: 5px; margin: 10px 0; font-size: 14px; border: 1px solid var(--bs-danger-border-subtle, #ffcdd2); color: var(--fg); }
             .no-blocked { background: var(--row-alt); padding: 40px; text-align: center; border-radius: 5px; margin: 20px 0; }
         </style>
     </head>
@@ -13169,7 +12860,8 @@ def view_blocklist():
                 var btn = e.target.closest ? e.target.closest('.unblock-btn') : null;
                 if (!btn) return;
                 var phone = btn.dataset.phone;
-                if (confirm('Unblock ' + phone + '?')) {
+                tmlConfirm('Unblock ' + phone + '?', { okText: 'Unblock' }).then(function(ok) {
+                    if (!ok) return;
                     fetch('/api/phone/unblock', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
@@ -13178,11 +12870,11 @@ def view_blocklist():
                     .then(r => r.json())
                     .then(data => {
                         if (data.success) {
-                            alert('✅ Phone number unblocked!');
+                            tmlNotify('Phone number unblocked.', 'success');
                             location.reload();
                         }
                     });
-                }
+                });
             });
         </script>
     </body>
@@ -13207,16 +12899,13 @@ def status_page():
                 document.documentElement.setAttribute('data-theme',e.data.theme); }}); }})();
         </script>
         <style>
+            /* Mapped onto FPP's Bootstrap 5.3 theme vars (follows data-bs-theme); fallbacks
+               keep a direct :5000 dev load legible. See the main page for the full rationale. */
             :root {{
-              --bg:#ffffff; --fg:#333333; --section-bg:#f5f5f5; --border:#dddddd;
-            }}
-            :root[data-theme="dark"] {{
-              --bg:#1e2127; --fg:#e6e6e6; --section-bg:#23262d; --border:#3a3f47;
-            }}
-            @media (prefers-color-scheme: dark) {{
-              :root:not([data-theme="light"]) {{
-                --bg:#1e2127; --fg:#e6e6e6; --section-bg:#23262d; --border:#3a3f47;
-              }}
+              --bg: var(--bs-body-bg, #ffffff);
+              --fg: var(--bs-body-color, #333333);
+              --section-bg: var(--bs-tertiary-bg, #f5f5f5);
+              --border: var(--bs-border-color, #dddddd);
             }}
             body {{ font-family: monospace; background: var(--bg); color: var(--fg); padding: 20px; }}
             .section {{ background: var(--section-bg); padding: 15px; margin: 15px 0; border: 1px solid var(--border); }}
@@ -13279,40 +12968,35 @@ def view_messages():
                 document.documentElement.setAttribute('data-theme',e.data.theme); }); })();
         </script>
         <style>
+            /* Palette mapped onto FPP's Bootstrap 5.3 theme variables so every element below
+               follows FPP's light/dark automatically (driven by data-bs-theme on <html>, set by
+               the injected FPP theme hook). The value after each comma is a fallback that keeps a
+               direct :5000 dev load legible when FPP's CSS isn't present. No separate dark block
+               is needed - the --bs-* values themselves change when the theme flips. */
             :root {
-              --bg:#ffffff; --fg:#333333; --fg-muted:#666666;
-              --card-bg:#ffffff; --section-bg:#f8f8f8;
-              --border:#dddddd; --border-strong:#cccccc; --input-bg:#ffffff;
-              --warn-bg:#fff3cd; --warn-fg:#856404; --warn-border:#ffc107;
-              --note-bg:#e3f2fd; --note-fg:#0d47a1; --note-border:#90caf9;
-              --tab-bg:#f0f0f0; --tab-fg:#555555; --tab-hover:#e8e8e8;
-              --queue-bg:#f3e5f5; --queue-border:#ce93d8;
-              --ok-bg:#e8f5e9; --ok-border:#c8e6c9;
-              --row-alt:#f5f5f5; --shadow:rgba(0,0,0,0.35);
-            }
-            :root[data-theme="dark"] {
-              --bg:#1e2127; --fg:#e6e6e6; --fg-muted:#a0a6b0;
-              --card-bg:#262a31; --section-bg:#23262d;
-              --border:#3a3f47; --border-strong:#4a5059; --input-bg:#2d323a;
-              --warn-bg:#4a3c0a; --warn-fg:#ffd98a; --warn-border:#8a6d00;
-              --note-bg:#0e2a40; --note-fg:#9fd0ff; --note-border:#2b5c82;
-              --tab-bg:#2a2e35; --tab-fg:#b8bec8; --tab-hover:#343941;
-              --queue-bg:#33263a; --queue-border:#6a4a78;
-              --ok-bg:#16341c; --ok-border:#2d5a37;
-              --row-alt:#262a31; --shadow:rgba(0,0,0,0.6);
-            }
-            @media (prefers-color-scheme: dark) {
-              :root:not([data-theme="light"]) {
-                --bg:#1e2127; --fg:#e6e6e6; --fg-muted:#a0a6b0;
-                --card-bg:#262a31; --section-bg:#23262d;
-                --border:#3a3f47; --border-strong:#4a5059; --input-bg:#2d323a;
-                --warn-bg:#4a3c0a; --warn-fg:#ffd98a; --warn-border:#8a6d00;
-                --note-bg:#0e2a40; --note-fg:#9fd0ff; --note-border:#2b5c82;
-                --tab-bg:#2a2e35; --tab-fg:#b8bec8; --tab-hover:#343941;
-                --queue-bg:#33263a; --queue-border:#6a4a78;
-                --ok-bg:#16341c; --ok-border:#2d5a37;
-                --row-alt:#262a31; --shadow:rgba(0,0,0,0.6);
-              }
+              --bg: var(--bs-body-bg, #ffffff);
+              --fg: var(--bs-body-color, #333333);
+              --fg-muted: var(--bs-secondary-color, #666666);
+              --card-bg: var(--bs-body-bg, #ffffff);
+              --section-bg: var(--bs-tertiary-bg, #f8f8f8);
+              --border: var(--bs-border-color, #dddddd);
+              --border-strong: var(--bs-border-color, #cccccc);
+              --input-bg: var(--bs-body-bg, #ffffff);
+              --warn-bg: var(--bs-warning-bg-subtle, #fff3cd);
+              --warn-fg: var(--bs-warning-text-emphasis, #856404);
+              --warn-border: var(--bs-warning-border-subtle, #ffc107);
+              --note-bg: var(--bs-info-bg-subtle, #e3f2fd);
+              --note-fg: var(--bs-info-text-emphasis, #0d47a1);
+              --note-border: var(--bs-info-border-subtle, #90caf9);
+              --tab-bg: var(--bs-tertiary-bg, #f0f0f0);
+              --tab-fg: var(--bs-secondary-color, #555555);
+              --tab-hover: var(--bs-secondary-bg, #e8e8e8);
+              --queue-bg: var(--bs-tertiary-bg, #f3e5f5);
+              --queue-border: var(--bs-border-color, #ce93d8);
+              --ok-bg: var(--bs-success-bg-subtle, #e8f5e9);
+              --ok-border: var(--bs-success-border-subtle, #c8e6c9);
+              --row-alt: var(--bs-tertiary-bg, #f5f5f5);
+              --shadow: rgba(0,0,0,0.35);
             }
             body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: var(--bg); color: var(--fg); }
             h1 { color: #4CAF50; }
@@ -13333,14 +13017,14 @@ def view_messages():
                clipping at phone width. */
             #today-messages-content, #queue-box-content, [id^="history-content-"] { overflow-x: auto; }
             .current-display { background: #4CAF50; padding: 15px; border-radius: 5px; margin: 10px 0; font-size: 18px; font-weight: bold; color: white; }
-            .queue-item { background: #f9f9f9; padding: 10px; border-radius: 5px; margin: 5px 0; border-left: 4px solid #FF9800; }
+            .queue-item { background: var(--section-bg); padding: 10px; border-radius: 5px; margin: 5px 0; border-left: 4px solid #FF9800; }
             .tab-bar { display: flex; flex-wrap: wrap; gap: 4px; margin: 16px 0 0; border-bottom: 2px solid #4CAF50; }
-            .tab-btn { padding: 8px 14px; border: 1px solid var(--border); border-bottom: none; background: var(--row-alt); cursor: pointer; border-radius: 4px 4px 0 0; font-size: 13px; color: #555; }
+            .tab-btn { padding: 8px 14px; border: 1px solid var(--border); border-bottom: none; background: var(--row-alt); cursor: pointer; border-radius: 4px 4px 0 0; font-size: 13px; color: var(--fg-muted); }
             .tab-btn:hover { background: var(--ok-bg); }
             .tab-btn.active { background: #4CAF50; color: white; border-color: #4CAF50; font-weight: bold; }
             .tab-panel { display: none; padding-top: 16px; }
             .tab-panel.active { display: block; }
-            .history-note { background: #fff9c4; padding: 8px 12px; border-radius: 4px; font-size: 13px; color: #5d4037; margin-bottom: 12px; border: 1px solid #f9a825; }
+            .history-note { background: var(--bs-warning-bg-subtle, #fff9c4); padding: 8px 12px; border-radius: 4px; font-size: 13px; color: #5d4037; margin-bottom: 12px; border: 1px solid #f9a825; }
         </style>
     </head>
     <body><script>if('scrollRestoration'in history)history.scrollRestoration='manual';function _toTop(){window.scrollTo(0,0);document.documentElement.scrollTop=0;document.body.scrollTop=0;try{window.parent.postMessage({type:'scrollTop'},'*');}catch(e){}}_toTop();document.addEventListener('DOMContentLoaded',_toTop);window.addEventListener('load',_toTop);</script>
@@ -13361,17 +13045,17 @@ def view_messages():
             <div class="info">Auto-refreshes every 5 seconds | Messages today: <span id="msg-count">{{ today_messages | length }}</span></div>
             <div class="queue-box">
                 <h2>Current Display Queue</h2>
-                <div id="queue-box-content"><p style="color:#aaa;">Loading...</p></div>
+                <div id="queue-box-content"><p style="color:var(--fg-muted);">Loading...</p></div>
             </div>
             <h2>Today's Messages</h2>
-            <div id="today-messages-content"><p style="color:#aaa;">Loading...</p></div>
+            <div id="today-messages-content"><p style="color:var(--fg-muted);">Loading...</p></div>
         </div>
 
         <!-- PAST DAY TAB PANELS -->
         {% for tab in tabs[1:] %}
         <div class="tab-panel" id="panel-{{ tab.date }}">
             <div class="history-note">Past day snapshot - no live queue.</div>
-            <div id="history-content-{{ tab.date }}"><p style="color:#aaa;">Click tab to load.</p></div>
+            <div id="history-content-{{ tab.date }}"><p style="color:var(--fg-muted);">Click tab to load.</p></div>
         </div>
         {% endfor %}
 
@@ -13390,7 +13074,7 @@ def view_messages():
                     <p id="whitelist-warning" style="color:#f44336; font-size:12px; margin:0; padding:4px 0; display:none;">
                         Whitelist is not enabled - this name may appear again
                     </p>
-                    <button style="background:#aaa; color:white; padding:10px; border:none; border-radius:5px; cursor:pointer;"
+                    <button style="background:var(--bs-secondary, #6c757d); color:white; padding:10px; border:none; border-radius:5px; cursor:pointer;"
                             onclick="closeBlockModal()">Cancel</button>
                 </div>
             </div>
@@ -13405,13 +13089,13 @@ def view_messages():
                           style="width:100%; box-sizing:border-box; padding:10px; border:1px solid var(--border-strong); border-radius:5px; font-size:14px; font-family:inherit; resize:vertical;"
                           placeholder="Type your reply..."></textarea>
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-top:6px;">
-                    <span id="respond-count" style="color:#999; font-size:12px;">0 / 300</span>
+                    <span id="respond-count" style="color:var(--fg-muted); font-size:12px;">0 / 300</span>
                     <span id="respond-status" style="font-size:13px;"></span>
                 </div>
                 <div style="display:flex; gap:10px; margin-top:16px;">
                     <button id="respond-send-btn" style="background:#1976d2; color:white; padding:12px; border:none; border-radius:5px; cursor:pointer; flex:1;"
                             onclick="sendRespond()">Send Reply</button>
-                    <button style="background:#aaa; color:white; padding:12px 18px; border:none; border-radius:5px; cursor:pointer;"
+                    <button style="background:var(--bs-secondary, #6c757d); color:white; padding:12px 18px; border:none; border-radius:5px; cursor:pointer;"
                             onclick="closeRespondModal()">Cancel</button>
                 </div>
             </div>
@@ -13466,7 +13150,7 @@ def view_messages():
 
             function loadHistoryTab(date) {
                 var container = document.getElementById('history-content-' + date);
-                container.innerHTML = '<p style="color:#aaa;">Loading...</p>';
+                container.innerHTML = '<p style="color:var(--fg-muted);">Loading...</p>';
                 fetch('/api/messages/' + date)
                     .then(function(r) { return r.json(); })
                     .then(function(msgs) { container.innerHTML = renderTable(msgs, false); })
@@ -13509,7 +13193,7 @@ def view_messages():
                                 esc(item.name) + ' (from ***' + esc(item.phone_last4) + ')</div>';
                     });
                 } else {
-                    html += '<p style="color:#aaa;font-style:italic;margin-top:15px;">Queue is empty</p>';
+                    html += '<p style="color:var(--fg-muted);font-style:italic;margin-top:15px;">Queue is empty</p>';
                 }
                 document.getElementById('queue-box-content').innerHTML = html;
             }
@@ -13582,7 +13266,7 @@ def view_messages():
                 closeBlockModal();
                 fetch('/api/phone/block', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ts:ts, date:date}) })
                     .then(function(r) { return r.json(); })
-                    .then(function(data) { alert(data.success ? 'Phone number blocked!' : ('Could not block: ' + (data.error || 'unknown error'))); refreshData(); });
+                    .then(function(data) { tmlNotify(data.success ? 'Phone number blocked.' : ('Could not block: ' + (data.error || 'unknown error')), data.success ? 'success' : 'danger'); refreshData(); });
             }
 
             function blockNameFromDisplay() {
@@ -13592,7 +13276,7 @@ def view_messages():
                 fetch('/api/whitelist/remove', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name:name}) })
                     .then(function(r) { return r.json(); })
                     .then(function(data) {
-                        alert(data.success ? '"' + name + '" blocked from display!' : 'Error: ' + data.error);
+                        tmlNotify(data.success ? ('"' + name + '" blocked from display.') : ('Error: ' + data.error), data.success ? 'success' : 'danger');
                         refreshData();
                     });
             }
@@ -13653,11 +13337,12 @@ def view_messages():
             });
 
             function clearHistory() {
-                if (confirm("Clear all of today's messages?")) {
+                tmlConfirm("Clear all of today's messages?", { danger: true, okText: 'Clear' }).then(function(ok) {
+                    if (!ok) return;
                     fetch('/api/messages/clear', { method:'POST' })
                         .then(function(r) { return r.json(); })
-                        .then(function(data) { if (data.success) alert("Today's messages cleared!"); refreshData(); });
-                }
+                        .then(function(data) { if (data.success) tmlNotify("Today's messages cleared.", 'success'); refreshData(); });
+                });
             }
 
             refreshData();

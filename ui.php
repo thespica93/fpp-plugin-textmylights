@@ -48,12 +48,12 @@ $pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) :
         font-family: Arial, sans-serif;
     }
     .tml-modal .tml-card {
-        background: #fff; color: #333; width: 92%; max-width: 460px;
+        background: var(--bs-body-bg, #fff); color: var(--bs-body-color, #333); width: 92%; max-width: 460px;
         border-radius: 8px; padding: 22px; box-shadow: 0 8px 30px rgba(0,0,0,0.35);
         max-height: 88vh; overflow-y: auto; box-sizing: border-box;
     }
-    .tml-modal h3 { margin: 0 0 6px; color: #333; font-size: 20px; }
-    .tml-modal .tml-sub { font-size: 13px; color: #555; margin: 0 0 14px; }
+    .tml-modal h3 { margin: 0 0 6px; color: var(--bs-body-color, #333); font-size: 20px; }
+    .tml-modal .tml-sub { font-size: 13px; color: var(--bs-secondary-color, #555); margin: 0 0 14px; }
     /* Dark theme (set via the .tml-dark class from tmlDetectTheme) to match FPP. */
     .tml-modal.tml-dark .tml-card { background: #262a31; color: #e6e6e6; box-shadow: 0 8px 30px rgba(0,0,0,0.6); }
     .tml-modal.tml-dark h3 { color: #e6e6e6; }
@@ -71,16 +71,23 @@ $pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) :
         accent-color: #4CAF50; cursor: pointer; box-sizing: border-box;
     }
     .tml-modal .tml-opt strong { font-size: 14px; }
-    .tml-modal .tml-opt .tml-desc { font-size: 12px; color: #666; }
+    .tml-modal .tml-opt .tml-desc { font-size: 12px; color: var(--bs-secondary-color, #666); }
     .tml-modal .tml-status { font-size: 13px; margin: 0 0 10px; min-height: 18px; }
     .tml-modal .tml-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 6px; align-items: center; }
     .tml-modal .tml-actions button {
         padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; color: #fff; font-size: 14px;
     }
     .tml-modal .tml-actions button:disabled { cursor: default; opacity: 0.6; }
-    .tml-modal .tml-cancel { background: #9e9e9e; }
+    .tml-modal .tml-cancel { background: var(--bs-secondary, #9e9e9e); }
     .tml-modal .tml-go { background: #4CAF50; min-width: 110px; }
     #tml-import-modal .tml-go { background: #2196F3; }
+    /* Colour accents for the plugin's jGrowl toasts (tmlNotify from the iframe / tmlToast here). */
+    .jGrowl-notification.tml-jg-success { background: #2e7d32; color: #fff; }
+    .jGrowl-notification.tml-jg-danger  { background: #c62828; color: #fff; }
+    .jGrowl-notification.tml-jg-warning { background: #e65100; color: #fff; }
+    .jGrowl-notification.tml-jg-success .jGrowl-close,
+    .jGrowl-notification.tml-jg-danger  .jGrowl-close,
+    .jGrowl-notification.tml-jg-warning .jGrowl-close { color: #fff; }
 </style>
 <iframe id="sms-plugin-frame" src="<?php echo htmlspecialchars($pluginUrl); ?>" scrolling="no"></iframe>
 
@@ -88,15 +95,11 @@ $pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) :
 <div id="tml-export-modal" class="tml-modal" onclick="if(event.target===this)tmlHideExport()">
     <div class="tml-card">
         <h3>Export Config</h3>
-        <p class="tml-sub">Choose what to include. Only the content <strong>this plugin is set to use</strong> is ever exported - never all of FPP's files. <strong>Credentials are never included.</strong></p>
+        <p class="tml-sub">This exports only the plugin's <strong>own</strong> data. FPP's sequences, images, videos and the overlay model are not included (distribute sequences with xLights FPP Connect; set the overlay model in FPP). <strong>Credentials are never included.</strong></p>
         <label class="tml-opt"><input type="checkbox" id="tml-exp-settings" checked>
-            <span><strong>Plugin settings</strong><br><span class="tml-desc">Display lines, message rules, response text, filters, poll interval, selected content &amp; overlay model.</span></span></label>
+            <span><strong>Plugin settings</strong><br><span class="tml-desc">Display lines, message rules, response text, filters, poll interval, and the selected content &amp; overlay model <em>names</em>.</span></span></label>
         <label class="tml-opt"><input type="checkbox" id="tml-exp-lists" checked>
             <span><strong>Blocked numbers &amp; word lists</strong><br><span class="tml-desc">Blocked phone numbers and your whitelist / blacklist words.</span></span></label>
-        <label class="tml-opt"><input type="checkbox" id="tml-exp-content">
-            <span><strong>Content files</strong> (off by default)<br><span class="tml-desc">Copies the actual sequence / image / video files into the bundle - can be large. Leave OFF: xLights FPP Connect already distributes sequences to your Pis, so the export just records which content to use by name. Turn ON only for a fully self-contained copy.</span></span></label>
-        <label class="tml-opt"><input type="checkbox" id="tml-exp-overlay" checked>
-            <span><strong>Overlay model (matrix)</strong><br><span class="tml-desc">The FPP Pixel Overlay Model the names are drawn onto.</span></span></label>
         <p class="tml-status" id="tml-exp-status"></p>
         <div class="tml-actions">
             <button type="button" id="tml-exp-cancel" class="tml-cancel" onclick="tmlHideExport()">Cancel</button>
@@ -109,11 +112,24 @@ $pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) :
 <div id="tml-import-modal" class="tml-modal" onclick="if(event.target===this)tmlHideImport()">
     <div class="tml-card">
         <h3>Import Config</h3>
-        <p class="tml-sub">Import <strong id="tml-imp-name">the selected file</strong>? This <strong>overwrites</strong> the plugin settings, block / whitelist, the content this plugin references, and the overlay model on <strong>THIS Pi</strong>. Your saved credentials are kept.</p>
+        <p class="tml-sub">Import <strong id="tml-imp-name">the selected file</strong>? This <strong>overwrites</strong> the plugin settings and block / whitelist on <strong>THIS Pi</strong>. FPP's sequences, media and overlay model are not touched. Your saved credentials are kept.</p>
         <p class="tml-status" id="tml-imp-status"></p>
         <div class="tml-actions">
             <button type="button" id="tml-imp-cancel" class="tml-cancel" onclick="tmlHideImport()">Cancel</button>
             <button type="button" id="tml-imp-go" class="tml-go" onclick="tmlDoImport()">Import</button>
+        </div>
+    </div>
+</div>
+
+<!-- Generic confirm modal (parent-owned so it centers on the real viewport), driven by a
+     tml_confirm message from any plugin page in the iframe. Replaces the browser's confirm(). -->
+<div id="tml-generic-modal" class="tml-modal" onclick="if(event.target===this)tmlGenericResolve(false)">
+    <div class="tml-card">
+        <h3 id="tml-gen-title">Please confirm</h3>
+        <p class="tml-sub" id="tml-gen-msg"></p>
+        <div class="tml-actions">
+            <button type="button" id="tml-gen-cancel" class="tml-cancel" onclick="tmlGenericResolve(false)">Cancel</button>
+            <button type="button" id="tml-gen-ok" class="tml-go" onclick="tmlGenericResolve(true)">OK</button>
         </div>
     </div>
 </div>
@@ -216,9 +232,8 @@ $pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) :
     function tmlDoExport() {
         if (_tmlExporting) return;
         function ck(id) { return document.getElementById(id).checked ? 1 : 0; }
-        var sel = { s: ck('tml-exp-settings'), l: ck('tml-exp-lists'),
-                    c: ck('tml-exp-content'), o: ck('tml-exp-overlay') };
-        if (!sel.s && !sel.l && !sel.c && !sel.o) { alert('Select at least one thing to export.'); return; }
+        var sel = { s: ck('tml-exp-settings'), l: ck('tml-exp-lists') };
+        if (!sel.s && !sel.l) { tmlToast('Select at least one thing to export.', 'warning'); return; }
         _tmlExporting = true;
         var go = document.getElementById('tml-exp-go');
         go.disabled = true; go.textContent = 'Exporting...';
@@ -234,7 +249,6 @@ $pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) :
         var token = 'dl' + Date.now() + '-' + Math.random().toString(36).slice(2);
         var url = TML_PROXY + encodeURIComponent('api/config/export')
                 + '&settings=' + sel.s + '&lists=' + sel.l
-                + '&content=' + sel.c + '&overlay=' + sel.o
                 + '&dl_token=' + encodeURIComponent(token)
                 + '&_ts=' + Date.now();
         var dl = document.getElementById('tml-export-dl');
@@ -258,7 +272,7 @@ $pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) :
             function fail(msg) {
                 clearInterval(_tmlExportPoll);
                 tmlResetExportBtn();
-                st.style.color = '#c62828';
+                st.style.color = 'var(--bs-danger-text-emphasis, #c62828)';
                 st.textContent = msg;
             }
             fetch(statusUrl, { cache: 'no-store' })
@@ -268,7 +282,7 @@ $pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) :
                         clearInterval(_tmlExportPoll);
                         _tmlExporting = false;
                         go.textContent = 'Downloaded';
-                        st.style.color = '#2e7d32';
+                        st.style.color = 'var(--bs-success-text-emphasis, #2e7d32)';
                         st.textContent = 'Export complete.';
                         setTimeout(function() { tmlHideExport(); tmlResetExportBtn(); }, 1200);
                     } else if (s.state === 'error') {
@@ -315,8 +329,41 @@ $pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) :
         st.style.color = '#555'; st.textContent = 'Importing... please wait.';
         tmlFrame().postMessage({ type: 'tml_doImport' }, '*');
         _tmlImportTimer = setTimeout(function() {
-            if (_tmlImporting) { tmlResetImportBtn(); alert('Import timed out. Please try again.'); }
+            if (_tmlImporting) { tmlResetImportBtn(); tmlToast('Import timed out. Please try again.', 'danger'); }
         }, 180000);
+    }
+
+    /* ---------------- Toasts + generic confirm (parent-owned, for the iframe) ---------------- */
+    // FPP-native toast. Used by this parent page; the iframe pages reach jGrowl directly via
+    // window.parent.jQuery.jGrowl (see tmlNotify injected into those pages).
+    function tmlToast(msg, type) {
+        try {
+            if (window.jQuery && jQuery.jGrowl) {
+                jQuery.jGrowl(String(msg), { life: (type === 'danger' ? 7000 : 4000),
+                    theme: 'tml-jg' + (type ? ' tml-jg-' + type : '') });
+                return;
+            }
+        } catch (e) {}
+        alert(msg);
+    }
+    var _tmlGenId = null;
+    function tmlGenericResolve(ok) {
+        var id = _tmlGenId; _tmlGenId = null;
+        document.getElementById('tml-generic-modal').style.display = 'none';
+        if (id) { try { tmlFrame().postMessage({ type: 'tml_confirm_result', id: id, ok: !!ok }, '*'); } catch (e) {} }
+    }
+    function tmlShowConfirm(id, message, opts) {
+        opts = opts || {};
+        _tmlGenId = id;
+        document.getElementById('tml-gen-title').textContent = opts.title || 'Please confirm';
+        document.getElementById('tml-gen-msg').textContent = message;
+        var ok = document.getElementById('tml-gen-ok'), cancel = document.getElementById('tml-gen-cancel');
+        ok.textContent = opts.okText || 'OK';
+        cancel.textContent = opts.cancelText || 'Cancel';
+        ok.style.background = opts.danger ? '#f44336' : '#4CAF50';
+        var m = document.getElementById('tml-generic-modal');
+        m.classList.toggle('tml-dark', tmlDetectTheme() === 'dark');
+        m.style.display = 'flex';
     }
 
     window.addEventListener('message', function(e) {
@@ -325,6 +372,8 @@ $pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) :
             document.getElementById('sms-plugin-frame').style.height = (e.data.height + 20) + 'px';
         }
         if (e.data.type === 'scrollTop') { window.scrollTo(0, 0); }
+
+        if (e.data.type === 'tml_confirm') { tmlShowConfirm(e.data.id, e.data.message, e.data.opts); }
 
         if (e.data.type === 'tml_openExport') { tmlShowExport(); }
         if (e.data.type === 'tml_exportDone') {
@@ -336,7 +385,7 @@ $pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) :
                 setTimeout(function() { tmlHideExport(); tmlResetExportBtn(); }, 900);
             } else {
                 tmlResetExportBtn();
-                alert('Export failed: ' + (e.data.error || 'unknown error'));
+                tmlToast('Export failed: ' + (e.data.error || 'unknown error'), 'danger');
             }
         }
 
@@ -350,7 +399,7 @@ $pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) :
                 var msg = 'Imported successfully.';
                 if (e.data.warnings) { msg += ' (' + e.data.warnings + ' warning' + (e.data.warnings > 1 ? 's' : '') + ')'; }
                 if (e.data.note) { msg += ' ' + e.data.note; }
-                ist.style.color = '#2e7d32';
+                ist.style.color = 'var(--bs-success-text-emphasis, #2e7d32)';
                 ist.textContent = msg + ' Reloading...';
                 setTimeout(function() {
                     document.getElementById('tml-import-modal').style.display = 'none';
@@ -359,7 +408,7 @@ $pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) :
                 }, 1800);
             } else {
                 tmlResetImportBtn();
-                ist.style.color = '#c62828';
+                ist.style.color = 'var(--bs-danger-text-emphasis, #c62828)';
                 ist.textContent = 'Import failed: ' + (e.data.error || 'unknown error');
             }
         }

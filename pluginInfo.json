@@ -7,7 +7,7 @@
 	"srcURL": "https://github.com/thespica93/fpp-plugin-textmylights.git",
 	"bugURL": "https://github.com/thespica93/fpp-plugin-textmylights/issues",
 	"iconURL": "https://raw.githubusercontent.com/thespica93/fpp-plugin-textmylights/stable/icon.png",
-	"minMemoryMB": 512,
+	"minMemoryMB": 256,
 	"minCpuCores": 1,
 	"allowUpdates": 1,
 	"releaseNotesStyle": "gitHistory",
@@ -113,11 +113,7 @@
 			},
 			{
 				"kind": "core-settings",
-				"what": "Copies bundled fonts to /usr/local/share/fonts/fpp-plugin-textmylights/ and installs TextMyLightsStart/Stop.sh into media/scripts."
-			},
-			{
-				"kind": "core-settings",
-				"what": "Config import writes into media/playlists, sequences, images and videos, and the overlay model into config/co-other.json."
+				"what": "Copies bundled fonts to /usr/local/share/fonts/fpp-plugin-textmylights/ and installs fpp-plugin-textmylights-Start.sh / -Stop.sh into media/scripts."
 			}
 		],
 		"closedCode": false,

@@ -5,3 +5,6 @@ whitelist_removed.txt
 whitelist_added.txt
 blacklist_removed.txt
 blacklist_added.txt
+
+# Maintainer-only test notes, not shipped with the plugin
+TESTING-low-memory-preview.md

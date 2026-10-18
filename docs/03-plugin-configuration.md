@@ -173,6 +173,8 @@ The Filters section has three sub-sections:
 
 Below the Text Position dropdown is a live canvas preview of your overlay model at its correct aspect ratio. Use it to visually position the text before displaying it.
 
+> **Note — background preview on small boards:** The canvas normally shows your Waiting/Name Display sequence or image *behind* the text. Rendering that background frame needs extra memory, so on boards with **less than 1 GB of RAM** (e.g. Pi Zero, BeagleBone Black) it is disabled automatically to keep the plugin from running the show out of memory — the background stays blank. **Text positioning still works exactly the same** (drag, scrollbars, movement, color, font); only the picture behind the text is hidden. On a 1 GB+ board (Pi 3/4/5) the background appears automatically.
+
 | Control | Description |
 |---------|-------------|
 | **Canvas drag** | Click and drag the preview text to move it. The cursor changes to indicate which axes are available. |

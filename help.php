@@ -212,6 +212,7 @@ $fppTheme = tml_fpp_theme_help();
         <tr><td>Movement &amp; Speed</td><td>Center (static) or scroll, with a speed for scrolling lines.</td></tr>
         <tr><td>Display Duration</td><td>How many seconds each name stays on screen.</td></tr>
     </table></div>
+    <div class="note"><strong>Background preview on small boards.</strong> The Display tab shows your sequence or image <em>behind</em> the text so you can see how the names will land. Drawing that background frame uses extra memory, so on boards with <strong>less than 1&nbsp;GB of RAM</strong> (e.g. a Pi Zero or BeagleBone Black) it is turned off automatically — the preview area stays blank and the plugin protects your show from running out of memory mid-display. <strong>You can still position and style the text as normal:</strong> the text boxes, movement, color, and font all work exactly the same; only the picture behind them is hidden. On a 1&nbsp;GB+ board (Pi&nbsp;3/4/5) the background preview appears automatically.</div>
 
     <h3>SMS Responses tab</h3>
     <div class="ref"><table>

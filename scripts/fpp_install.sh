@@ -232,8 +232,12 @@ else
     log_and_show "Sudoers rule installed for pixel rendering (shm access, validated wrapper)"
 fi
 
-# Set permissions on config/logs directories
-chown -R fpp:fpp /home/fpp/media/config /home/fpp/media/logs 2>/dev/null || true
+# A plugin must only chown files it created (FPP plugin guideline §5). We deliberately do NOT
+# `chown -R fpp:fpp /home/fpp/media/config /home/fpp/media/logs` here: those directories are
+# shared with FPP and every other plugin, and a blanket recursive chown would seize files
+# another plugin or FPP itself created with a different owner on purpose. The plugin's own
+# files are handled individually - plugindata at the secrets step above, and our log file just
+# below - so there is nothing of ours left to fix here.
 # FPP log viewer recognizes logs named plugin-<pluginname>.log in logDirectory.
 # Remove the old pre-convention name so it stops lingering after an update.
 rm -f /home/fpp/media/logs/sms_plugin.log

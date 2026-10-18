@@ -4454,20 +4454,11 @@ def send_to_fpp(name, override=None, preselected=_UNSET):
                 # the names effect, leaving the waiting effect running underneath.
                 if name_playlist.startswith('seq:'):
                     # FSEQ Effect (loop=true, background=true): plays as background so
-                    # overlay model renders on top with correct text colors.
+                    # overlay model renders on top with correct text colors. NOTE: we do NOT
+                    # stop/restart it here - a name composites over whatever waiting background is
+                    # already running, which is kept phase-aligned across boxes by the co-started
+                    # waiting content (see start_waiting_content / the scheduled waiting state).
                     seq_name = name_playlist[4:].removesuffix('.fseq')
-                    # Force a clean FRAME-0 restart: Stop, then Start. Diagnostics proved the two
-                    # boxes call Start at the SAME instant (identical master_epoch), yet the video
-                    # drifts - because FSEQ Effect Start does NOT reset an effect that is ALREADY
-                    # running. When this clip doubles as the waiting background it has been looping
-                    # since each box started it (at different times), so both play it from different
-                    # frames. Stopping first guarantees both boxes begin at frame 0 at the (already
-                    # co-triggered) instant, so a 16s clip stays aligned for its whole run.
-                    stop_url = f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(seq_name)}"
-                    try:
-                        requests.get(stop_url, timeout=3)
-                    except Exception:
-                        pass
                     effect_url = f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Start')}/{urllib.parse.quote(seq_name)}/true/true"
                     # SYNC DIAGNOSTIC: fire instant in the MASTER's clock so master's and each
                     # remote's log lines are directly comparable (matching => co-triggered).
@@ -7260,6 +7251,10 @@ def index():
                             window._waitingContentListInit = {{ (config.get('default_content_list') or []) | tojson }};
                             window._waitingContentModeInit = {{ config.get('default_content_mode', 'roundrobin') | tojson }};
                             window._flatDefaultContentInit = {{ config.get('default_playlist', '') | tojson }};
+                            // Whether THIS board renders the background frame behind the text. False on
+                            // boards under ~1 GB RAM, where the server-side render is disabled to protect
+                            // the show from OOM. Text positioning works regardless (client-side canvas).
+                            window._previewBgEnabled = {{ bg_preview_enabled | tojson }};
                         </script>
                     </div>
                 </div>
@@ -9677,6 +9672,23 @@ def index():
                         return;
                     }
 
+                    // Low-memory board: the heavy background FRAME render is turned off server-side so
+                    // it can't run the show out of memory. Text positioning is a client-side canvas and
+                    // keeps working, so clear the background, explain why, and draw the boxes. Only gate
+                    // LOCAL previews - a selected remote renders on its own hardware (and enforces its
+                    // own gate), so let that path through.
+                    if (!window._previewRemote && window._previewBgEnabled === false) {
+                        window._fseqBgImage = null;
+                        loadEl.textContent = 'Background preview is off on this board (under 1 GB RAM) '
+                            + 'to protect the show from running out of memory. You can still position the '
+                            + 'text below.';
+                        loadEl.style.color = '#ff9800';
+                        var _srlm = document.getElementById('fseq_scrubber_row'); if (_srlm) _srlm.style.display = 'none';
+                        if (scrubHint) scrubHint.style.display = 'none';
+                        if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
+                        return;
+                    }
+
                     if (ct.type === 'seq') {
                         // ---- FSEQ: fetch info then show scrubber ----
                         // Preview-from-remote: the .fseq lives on the REMOTE (the master may not
@@ -9776,6 +9788,9 @@ def index():
                             + '&frame='   + frameIdx);
                         return;
                     }
+                    // Background render disabled on this low-memory board - nothing to fetch (the
+                    // remote path above already returned). Text positioning is unaffected.
+                    if (window._previewBgEnabled === false) return;
                     var mw    = document.getElementById('overlay_model_width').value  || 0;
                     var mh    = document.getElementById('overlay_model_height').value || 0;
                     var model = document.getElementById('overlay_model_name').value   || '';
@@ -9804,6 +9819,9 @@ def index():
                             + '&time='    + Math.floor(seconds));
                         return;
                     }
+                    // Background render disabled on this low-memory board - nothing to fetch (the
+                    // remote path above already returned). Text positioning is unaffected.
+                    if (window._previewBgEnabled === false) return;
                     // Images/videos just get resized to these dims server-side (no model needed),
                     // so when no overlay model is set, fall back to the assumed 16:9 preview size.
                     var mw = parseInt(document.getElementById('overlay_model_width').value)  || window._canvasModelW || 480;
@@ -10682,6 +10700,7 @@ var _saveTimer = null;
     return render_template_string(html, config=config, secret_sentinel=SECRET_SENTINEL,
                                   effective_role=_eff_role, response_defaults=_resp_defaults,
                                   admin_ctx_seeded=admin_ctx_is_seeded(),
+                                  bg_preview_enabled=_bg_preview_enabled(),
                                   admin_gv_linked=bool(config.get('gv_email') and config.get('gv_app_password')))
 
 @app.route('/api/config', methods=['POST'])
@@ -11764,25 +11783,58 @@ def fseq_info():
     except Exception as e:
         return _client_error("fseq_info", e, 500)
 
-# Hard cap on preview image dimensions. The preview endpoints take width/height from the
-# query string; without a cap, Pillow would allocate the full width*height*3 image, so one
-# large value on a 512 MB board can invoke the OOM killer (which may pick fppd). A preview
-# never needs to exceed the overlay model, and 512 is comfortably larger than any overlay.
-MAX_PREVIEW_DIM = 512    # longest side of the PNG we hand back (display/transport cap)
-MAX_RENDER_DIM  = 4096   # hard cap on the render BUFFER (OOM guard only). Real overlay models
-                         # are far below this, so it never distorts a legitimate preview - unlike
-                         # clamping the render to MAX_PREVIEW_DIM, which sheared wide matrices
-                         # (a 640-wide model drawn 512 wide slides every row). See #10 follow-up.
+# --- Background-preview memory gate -------------------------------------------------------
+# Rendering an FSEQ/image/video frame server-side builds a full model-sized image in Pillow.
+# On a small board (Pi Zero / BeagleBone, ~430-490 MB usable) that render - especially a few
+# at once - can summon the OOM killer onto fppd mid-show. So the heavy BACKGROUND render is
+# auto-disabled on boards that don't clear the 1 GB class. Text-box positioning is a purely
+# client-side canvas and is unaffected: it keeps working on every board.
+#
+# The threshold is in kernel-reported MB (what /proc/meminfo shows, below the marketing size):
+# a real 1 GB board reports ~900-950, a 512 MB board ~430-490, so 768 cleanly admits 1 GB+
+# boards and excludes 512 MB ones.
+BG_PREVIEW_MIN_MEMORY_MB = 768
+_system_memory_mb_cache = None
 
-def _clamp_render_dim(v):
-    """Upper bound for the render buffer itself: generous enough that a real model's dimensions
-    pass through UNCHANGED (so the channel->pixel layout stays correct), but still caps a bogus
-    width/height so it can't OOM the board. Pair with _shrink_for_preview on the finished image."""
+def _system_memory_mb():
+    """Total physical RAM in MB as the kernel reports it (/proc/meminfo MemTotal), cached for
+    the process (total RAM never changes). Returns 0 if it can't be read (e.g. a non-Linux dev
+    host); callers treat 0 as 'unknown' and leave the gate OPEN so desktop development still
+    previews."""
+    global _system_memory_mb_cache
+    if _system_memory_mb_cache is not None:
+        return _system_memory_mb_cache
+    mb = 0
     try:
-        v = int(v)
-    except (TypeError, ValueError):
-        v = 0
-    return max(1, min(v, MAX_RENDER_DIM))
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemTotal:'):
+                    mb = int(line.split()[1]) // 1024   # MemTotal is in kB
+                    break
+    except Exception:
+        mb = 0
+    _system_memory_mb_cache = mb
+    return mb
+
+def _bg_preview_enabled():
+    """True if THIS board has enough RAM to render background preview frames without risking
+    an OOM during a show. A board that can't read its own memory (mb == 0, non-Linux dev host)
+    is treated as capable so local development still previews."""
+    mb = _system_memory_mb()
+    return mb == 0 or mb >= BG_PREVIEW_MIN_MEMORY_MB
+
+# User-facing reason shown when the background render is gated off, reused by every endpoint.
+_BG_PREVIEW_DISABLED_MSG = (
+    "Background preview is turned off on this board because it reports under 1 GB of RAM - "
+    "rendering a full frame could run it out of memory during a show. You can still position the "
+    "text; only the sequence/image behind it is hidden."
+)
+
+# Longest side of the PNG we hand back (display/transport cap). The preview endpoints render
+# at the overlay model's REAL dimensions - never a client-supplied width/height - so the
+# allocation is bounded by the model itself and a bogus query value can't OOM the board. This
+# cap only shrinks the finished image for the wire; it does not drive the render buffer size.
+MAX_PREVIEW_DIM = 512
 
 def _shrink_for_preview(img):
     """Downscale a finished preview image so its longest side <= MAX_PREVIEW_DIM, preserving
@@ -11791,15 +11843,6 @@ def _shrink_for_preview(img):
     if max(img.size) > MAX_PREVIEW_DIM:
         img.thumbnail((MAX_PREVIEW_DIM, MAX_PREVIEW_DIM), Image.LANCZOS)
     return img
-
-def _preview_dim_arg(arg_name, cfg_key):
-    """Read a width/height query arg (defaulting to the configured model dim), tolerating a
-    non-numeric value by returning 0 so the caller resolves the model's real size. The caller
-    must still pass the result through _clamp_render_dim before allocating any image."""
-    try:
-        return int(request.args.get(arg_name, config.get(cfg_key, 0)))
-    except (TypeError, ValueError):
-        return 0
 
 def _render_fseq_frame_png(seq, frame_idx, model_name, width, height,
                            start_ch_override='', ch_count_override=''):
@@ -11836,15 +11879,24 @@ def _render_fseq_frame_png(seq, frame_idx, model_name, width, height,
     bpp        = max(3, ch_count // num_pixels) if num_pixels > 0 else 3
     raw        = read_fseq_frame(hdr, frame_idx, start_ch, ch_count)
 
-    img = Image.new('RGB', (width, height))
-    pixels = []
-    for i in range(num_pixels):
-        b = i * bpp
-        if b + 2 < len(raw):
-            pixels.append((raw[b], raw[b + 1], raw[b + 2]))
-        else:
-            pixels.append((0, 0, 0))
-    img.putdata(pixels)
+    # Pack the frame into a contiguous RGB byte buffer (3 bytes/pixel) and hand it straight
+    # to Pillow via frombytes. The old path built a Python list with one (r,g,b) tuple object
+    # per pixel - tens of bytes of interpreter overhead each - so a large render ballooned to
+    # hundreds of MB and seconds of CPU, which is what let a preview OOM a small board. A
+    # bytes buffer is ~3 bytes/pixel with no per-pixel objects.
+    need    = num_pixels * 3
+    raw_len = len(raw)
+    if bpp == 3 and raw_len >= need:
+        rgb = bytes(raw[:need])          # already packed RGB - use directly, no per-pixel copy
+    else:
+        rgb = bytearray(need)            # zero-filled: any short/overshoot pixel stays black
+        for i in range(num_pixels):
+            b = i * bpp
+            if b + 2 < raw_len:
+                o = i * 3
+                rgb[o], rgb[o + 1], rgb[o + 2] = raw[b], raw[b + 1], raw[b + 2]
+        rgb = bytes(rgb)
+    img = Image.frombytes('RGB', (width, height), rgb)
     img = _shrink_for_preview(img)   # built at real dims (correct layout); shrink only for display
     buf = io.BytesIO()
     img.save(buf, format='PNG')
@@ -11890,18 +11942,17 @@ def fseq_frame():
     """Return a single FSEQ frame as a PNG image for the canvas background preview."""
     if not PIL_AVAILABLE:
         return jsonify({'error': 'Pillow not installed - run fpp_install.sh'}), 503
+    if not _bg_preview_enabled():
+        return jsonify({'error': _BG_PREVIEW_DISABLED_MSG, 'preview_disabled': True}), 503
     seq        = request.args.get('sequence', '').strip()
     frame_idx  = max(0, int(request.args.get('frame', 0)))
     model_name = request.args.get('model', config.get('overlay_model_name', ''))
-    width      = _preview_dim_arg('width',  'overlay_model_width')
-    height     = _preview_dim_arg('height', 'overlay_model_height')
-    if width <= 0 or height <= 0:
-        rw, rh = _overlay_model_dims()   # resolve the model's real size live if the form sent 0
-        width  = width  if width  > 0 else rw
-        height = height if height > 0 else rh
-    # Render at the model's REAL size (correct channel->pixel layout); _render_fseq_frame_png
-    # shrinks the finished image to MAX_PREVIEW_DIM. Only guard against an OOM-sized bogus value.
-    width, height = _clamp_render_dim(width), _clamp_render_dim(height)
+    # Size the render from the overlay model's REAL dimensions and IGNORE any width/height
+    # query values. The buffer a preview allocates must never exceed what the selected model
+    # needs, whatever the client sends - a huge ?width/?height could otherwise OOM a small
+    # board (several concurrent requests can summon the OOM killer onto fppd). Real dims also
+    # keep the channel->pixel layout correct, so wide matrices don't shear.
+    width, height = _overlay_model_dims()   # 0,0 -> _render_fseq_frame_png returns a 400
     try:
         png, err = _render_fseq_frame_png(seq, frame_idx, model_name, width, height,
                                           request.args.get('start_channel', '').strip(),
@@ -11919,18 +11970,18 @@ def media_preview():
     """Return a canvas-preview PNG for an image or video file, resized to the model dims."""
     if not PIL_AVAILABLE:
         return jsonify({'error': 'Pillow not installed - run fpp_install.sh'}), 503
+    if not _bg_preview_enabled():
+        return jsonify({'error': _BG_PREVIEW_DISABLED_MSG, 'preview_disabled': True}), 503
     media_type = request.args.get('type', '').strip()
     filename   = request.args.get('file', '').strip()
     time_sec   = max(0.0, float(request.args.get('time', 0)))
-    width  = _preview_dim_arg('width',  'overlay_model_width')
-    height = _preview_dim_arg('height', 'overlay_model_height')
+    # Size from the overlay model's REAL dimensions and IGNORE any width/height query values,
+    # so a bogus client size can't OOM a small board. Images/videos don't need a model (they
+    # just get resized), so when none is set fall back to a fixed, small 16:9 default chosen
+    # SERVER-side - never a client-supplied number.
+    width, height = _overlay_model_dims()
     if width <= 0 or height <= 0:
-        rw, rh = _overlay_model_dims()
-        width  = width  if width  > 0 else rw
-        height = height if height > 0 else rh
-    # Resize to the model's REAL aspect (no squish); _render_media_png shrinks the finished
-    # image to MAX_PREVIEW_DIM. Only guard against an OOM-sized bogus value.
-    width, height = _clamp_render_dim(width), _clamp_render_dim(height)
+        width, height = 480, 270
     try:
         png, err = _render_media_png(media_type, filename, time_sec, width, height)
         if err:
@@ -11947,6 +11998,10 @@ def api_tml_render_frame():
     Trusted-peer accessible (no token) - gated by the before_request MultiSync peer allowlist."""
     if not PIL_AVAILABLE:
         return jsonify({'error': 'Pillow not installed'}), 503
+    if not _bg_preview_enabled():
+        # This box is too small to render safely; tell the requesting master so it can show the
+        # same "background preview off" note instead of a broken image.
+        return jsonify({'error': _BG_PREVIEW_DISABLED_MSG, 'preview_disabled': True}), 503
     content   = request.args.get('content', '').strip()
     frame_idx = max(0, int(request.args.get('frame', 0) or 0))
     time_sec  = max(0.0, float(request.args.get('time', 0) or 0))

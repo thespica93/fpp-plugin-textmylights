@@ -3,18 +3,21 @@
 $pluginName = "fpp-plugin-textmylights";
 $githubBase = "https://github.com/thespica93/fpp-plugin-textmylights";
 
-// Inline a setup screenshot from the plugin's own docs/images/ folder as a
-// base64 data URI. This renders the walkthrough images inside FPP with no
-// dependency on external hosting or internet access — the files ship with the
-// plugin. Returns '' if the image isn't present.
+// Render a setup screenshot from the plugin's own docs/images/ folder. The images
+// ship with the plugin, so FPP serves them from the plugin directory via its own
+// file route (plugin.php?...&file=docs/images/<name>&nopage=1) - same origin, no
+// external hosting or internet needed. This replaces inlining ~1.3 MB of base64 on
+// EVERY page load: the browser fetches each image once and caches it across visits.
+// Returns '' if the image isn't present.
 function tml_shot($file, $alt) {
-    $path = __DIR__ . '/docs/images/' . basename($file);
-    if (!is_file($path)) {
+    $name = basename($file);
+    if (!is_file(__DIR__ . '/docs/images/' . $name)) {
         return '';
     }
-    $data = base64_encode(file_get_contents($path));
-    return '<img class="shot" src="data:image/png;base64,' . $data . '" alt="'
-         . htmlspecialchars($alt, ENT_QUOTES) . '">';
+    $src = 'plugin.php?plugin=fpp-plugin-textmylights&file=docs/images/'
+         . rawurlencode($name) . '&nopage=1';
+    return '<img class="shot" loading="lazy" src="' . htmlspecialchars($src, ENT_QUOTES)
+         . '" alt="' . htmlspecialchars($alt, ENT_QUOTES) . '">';
 }
 
 // FPP's UI theme, read server-side (see ui.php) - 'light'/'dark' or '' for System/unknown.
@@ -195,13 +198,14 @@ $fppTheme = tml_fpp_theme_help();
         <tr><td>Poll Interval</td><td>How often (seconds) to check for new messages. 2–5 is typical.</td></tr>
         <tr><td>Default “Waiting” Content</td><td><strong>Required.</strong> The sequence (.fseq) or image that loops while waiting for texts. (Playlists aren’t supported — they’re foreground and would take over the player.)</td></tr>
         <tr><td>Name Display Content</td><td>Optional content to play while a name is on screen (defaults to the waiting content).</td></tr>
-        <tr><td>Overlay Model</td><td>The FPP overlay model the name text is drawn onto.</td></tr>
+        <tr><td>Overlay Model</td><td>The FPP overlay model the name text is drawn onto. Use a <strong>standard RGB matrix</strong> model — see the note below on supported layouts.</td></tr>
         <tr><td>Max messages / phone</td><td>Per-day rate limit per phone number (0 = unlimited).</td></tr>
         <tr><td>Max message length</td><td>Longest name accepted, in characters.</td></tr>
         <tr><td>Allow duplicate names</td><td>If off, the same name from the same number is only shown once per day.</td></tr>
         <tr><td>Profanity filter</td><td>Rejects names containing blacklisted words.</td></tr>
         <tr><td>Use whitelist</td><td>Only show names on your approved list.</td></tr>
     </table></div>
+    <div class="note"><strong>Supported overlay layouts.</strong> The plugin draws names by writing the picture straight into the overlay model's memory, top-left to bottom-right. That only comes out right on a <strong>standard RGB matrix</strong>: <strong>3 channels per pixel (RGB, not RGBW)</strong>, laid out as a <strong>progressive</strong> grid — <strong>not serpentine / zig-zag</strong> — starting at the <strong>top-left</strong>. On those, text reads correctly. On a zig-zag, vertical, bottom-start, or RGBW model the output would come out scrambled, so the plugin <strong>detects a non-matching model and skips drawing</strong> rather than show garbage (it logs a warning naming the model). If your matrix is wired zig-zag, define the Pixel Overlay Model in FPP as a plain progressive RGB grid for the plugin to use. <em>(FPP&nbsp;10 adds an API that maps the data for any layout; a future release will use it to lift this restriction.)</em></div>
 
     <h3>Display tab</h3>
     <div class="ref"><table>

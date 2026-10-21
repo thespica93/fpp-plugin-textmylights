@@ -118,6 +118,14 @@ SECRET_KEYS     = ("twilio_auth_token", "gv_app_password")
 # Box-specific Master/Remote identity - kept on THIS Pi across a config import unless the
 # user ticks "import mode" (so restoring settings never silently flips a master to a remote).
 MODE_KEYS       = ("plugin_role", "selected_master")
+# Gmail IMAP/SMTP endpoints are HARD-CODED, never config- or import-driven. The Google Voice
+# feature is Gmail-specific, so these are the only servers this plugin ever connects to. A
+# stored setting or an imported bundle must never be able to redirect the login - that would
+# send the user's Gmail address and app password (and outbound replies) to an attacker's
+# server on the next poll/reply, and a valid TLS cert for that host wouldn't stop it.
+GV_IMAP_HOST    = "imap.gmail.com"
+GV_SMTP_HOST    = "smtp.gmail.com"
+GV_SMTP_PORT    = 587
 # Placeholder shown in a saved secret field. Submitting it unchanged means
 # "keep the stored secret"; clearing the field to empty means "remove it";
 # any other value updates it. Must be something a real secret never equals.
@@ -231,44 +239,23 @@ MAX_IMPORT_UNCOMPRESSED = 1024 * 1024 * 1024  # 1 GB total across all entries
 # ============================================================================
 # NETWORK ACCESS CONTROL
 # ----------------------------------------------------------------------------
-# The service binds 0.0.0.0:5000 so the FPP web UI (running on a different
-# machine - the user's browser) can iframe it. To keep anonymous LAN clients
-# from reading credentials / controlling the show, every *network* request must
-# carry an access token. The token is minted here and read by the FPP-served
-# PHP pages (ui.php / messages.php), which are already behind FPP's own web
-# server - so only someone who can load the FPP UI ever receives it.
+# The service binds 0.0.0.0:5000. The settings UI is served SAME-ORIGIN through FPP's own web
+# server: proxy.php forwards each request to 127.0.0.1:5000, so every legitimate browser request
+# arrives on the loopback interface and is trusted below. Access control therefore piggybacks on
+# FPP's own - anyone who can open this device's FPP web UI can reach the plugin, consistent with
+# FPP itself (and noted in pluginInfo.json privacy.other). There is NO separate per-instance token
+# anymore: it was only needed by the old CROSS-origin iframe that the proxy replaced, and it left a
+# world-readable token file and tokens in URLs/logs for no remaining benefit.
 #
-# Loopback (127.0.0.1) is always trusted: the scheduler's activate/deactivate
-# scripts and any on-box tooling reach us over localhost and need no token.
-# Escape hatch: `touch <PLUGIN_DATA_DIR>/.disable_auth` then restart to disable
-# network auth if you are ever locked out.
+# Off-loopback requests are refused (a bare 404), except inter-instance Master/Remote sync on
+# /api/tml/*, trusted by recognizing the FPP MultiSync peers this box already syncs with
+# (see _trusted_tml_peers - no shared secret crosses the wire).
+#
+# Escape hatch: `touch <PLUGIN_DATA_DIR>/.disable_auth` then restart to allow off-loopback access
+# (e.g. hitting :5000 directly from another machine for debugging).
 # ============================================================================
-ACCESS_TOKEN_FILE = os.path.join(PLUGIN_DATA_DIR, ".access_token")
 AUTH_DISABLE_FILE = os.path.join(PLUGIN_DATA_DIR, ".disable_auth")
-_AUTH_COOKIE = "tml_token"
 
-def _load_or_create_token():
-    """Reuse a persisted token across restarts so already-open UIs keep working;
-    mint one on first run. The token file is world-readable on purpose - the FPP
-    web server (whatever user it runs as) must read it to embed in the UI, and
-    local read access already implies full access to the plaintext config."""
-    try:
-        with open(ACCESS_TOKEN_FILE, 'r') as _f:
-            _tok = _f.read().strip()
-            if _tok:
-                return _tok
-    except OSError:
-        pass
-    _tok = _secrets.token_urlsafe(32)
-    try:
-        with open(ACCESS_TOKEN_FILE, 'w') as _f:
-            _f.write(_tok)
-        os.chmod(ACCESS_TOKEN_FILE, 0o644)
-    except OSError as _e:
-        logging.error(f"Could not persist access token: {_e}")
-    return _tok
-
-ACCESS_TOKEN = _load_or_create_token()
 _auth_disabled_warned_at = 0.0   # throttle the "auth disabled" warning log
 
 @app.before_request
@@ -286,34 +273,20 @@ def _require_access_token():
         if _now - _auth_disabled_warned_at > 300:
             _auth_disabled_warned_at = _now
             logging.warning("⚠️  AUTH DISABLED (.disable_auth present) - the plugin is "
-                            "reachable WITHOUT a token by anyone on the network. Remove "
-                            f"{AUTH_DISABLE_FILE} to re-enable access control.")
+                            "reachable off-loopback by anyone on the network. Remove "
+                            f"{AUTH_DISABLE_FILE} to restore the loopback-only restriction.")
         return None
-    # Inter-instance calls (a master pushing to a remote's /api/tml/* endpoints) come from
-    # another FPP on the LAN, so the per-instance access token won't match. Instead of a
-    # shared secret, trust the FPP MultiSync peers this box already recognizes (the same
-    # systems FPP itself syncs with), plus any manually-listed remote IPs.
-    if request.path.startswith('/api/tml/'):
-        if request.remote_addr in _trusted_tml_peers():
-            return None
-        # Not a MultiSync peer - fall through to the normal token/cookie check below, so the
-        # master's OWN browser UI can reach the browser-facing /api/tml/* endpoints
-        # (/api/tml/remotes, /api/tml/remote-frame). Inter-instance calls still pass via the
-        # peer check above without needing a token.
-    # First load carries the token as a query param (embedded by the FPP UI);
-    # we then set a cookie so subsequent same-origin fetches are authorized.
-    qtok = request.args.get('token', '')
-    if qtok and _secrets.compare_digest(qtok, ACCESS_TOKEN):
-        g._set_auth_cookie = True
+    # Inter-instance Master/Remote sync comes from another FPP on the LAN, so trust the FPP
+    # MultiSync peers this box already recognizes (plus any manually-listed remote IPs). The
+    # master's OWN browser reaches these same /api/tml/* endpoints via the proxy over loopback,
+    # so it is already authorized above and needs no peer entry.
+    if request.path.startswith('/api/tml/') and request.remote_addr in _trusted_tml_peers():
         return None
-    ctok = request.cookies.get(_AUTH_COOKIE, '')
-    if ctok and _secrets.compare_digest(ctok, ACCESS_TOKEN):
-        return None
-    # Unauthorized direct hit (someone browsing to :5000 themselves). Give nothing
-    # away: a bare 404 looks like a dead URL, with no hint that a plugin - or FPP -
-    # lives here and no instructions pointing anyone to the FPP UI. A true TCP
-    # timeout isn't possible from here without hanging a worker thread (abusable),
-    # so an empty not-found is the stealthy, safe equivalent.
+    # Anything else is a direct off-loopback hit to :5000. The settings UI is served same-origin
+    # through FPP (proxy.php -> 127.0.0.1:5000, trusted above), so a real browser never lands here.
+    # Give nothing away: a bare 404 looks like a dead URL, with no hint that a plugin - or FPP -
+    # lives here. (A true TCP timeout would need to hang a worker thread, which is abusable, so an
+    # empty not-found is the stealthy, safe equivalent.)
     return Response("Not Found", status=404, mimetype='text/plain')
 
 IFRAME_RESIZE_SCRIPT = """<script>
@@ -415,11 +388,6 @@ FPP_THEME_HEAD = (
 
 @app.after_request
 def inject_iframe_resize(response):
-    # Persist the access token as a cookie once a valid ?token= is presented, so
-    # follow-up requests from the same browser don't need the query param.
-    if getattr(g, '_set_auth_cookie', False):
-        response.set_cookie(_AUTH_COOKIE, ACCESS_TOKEN, httponly=True,
-                            samesite='Lax', max_age=60 * 60 * 24 * 365)
     if response.content_type.startswith('text/html'):
         body = response.get_data(as_text=True)
         # Proxy URL-rewrite shim FIRST (into <head>), so fetch/XHR are wrapped before any
@@ -477,11 +445,10 @@ DEFAULT_CONFIG = {
     # Google Voice and a Google App Password (2-Step Verification must be on).
     "gv_email": "",
     "gv_app_password": "",
-    "gv_imap_host": "imap.gmail.com",
+    # gv_imap_host / gv_smtp_host / gv_smtp_port are intentionally NOT config keys - the
+    # Gmail endpoints are hard-coded (GV_IMAP_HOST / GV_SMTP_HOST / GV_SMTP_PORT) so no
+    # stored setting or imported bundle can redirect the Gmail login to another server.
     "gv_imap_folder": "INBOX",
-    # SMTP is used only for Google Voice outbound replies (reply-to-email trick)
-    "gv_smtp_host": "smtp.gmail.com",
-    "gv_smtp_port": 587,
     "poll_interval": 2,
     "display_duration": 10,
     # Per-phone daily message cap the OPERATOR controls. Default 5 so a fresh install isn't
@@ -599,6 +566,20 @@ _gv_reply_ctx = None       # reply target/headers for the GV message being proce
 display_thread = None
 stop_polling = False
 stop_display = False
+
+# Inbound-poll health, surfaced on the config page so a SILENT polling failure is visible
+# instead of log-only. The common offender on FPP hardware: no RTC battery + no NTP on a show
+# network leaves the clock wrong, which fails the Gmail TLS certificate check - the texts just
+# stop arriving with nothing on the page to say why. Updated by the pollers, read by
+# get_queue_status() (which the page already polls every 5s).
+_poll_health = {
+    "source": None,          # 'twilio' | 'google_voice'
+    "configured": False,     # creds present, so a failure is meaningful (not just "not set up yet")
+    "last_success": None,    # epoch seconds of the last clean poll
+    "last_error": None,      # humanized, actionable message (None once a poll succeeds again)
+    "last_error_ts": None,   # epoch seconds of the last failure
+}
+_poll_health_lock = threading.Lock()
 
 # Queue system
 message_queue = deque()
@@ -1987,6 +1968,44 @@ def _sudo_fix_shm_perms(model_name):
     return False
 
 
+# Track model names we've already warned about so the size-mismatch warning is logged
+# once per model, not on every frame/name.
+_shm_layout_warned = set()
+
+def _shm_layout_ok(model_name, width, height):
+    """Gate a direct /dev/shm/FPP-Model-Data-<model> write on the ONE layout this plugin can
+    write correctly: a plain, progressive (non-serpentine), top-left-start RGB matrix. That
+    block is FPP's channelData, stored in the model's WIRING order and sized to its channel
+    count; we render a row-major, top-left, 3-byte-per-pixel image. The two only line up when
+    FPP's channelMap is the identity - which requires 3 channels/node AND width*height*3 ==
+    channelCount. We can't read the channelMap over FPP 9's API to reorder (FPP 10's
+    PUT .../data does the mapping for us - the real fix later), but the block's byte size is a
+    cheap, decisive gate: if it isn't exactly width*height*3, the model is RGBW, a submodel, or
+    sized differently, and a raw write would scramble or truncate the output - so refuse rather
+    than corrupt it. A matching size still can't prove non-serpentine wiring (see help: only
+    standard matrices are supported), but a mismatching size is a guaranteed-wrong write.
+    Returns True to proceed, False to skip. On any stat error, allow the write (don't block
+    rendering on a check that itself failed)."""
+    shm_path = f"/dev/shm/FPP-Model-Data-{model_name}"
+    try:
+        actual = os.path.getsize(shm_path)
+    except OSError:
+        return True  # file not there yet / unreadable - let the writer handle it as before
+    expected = width * height * 3
+    if actual == expected:
+        return True
+    if model_name not in _shm_layout_warned:
+        _shm_layout_warned.add(model_name)
+        logging.warning(
+            f"⚠️ Overlay model '{model_name}' shm block is {actual} bytes but a {width}x{height} "
+            f"RGB image needs {expected}. This model isn't a plain RGB matrix (likely RGBW, a "
+            f"submodel, or different dimensions), so a direct shm write would scramble the output "
+            f"- skipping. Use a standard RGB Pixel Overlay Model, or upgrade to FPP 10 (which maps "
+            f"the data for us)."
+        )
+    return False
+
+
 def render_to_shm(line_items, model_name, width, height):
     """Render multiple text lines to FPP shared memory, each with its own box, color, font,
     and orientation.
@@ -1999,6 +2018,8 @@ def render_to_shm(line_items, model_name, width, height):
     negative value: scrolling lines may legitimately have negative box_x/box_y to position
     the box off-page. Returns True on success, False on failure."""
     if not PIL_AVAILABLE or width <= 0 or height <= 0:
+        return False
+    if not _shm_layout_ok(model_name, width, height):
         return False
     try:
         img = Image.new('RGB', (width, height), (0, 0, 0))
@@ -2056,7 +2077,7 @@ def _text_coverage_mask(strip):
     background → transparent, anti-aliased edges → partial. Pass this as the mask when
     pasting text onto an image so only the glyph lands (no black box); the black
     background is what FPP's State-3 transparency handles for sequences, but over an
-    Opaque (State 2) image we must do that blending ourselves. Returns None on failure
+    Opaque (State 1) image we must do that blending ourselves. Returns None on failure
     (caller then pastes opaquely, as before)."""
     try:
         from PIL import ImageChops
@@ -2070,9 +2091,11 @@ def render_image_to_shm(image_path, model_name, width, height, line_items=None):
     """Load an image file, resize to model dimensions, optionally composite text on top,
     then write to FPP shared memory.  Returns True on success.
     line_items: optional list of (text, box_x, box_y, box_w, box_h, color_hex, font_name,
-    orientation) to draw over the image (same box-fit behavior as render_to_shm). State 2
+    orientation) to draw over the image (same box-fit behavior as render_to_shm). State 1
     (Opaque) should be used so the image fully covers the background."""
     if not PIL_AVAILABLE or width <= 0 or height <= 0:
+        return False
+    if not _shm_layout_ok(model_name, width, height):
         return False
     try:
         img = Image.open(image_path).convert('RGB')
@@ -2205,6 +2228,8 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
     Returns True if the thread started, False on error."""
     global _scroll_thread
     if not PIL_AVAILABLE or width <= 0 or height <= 0:
+        return False
+    if not _shm_layout_ok(model_name, width, height):
         return False
     try:
         # Pace to the background sequence's own frame rate (from its FSEQ header) when the
@@ -3232,7 +3257,7 @@ def verify_admin_ctx(force=False):
 
     imap = None
     try:
-        imap = imaplib.IMAP4_SSL(config.get('gv_imap_host', 'imap.gmail.com'), timeout=20, ssl_context=_TLS_CONTEXT)
+        imap = imaplib.IMAP4_SSL(GV_IMAP_HOST, timeout=20, ssl_context=_TLS_CONTEXT)
         imap.login(email_addr, app_pw)
         imap.select(config.get('gv_imap_folder', 'INBOX'))
         # Targeted header search for exactly the stored thread message. Quote the Message-ID
@@ -3329,7 +3354,7 @@ def prune_pending_approvals(items=None):
         else:
             survivors.append(it)
     for it in expired:
-        logging.info(f"⌛ Pending approval expired: '{it.get('name')}' "
+        logging.info(f"⌛ Pending approval expired: '{_mask_name(it.get('name'))}' "
                      f"from {str(it.get('texter_phone', ''))[-4:]}")
         _send_feature_reply(it.get('texter_ctx'),
                             config.get('response_not_whitelisted', ''),
@@ -3371,16 +3396,17 @@ def add_name_to_whitelist(name):
         logging.info(f"Added '{_mask_name(name)}' to whitelist via admin approval")
         return True
     except Exception as e:
-        logging.error(f"Error adding '{name}' to whitelist: {e}")
+        logging.error(f"Error adding '{_mask_name(name)}' to whitelist: {e}")
         return False
 
-def _send_feature_reply(ctx, text, message_type):
+def _send_feature_reply(ctx, text, message_type, priority=False):
     """Send a Google Voice reply for the admin-approval feature using an explicit
     stored ctx (the texter's or the admin's). No-op if text or ctx is missing.
-    GV-only feature, so this always routes through send_gv_reply()."""
+    GV-only feature, so this always routes through send_gv_reply(). `priority` lets the
+    admin approval prompt bypass the daily reply-cap pause (see send_gv_reply)."""
     if not text or not ctx:
         return False
-    return send_gv_reply(text, message_type, ctx=ctx)
+    return send_gv_reply(text, message_type, ctx=ctx, priority=priority)
 
 def _parse_admin_decision(body):
     """Interpret an admin reply as an approve/deny decision. Accepts a bare
@@ -3599,14 +3625,16 @@ def _maybe_request_admin_approval(name, from_number, body):
                 _send_feature_reply(d.get('texter_ctx'), config.get('response_not_whitelisted', ''), 'not_whitelisted')
                 log_message(d.get('texter_phone', ''), d.get('body', ''), d.get('name', ''),
                             "admin_dropped_overflow", reply_ctx=d.get('texter_ctx'))
-                logging.warning(f"Pending approvals full ({MAX_PENDING}); dropped '{d.get('name','')}' "
+                logging.warning(f"Pending approvals full ({MAX_PENDING}); dropped '{_mask_name(d.get('name',''))}' "
                                 f"from {str(d.get('texter_phone',''))[-4:]} and notified the texter")
             except Exception as _de:
                 logging.error(f"Error notifying dropped approval: {_de}")
     save_pending_approvals(pending)
 
     prompt = config.get('admin_approval_prompt', '').replace('{name}', name)
-    _send_feature_reply(admin_ctx, prompt, 'admin_prompt')
+    # priority=True: the admin must be able to approve names even after the daily reply cap is
+    # reached by texter replies, or Live Name Approval would silently stop mid-show.
+    _send_feature_reply(admin_ctx, prompt, 'admin_prompt', priority=True)
     _send_feature_reply(texter_ctx, config.get('response_whitelist_pending', ''), 'whitelist_pending')
     log_message(from_number, body, name, "admin_pending")
     logging.info(f"📨 Requested admin approval for '{_mask_name(name)}' from {from_number[-4:]}")
@@ -3702,7 +3730,7 @@ def _reply_quota_record():
             _reply_quota["count"] = 0
         _reply_quota["count"] += 1
 
-def send_gv_reply(text, message_type="", ctx=None):
+def send_gv_reply(text, message_type="", ctx=None, priority=False):
     """Send an outbound SMS via Google Voice by replying to the forwarding email.
 
     Replying to the notification email from the same Gmail account causes Google
@@ -3719,8 +3747,12 @@ def send_gv_reply(text, message_type="", ctx=None):
         return False
 
     # Global daily safety cap (hardcoded, protects Gmail's send limit). When reached we stop
-    # sending for the day - the display keeps running, only outbound replies pause.
-    if not _reply_quota_allow():
+    # sending for the day - the display keeps running, only outbound replies pause. A `priority`
+    # send (the Live Name Approval prompt to the admin) BYPASSES the pause so the operator can
+    # keep approving names after a busy night of texter replies hits the cap - but it is still
+    # COUNTED below, so Gmail's own hard send limit is still respected. Admin prompts are naturally
+    # few (deduped, and the pending list is capped), so this can't run away.
+    if not priority and not _reply_quota_allow():
         return False
 
     # Only ever reply INTO Google Voice. The reply address is normally captured from a
@@ -3751,9 +3783,7 @@ def send_gv_reply(text, message_type="", ctx=None):
             refs = _sanitize_header((ctx.get('references', '') + ' ' + ctx['message_id']).strip())
             reply['References'] = refs
 
-        host = config.get('gv_smtp_host', 'smtp.gmail.com')
-        port = int(config.get('gv_smtp_port', 587))
-        with smtplib.SMTP(host, port, timeout=20) as s:
+        with smtplib.SMTP(GV_SMTP_HOST, GV_SMTP_PORT, timeout=20) as s:
             s.ehlo()
             s.starttls(context=_TLS_CONTEXT)
             s.ehlo()
@@ -3941,7 +3971,10 @@ def _profanity_scan_forms(text):
     matrix. We therefore screen three forms:
       1. the raw message (catches normal and multi-word profanity),
       2. the name as DISPLAYED (extract_name - the exact string that hits the screen),
-      3. a letters-only collapse that defeats separator obfuscation ("w-h-o-r-e", "w h o r e").
+      3. a letters-only collapse that defeats separator obfuscation, done PER WORD so a real
+         multi-word name ("Ana L") is never fused into a slur ("anal"): each word collapsed on
+         its own ("w-h-o-r-e", "f.u.c.k" -> "whore"/"fuck"), plus runs of single-letter words
+         joined ("w h o r e" -> "whore").
     Word boundaries in the blacklist regex keep (3) from creating false positives inside longer
     tokens (e.g. "Scunthorpe" never matches "cunt")."""
     raw = text or ''
@@ -3952,9 +3985,21 @@ def _profanity_scan_forms(text):
             forms.append(disp)
     except Exception:
         pass
-    collapsed = re.sub(r'[^a-z]', '', raw.lower())
-    if collapsed:
-        forms.append(collapsed)
+    # Per-word letters-only collapse (NOT a whole-message collapse, which fused "Ana L" -> "anal").
+    tokens = [re.sub(r'[^a-z]', '', t) for t in raw.lower().split()]
+    tokens = [t for t in tokens if t]
+    forms.extend(t for t in tokens if len(t) > 1)   # separators inside one word ("f.u.c.k")
+    i = 0                                            # a word spelled out as single letters
+    while i < len(tokens):
+        if len(tokens[i]) == 1:
+            j = i
+            while j < len(tokens) and len(tokens[j]) == 1:
+                j += 1
+            if j - i > 1:
+                forms.append(''.join(tokens[i:j]))
+            i = j
+        else:
+            i += 1
     # De-duplicate case-insensitively while preserving order.
     seen, out = set(), []
     for f in forms:
@@ -4574,7 +4619,7 @@ def send_to_fpp(name, override=None, preselected=_UNSET):
                 shm_rendered = False
                 scroll_started = False
 
-                # For img: names content, composite text onto the image (State 2 = Opaque).
+                # For img: names content, composite text onto the image (State 1 = Opaque).
                 # When no Names content is configured, fall back to an img: Default Waiting
                 # content so the name displays over it instead of wiping it with plain text.
                 # Both static AND scrolling text composite over the image background now
@@ -4589,11 +4634,11 @@ def send_to_fpp(name, override=None, preselected=_UNSET):
                         img_bg_path = None
 
                 # Blanking policy (avoids the transition flash):
-                # - Incoming IMAGE (State 2, Opaque): do NOT blank. The current overlay
+                # - Incoming IMAGE (State 1, Opaque): do NOT blank. The current overlay
                 #    (e.g. the previous image) stays on screen while we load/resize the new
                 #    one - the slow part - and render_image_to_shm swaps it in with a single
                 #    write(), so image→image changes have no blank frame at all.
-                # - Incoming text/seq (State 3, Transparent): blank first, so the previous
+                # - Incoming text/seq (State 3, Transparent RGB): blank first, so the previous
                 #    name can't linger while the new text frame is built. (Text path unchanged
                 # - it already works cleanly.)
                 if not img_bg_path:
@@ -4649,11 +4694,12 @@ def send_to_fpp(name, override=None, preselected=_UNSET):
                     }
                     requests.put(text_url, json=text_payload, timeout=10)
 
-                # State 2 (Opaque) for image background so it covers the display fully -
+                # State 1 (Opaque) for image background so it covers the display fully -
                 # for both the static composite (shm_rendered) and the scroll composite
                 # (scroll_started) paths. State 3 (Transparent RGB) for normal/FSEQ
-                # background (black = transparent).
-                overlay_state = 2 if (img_bg_path and (shm_rendered or scroll_started)) else 3
+                # background (black = transparent). FPP enum: 1=Opaque, 2=Transparent,
+                # 3=TransparentRGB (PixelOverlayModel.cpp).
+                overlay_state = 1 if (img_bg_path and (shm_rendered or scroll_started)) else 3
                 requests.put(state_url, json={"State": overlay_state}, timeout=3)
 
             except Exception as e:
@@ -4730,7 +4776,7 @@ def start_default_playlist(content=None):
                 if ok:
                     encoded = urllib.parse.quote(overlay_model)
                     state_url = f"{fpp_host}/api/overlays/model/{encoded}/state"
-                    requests.put(state_url, json={"State": 2}, timeout=3)  # Opaque
+                    requests.put(state_url, json={"State": 1}, timeout=3)  # Opaque (full cover)
                     return True
             logging.warning(f"⚠️  Image background failed: PIL={PIL_AVAILABLE} model={overlay_model} "
                             f"dims={mw}x{mh} exists={os.path.exists(img_path) if img_path else False}")
@@ -4931,8 +4977,8 @@ def return_to_default_playlist():
             # Turn the text/image overlay OFF (State 0). Used only when we are NOT
             # returning to an image - a seq:/none waiting background shows through once
             # the overlay is off. (An image waiting background is instead restored by
-            # start_default_playlist, which overwrites the overlay buffer and sets State 2
-            # in one step, so there is no blank frame.)
+            # start_default_playlist, which overwrites the overlay buffer and sets State 1
+            # (Opaque) in one step, so there is no blank frame.)
             if not overlay_model:
                 return
             try:
@@ -4945,7 +4991,7 @@ def return_to_default_playlist():
             # No names content configured. Nothing on the output to stop (seq:/playlist
             # waiting was never stopped); just restore the overlay for the waiting content.
             if returning_to_image:
-                start_default_playlist(default_content)   # image + State 2, overwrites overlay, no blank
+                start_default_playlist(default_content)   # image + State 1 (Opaque), overwrites overlay, no blank
             else:
                 _clear_overlay()
             return
@@ -4979,10 +5025,10 @@ def return_to_default_playlist():
             pass
 
         # 2) Restore WAITING content on the overlay.
-        # - img: waiting → re-render it and set State 2 Opaque. The name display
+        # - img: waiting → re-render it and set State 1 Opaque. The name display
         #      overwrote the overlay buffer (text frames or a name image), so this must
         #      run for every name type. start_default_playlist writes the image and flips
-        #      to State 2 in one step, so an image→image return has NO blank frame.
+        #      to State 1 (Opaque) in one step, so an image→image return has NO blank frame.
         # - seq:/none waiting → just turn the overlay off; the seq (still looping
         #      underneath) or the bare output shows through. No blank either (the
         #      background was there the whole time).
@@ -5250,9 +5296,10 @@ def get_queue_status():
         "currently_displaying": current,
         "queue": queue_list,
         "queue_length": len(queue_list),
-        "show_live": config.get('enabled', False)
+        "show_live": config.get('enabled', False),
+        "inbound": _poll_health_summary(),
     }
-    
+
     return status
 
 def parse_name_list(body):
@@ -5382,7 +5429,7 @@ def process_incoming_message(from_number, body):
     else:
         # ── Single-name text (original behavior) ──
         name = extract_name(body)
-        logging.debug(f"👤 Extracted name: '{name}'")
+        logging.debug(f"👤 Extracted name: '{_mask_name(name)}'")
         max_msgs = config.get('max_messages_per_phone', 0)
         msg_count = get_message_count(from_number) if max_msgs > 0 else 0
         is_valid, reason = is_valid_name(name)
@@ -5425,7 +5472,7 @@ def process_incoming_message(from_number, body):
                     log_message(from_number, body, name, "queued")
                     send_sms_response(from_number, "success")
                 else:
-                    logging.warning(f"❌ Queue error: {name}")
+                    logging.warning(f"❌ Queue error: {_mask_name(name)}")
                     log_message(from_number, body, name, "error")
 
             elif config['profanity_filter'] and contains_profanity(body):
@@ -5464,7 +5511,7 @@ def process_incoming_message(from_number, body):
                 log_message(from_number, body, name, "queued")
                 send_sms_response(from_number, "success")
             else:
-                logging.warning(f"❌ Queue error: {name}")
+                logging.warning(f"❌ Queue error: {_mask_name(name)}")
                 log_message(from_number, body, name, "error")
 
 
@@ -5477,6 +5524,90 @@ def _poll_interval():
         return max(1, min(int(config.get('poll_interval', 2)), 60))
     except (TypeError, ValueError):
         return 2
+
+
+def _humanize_poll_error(exc):
+    """Turn a raw connection/login exception into one sentence the operator can act on.
+    The case that matters most on FPP hardware: a wrong clock (no RTC battery, no NTP) makes
+    the Gmail TLS certificate read as 'not yet valid' / 'has expired', which otherwise surfaces
+    only as an opaque '[SSL: CERTIFICATE_VERIFY_FAILED] ...'. Falls back to the raw text."""
+    s = str(exc or '').strip()
+    low = s.lower()
+    is_cert_verify = 'certificate_verify_failed' in low
+    clock_words = ('not yet valid' in low or 'has expired' in low or 'is expired' in low)
+    # Clock-driven certificate failure - point straight at the date/time setting.
+    if ('certificate is not yet valid' in low or 'certificate has expired' in low
+            or (is_cert_verify and clock_words)):
+        return ("The device's clock looks wrong, so the secure connection to Gmail can't be "
+                "verified. Set the correct date and time under Status/Control → FPP Settings "
+                "→ Localization, then try again.")
+    # Any other certificate / TLS verification problem (still most often a clock issue).
+    if is_cert_verify or ('ssl' in low and 'certificate' in low):
+        return ("Couldn't verify Gmail's security certificate - usually the device's date/time "
+                "being wrong. Check it under Status/Control → FPP Settings → "
+                "Localization; if the clock is right, check the network.")
+    # Gmail rejected the credentials.
+    if ('authenticationfailed' in low or 'invalid credentials' in low
+            or 'application-specific password' in low
+            or 'username and password not accepted' in low):
+        return ("Gmail rejected the login. Use a Google App Password (not your normal password), "
+                "with 2-Step Verification on and IMAP enabled in Gmail.")
+    # Couldn't reach the server at all.
+    if ('timed out' in low or 'timeout' in low or 'getaddrinfo' in low
+            or 'name or service not known' in low or 'connection refused' in low
+            or 'network is unreachable' in low or 'no route to host' in low
+            or 'temporary failure in name resolution' in low):
+        return ("Couldn't reach Gmail (imap.gmail.com). Check the device's internet/network "
+                "connection and DNS.")
+    return s or "Unknown error."
+
+
+def _poll_mark_success(source):
+    """Record that an inbound poll completed cleanly (clears any outstanding error)."""
+    with _poll_health_lock:
+        _poll_health['source'] = source
+        _poll_health['configured'] = True
+        _poll_health['last_success'] = time.time()
+        _poll_health['last_error'] = None
+        _poll_health['last_error_ts'] = None
+
+
+def _poll_mark_error(source, exc):
+    """Record a humanized inbound-poll failure for display on the page."""
+    with _poll_health_lock:
+        _poll_health['source'] = source
+        _poll_health['configured'] = True
+        _poll_health['last_error'] = _humanize_poll_error(exc)
+        _poll_health['last_error_ts'] = time.time()
+
+
+def _poll_mark_unconfigured(source):
+    """Record that the source has no credentials yet - not a failure, nothing to warn about."""
+    with _poll_health_lock:
+        _poll_health['source'] = source
+        _poll_health['configured'] = False
+        _poll_health['last_error'] = None
+        _poll_health['last_error_ts'] = None
+
+
+def _poll_health_summary():
+    """Compact, display-ready inbound-poll health for the config page (see get_queue_status)."""
+    with _poll_health_lock:
+        h = dict(_poll_health)
+    source = h.get('source')
+    label = {'twilio': 'Twilio', 'google_voice': 'Google Voice'}.get(source)
+    if not h.get('configured'):
+        return {"state": "unconfigured", "label": label, "last_success_secs": None,
+                "last_error": None}
+    last_ok = h.get('last_success')
+    last_ok_secs = int(max(0, time.time() - last_ok)) if last_ok else None
+    if h.get('last_error'):
+        return {"state": "error", "label": label, "last_success_secs": last_ok_secs,
+                "last_error": h['last_error']}
+    if last_ok:
+        return {"state": "ok", "label": label, "last_success_secs": last_ok_secs,
+                "last_error": None}
+    return {"state": "starting", "label": label, "last_success_secs": None, "last_error": None}
 
 
 def poll_twilio():
@@ -5502,6 +5633,7 @@ def poll_twilio():
                     logging.error(f"Error during midnight cleanup: {e}")
 
             if not twilio_client:
+                _poll_mark_unconfigured('twilio')
                 time.sleep(_poll_interval())
                 continue
 
@@ -5512,6 +5644,10 @@ def poll_twilio():
                 date_sent_after=datetime.utcnow() - timedelta(minutes=10),
                 limit=20
             )
+            # The list() call above is the network/TLS/auth round-trip; reaching here means the
+            # poll connected cleanly. Mark success now so the first-run early-continue below is
+            # still counted as a healthy poll.
+            _poll_mark_success('twilio')
 
             logging.debug(f"📨 Found {len(messages)} total messages in last 10 minutes")
 
@@ -5564,6 +5700,7 @@ def poll_twilio():
                     logging.error(traceback.format_exc())
             
         except Exception as e:
+            _poll_mark_error('twilio', e)
             logging.error(f"💥 Error polling Twilio: {e}")
 
         time.sleep(_poll_interval())
@@ -5705,14 +5842,28 @@ def _gv_from_is_authentic(msg):
     From / display name - which let an outsider impersonate the Live Name Approval
     admin. Instead we require the parsed From ADDRESS to be @txt.voice.google.com
     (DMARC p=reject means Gmail rejects forgeries at delivery). Belt-and-suspenders:
-    when Gmail's Authentication-Results header is present, also require dkim=pass for
-    a google.com domain."""
+    we also consult Gmail's OWN Authentication-Results header and require dmarc=pass.
+
+    Why only Gmail's own header: the receiving server (authserv-id 'mx.google.com')
+    PREPENDS its Authentication-Results at delivery, above anything the sender put in
+    the message. A sender can add their own 'Authentication-Results: ... dkim=pass ...'
+    header to look authentic, but it lands BELOW Gmail's genuine one, so taking the
+    topmost mx.google.com header ignores it. That genuine header carries the REAL DMARC
+    verdict for the From domain; a forged @txt.voice.google.com message would show
+    dmarc=fail there (and in practice be rejected at delivery, never reaching the inbox).
+    If no mx.google.com header is present at all we don't drop on its absence - the
+    verified sender domain plus delivery-time DMARC still govern. (The earlier version
+    substring-matched 'dkim=pass' and 'google.com' across ALL joined headers, which was
+    forgeable and didn't actually verify what it claimed.)"""
     _disp, addr = email.utils.parseaddr(str(msg.get('From', '')))
     addr = (addr or '').strip().lower()
     if not addr.endswith('@' + GV_SENDER_DOMAIN):
         return False
-    authres = ' '.join(str(v) for v in (msg.get_all('Authentication-Results') or [])).lower()
-    if authres and ('dkim=pass' not in authres or 'google.com' not in authres):
+    top_gmail_authres = next(
+        (str(h) for h in (msg.get_all('Authentication-Results') or [])
+         if str(h).strip().lower().startswith('mx.google.com')),
+        None)
+    if top_gmail_authres is not None and 'dmarc=pass' not in top_gmail_authres.lower():
         return False
     return True
 
@@ -5762,7 +5913,7 @@ def parse_gv_email(raw_bytes):
         # From header is forgeable and was the root of the admin-impersonation issue - use
         # the verified-domain (+ DKIM) check instead.
         if not _gv_from_is_authentic(msg):
-            logging.warning("Dropped non-authentic 'Google Voice' email (From not @%s / DKIM)", GV_SENDER_DOMAIN)
+            logging.warning("Dropped non-authentic 'Google Voice' email (From not @%s / DMARC)", GV_SENDER_DOMAIN)
             return None
 
         _disp, _addr = email.utils.parseaddr(str(msg.get('From', '')))
@@ -5828,13 +5979,14 @@ def poll_google_voice():
             app_pw = config.get('gv_app_password', '').strip()
             if not email_addr or not app_pw:
                 consecutive_failures = 0   # not a failure - just not configured yet
+                _poll_mark_unconfigured('google_voice')
                 time.sleep(_poll_interval())
                 continue
 
             imap = None
             try:
                 # timeout so a half-open TCP connection can't hang the poller forever.
-                imap = imaplib.IMAP4_SSL(config.get('gv_imap_host', 'imap.gmail.com'), timeout=20, ssl_context=_TLS_CONTEXT)
+                imap = imaplib.IMAP4_SSL(GV_IMAP_HOST, timeout=20, ssl_context=_TLS_CONTEXT)
                 imap.login(email_addr, app_pw)
                 imap.select(config.get('gv_imap_folder', 'INBOX'))
 
@@ -5894,9 +6046,11 @@ def poll_google_voice():
                         pass
 
             consecutive_failures = 0   # a clean pass - resume normal cadence
+            _poll_mark_success('google_voice')
 
         except Exception as e:
             consecutive_failures += 1
+            _poll_mark_error('google_voice', e)
             logging.error(f"💥 Error polling Google Voice (failure #{consecutive_failures}): {e}")
 
         # After a failure (most commonly a wrong Gmail app password) back off instead of
@@ -6082,6 +6236,11 @@ def index():
             <span>Plugin is Not Live - Press Start or run the "Text My Lights Start" script to display incoming messages.<br>
             <span style="font-weight:normal; font-size:12px;">Note: Viewers can still send messages, messaging rates will apply, but no messages will be displayed.</span></span>
         </div>
+
+        <!-- Inbound receiving health (master only) - surfaces a silent polling failure, e.g. a
+             wrong clock failing the Gmail TLS cert, so the operator isn't left wondering why
+             texts stopped arriving. Populated by updateLiveStatus() from /api/queue/status. -->
+        <div id="tml_rx_status" style="display:none; margin-top:10px; padding:10px 14px; border-radius:5px; font-size:13px; line-height:1.45;"></div>
 
         <!-- Remotes-connected indicator (master only) - where pushed names can render -->
         <div id="remotes_indicator" style="display:none; margin-top:10px; padding:8px 14px; border-radius:5px; font-size:13px; line-height:1.4;"></div>
@@ -6806,9 +6965,9 @@ def index():
                     // the (potentially very large) zip straight to disk. The old
                     // fetch().blob() buffered the ENTIRE zip into JS memory first, which
                     // froze the tab whenever large content files (sequences) were included
-                    // - small exports without content worked fine. Auth is cookie-based
-                    // after the first ?token= load, so this same-origin GET is authorized,
-                    // and the server's Content-Disposition names the file.
+                    // - small exports without content worked fine. This same-origin GET is
+                    // served through FPP's proxy (loopback-trusted), so it is authorized, and
+                    // the server's Content-Disposition names the file.
                     return new Promise(function(resolve) {
                         var a = document.createElement('a');
                         a.href = url;
@@ -7692,6 +7851,50 @@ def index():
                 .finally(function() { btn.disabled = false; refreshStartBtnState(); });
             }
 
+            // Short "x ago" from a seconds count (server-provided), for the receiving-status line.
+            function _agoStr(secs) {
+                if (secs == null) return '';
+                if (secs < 60) return secs + 's ago';
+                if (secs < 3600) return Math.floor(secs / 60) + 'm ago';
+                if (secs < 86400) return Math.floor(secs / 3600) + 'h ago';
+                return Math.floor(secs / 86400) + 'd ago';
+            }
+
+            // Render the inbound receiving-health line from /api/queue/status .inbound.
+            // Built with text nodes (not innerHTML) so the error text is never interpreted as
+            // markup. States: unconfigured (hide), starting, ok (green), error (red + action).
+            function renderRxStatus(h) {
+                var rx = document.getElementById('tml_rx_status');
+                if (!rx) return;
+                if (!h || h.state === 'unconfigured') { rx.style.display = 'none'; return; }
+                rx.style.display = 'block';
+                rx.textContent = '';
+                var set = function(bg, fg, border) {
+                    rx.style.background = bg; rx.style.color = fg; rx.style.border = '1px solid ' + border;
+                };
+                if (h.state === 'ok') {
+                    set('#1b3a24', '#a5d6a7', '#2e5a3a');
+                    var ago = (h.last_success_secs == null) ? '' : ' (last checked ' + _agoStr(h.last_success_secs) + ')';
+                    rx.textContent = '✅ Receiving texts via ' + (h.label || 'your source') + ago + '.';
+                } else if (h.state === 'error') {
+                    set('#3a1b1b', '#ffb3ab', '#5a2e2e');
+                    var head = document.createElement('strong');
+                    head.textContent = '⚠️ Texts are not being received.';
+                    rx.appendChild(head);
+                    rx.appendChild(document.createElement('br'));
+                    rx.appendChild(document.createTextNode(h.last_error || 'Polling is failing.'));
+                    var sub = document.createElement('div');
+                    sub.style.cssText = 'font-size:12px; opacity:.85; margin-top:4px;';
+                    sub.textContent = (h.last_success_secs == null)
+                        ? 'No successful check yet.'
+                        : 'Last successful check ' + _agoStr(h.last_success_secs) + '.';
+                    rx.appendChild(sub);
+                } else { // starting
+                    set('#2a2a2a', '#dddddd', '#444444');
+                    rx.textContent = '⏳ Checking for texts…';
+                }
+            }
+
             function updateLiveStatus() {
                 // On a Remote there is no Start/Stop or live state - the Master runs the show.
                 // Keep those controls hidden and skip the master-only status UI entirely.
@@ -7700,6 +7903,7 @@ def index():
                     var t=document.getElementById('btn_plugin_toggle'); if(t) t.style.display='none';
                     var lb=document.getElementById('plugin_live_banner'); if(lb) lb.style.display='none';
                     var nb=document.getElementById('plugin_not_live_banner'); if(nb) nb.style.display='none';
+                    var rx=document.getElementById('tml_rx_status'); if(rx) rx.style.display='none';
                     return;
                 }
                 fetch('/api/queue/status').then(r => r.json()).then(data => {
@@ -7737,6 +7941,10 @@ def index():
                         contentInputs.style.opacity = live ? '0.4' : '';
                         contentInputs.style.pointerEvents = live ? 'none' : '';
                     }
+
+                    // Inbound receiving health - makes a silent polling failure (wrong clock/cert,
+                    // bad app password, no network) visible on the page instead of log-only.
+                    renderRxStatus(data.inbound);
                 }).catch(() => {});
             }
 
@@ -10786,15 +10994,12 @@ def update_config():
             _pi = 2
         config['poll_interval'] = max(1, min(_pi, 60))
 
-        # Allowlist the Gmail IMAP/SMTP hosts. The Google Voice feature is Gmail-specific,
-        # and letting a client point these at an arbitrary server would send the Gmail app
-        # password (and outbound replies) there on the next poll/reply. Reject anything
-        # else by reverting to the default. Applied to the merged value so a poisoned
-        # stored value self-heals.
-        if str(config.get('gv_imap_host', '')).strip().lower() != 'imap.gmail.com':
-            config['gv_imap_host'] = 'imap.gmail.com'
-        if str(config.get('gv_smtp_host', '')).strip().lower() != 'smtp.gmail.com':
-            config['gv_smtp_host'] = 'smtp.gmail.com'
+        # Gmail IMAP/SMTP hosts are hard-coded (GV_IMAP_HOST / GV_SMTP_HOST / GV_SMTP_PORT),
+        # not config keys, so there's nothing to allowlist here - no stored setting or imported
+        # bundle can redirect the login. Strip any such keys a legacy/tampered config carried in
+        # so they can't linger in plugin.json and mislead a reader.
+        for _stale in ('gv_imap_host', 'gv_smtp_host', 'gv_smtp_port'):
+            config.pop(_stale, None)
 
         # Per-phone daily message cap: non-negative int, 0 = unlimited per phone (the hardcoded
         # global daily reply cap still applies). Clamp so a bad client value can't wedge it.
@@ -11218,6 +11423,11 @@ def import_config():
                         continue
                     for sk in SECRET_KEYS:
                         imported.pop(sk, None)
+                    # Gmail endpoints are hard-coded, never config-driven. Drop any host/port
+                    # keys the bundle carries so an imported config can't redirect the Gmail
+                    # login (nor leave misleading dead keys behind).
+                    for _hk in ('gv_imap_host', 'gv_smtp_host', 'gv_smtp_port'):
+                        imported.pop(_hk, None)
                     # Mode/identity keys (this box's Master/Remote role, which master a remote
                     # follows, its advertised name) are box-specific. Keep THIS Pi's values
                     # unless the user explicitly opted to import them (import_mode checkbox).
@@ -11765,7 +11975,7 @@ def test_google_voice_conn():
     # IMAP - required for reading incoming texts
     try:
         # timeout so the connection test can't hang on a half-open connection.
-        imap = imaplib.IMAP4_SSL(config.get('gv_imap_host', 'imap.gmail.com'), timeout=20, ssl_context=_TLS_CONTEXT)
+        imap = imaplib.IMAP4_SSL(GV_IMAP_HOST, timeout=20, ssl_context=_TLS_CONTEXT)
         try:
             imap.login(email_addr, app_pw)
             imap.select(config.get('gv_imap_folder', 'INBOX'))
@@ -11779,21 +11989,22 @@ def test_google_voice_conn():
                         "error": f"Login failed ({e}). Use a Google App Password (not your normal password), "
                                  "with 2-Step Verification enabled and IMAP turned on in Gmail."})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        # Humanize the common opaque failures - above all the wrong-clock cert error, which
+        # otherwise reads as a bare "[SSL: CERTIFICATE_VERIFY_FAILED] certificate is not yet valid".
+        return jsonify({"success": False, "error": _humanize_poll_error(e)})
 
     # SMTP - only needed for outbound auto-responses; report but don't fail on it
     reply_ready = False
     reply_error = ""
     try:
-        with smtplib.SMTP(config.get('gv_smtp_host', 'smtp.gmail.com'),
-                          int(config.get('gv_smtp_port', 587)), timeout=15) as s:
+        with smtplib.SMTP(GV_SMTP_HOST, GV_SMTP_PORT, timeout=15) as s:
             s.ehlo()
             s.starttls(context=_TLS_CONTEXT)
             s.ehlo()
             s.login(email_addr, app_pw)
         reply_ready = True
     except Exception as e:
-        reply_error = str(e)
+        reply_error = _humanize_poll_error(e)
 
     return jsonify({"success": True, "reply_ready": reply_ready, "reply_error": reply_error})
 

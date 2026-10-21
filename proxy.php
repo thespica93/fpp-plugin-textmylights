@@ -70,10 +70,27 @@ if (in_array($method, array('POST', 'PUT', 'PATCH', 'DELETE'), true)) {
 curl_setopt($ch, CURLOPT_HTTPHEADER, $reqHeaders);
 
 // Relay the daemon's status + selected response headers as they arrive.
-curl_setopt($ch, CURLOPT_HEADERFUNCTION, function ($ch, $header) {
+$statusSet = false;
+curl_setopt($ch, CURLOPT_HEADERFUNCTION, function ($ch, $header) use (&$statusSet) {
     $len = strlen($header);
     $t = trim($header);
     if ($t === '') return $len;
+    // Set the browser's status code HERE, from the daemon's "HTTP/x.y <code> ..." line,
+    // which always arrives before any body byte. We cannot wait until after the body is
+    // streamed: FPP runs PHP with output_buffering=1024 (FPP_Install.sh), so the moment the
+    // body passes 1 KB the (default 200) header is flushed and a later http_response_code()
+    // is silently lost AND logs "headers already sent" to apache2-error.log. Parsing it in
+    // the header phase keeps the daemon's real 403/404/500 intact for a response of ANY size.
+    // A 1xx line (e.g. 100 Continue) or a repeated status line just overwrites until the
+    // final one - still before the body begins.
+    if (stripos($t, 'HTTP/') === 0) {
+        $parts = explode(' ', $t, 3);
+        if (isset($parts[1]) && ctype_digit($parts[1])) {
+            http_response_code((int)$parts[1]);
+            $statusSet = true;
+        }
+        return $len;
+    }
     $lower = strtolower($t);
     // Pass through only headers that matter for the browser; let Apache/PHP set the rest.
     // NOTE: deliberately NOT relaying Content-Length - if PHP/Apache re-chunks or gzips the
@@ -98,8 +115,60 @@ curl_close($ch);
 
 if ($ok === false || $code === 0) {
     http_response_code(502);
-    header('Content-Type: application/json');
-    echo json_encode(array('error' => 'Plugin service unreachable on 127.0.0.1:5000', 'detail' => $err));
+    // Distinguish a full-page load (the browser navigating to the plugin UI) from an SPA
+    // API/fetch call. A navigation sends "Accept: text/html"; fetch() defaults to "*/*".
+    // The known page paths are a belt-and-suspenders fallback. On a page load, show a short
+    // themed message telling the user what to do; API callers keep the machine-readable JSON.
+    // This is the common sight on a FRESH install/update too: the FPP installer only restarts
+    // the daemon if it was already running (fpp_install.sh), so the service isn't up until the
+    // user restarts FPPD - which is exactly what the message asks for.
+    $accept = $_SERVER['HTTP_ACCEPT'] ?? '';
+    $isPage = ($path === '')
+        || in_array($path, array('messages', 'whitelist', 'blacklist', 'blocklist'), true)
+        || stripos($accept, 'text/html') !== false;
+    if (!$isPage) {
+        header('Content-Type: application/json');
+        echo json_encode(array('error' => 'Plugin service unreachable on 127.0.0.1:5000', 'detail' => $err));
+        exit;
+    }
+    header('Content-Type: text/html; charset=utf-8');
+    // Honor FPP's ?theme=dark|light when present; otherwise follow the OS preference.
+    $themeAttr = '';
+    if (isset($_GET['theme']) && ($_GET['theme'] === 'dark' || $_GET['theme'] === 'light')) {
+        $themeAttr = ' data-theme="' . $_GET['theme'] . '"';
+    }
+    // NOTE: we deliberately do NOT offer a restart button here. FPP plugin policy (§3.6) does
+    // not allow plugins to call /api/system/fppd/restart; the installer already sets the
+    // restartFlag, so we point the user at FPP's own restart banner instead.
+    echo '<!doctype html><html lang="en"' . $themeAttr . '><head><meta charset="utf-8">'
+       . '<meta name="viewport" content="width=device-width,initial-scale=1">'
+       . '<title>Text My Lights - service not running</title><style>'
+       . ':root{--bg:#f4f5f7;--card:#fff;--fg:#1b1b1f;--muted:#5a5f6a;--border:#dfe2e8;--accent:#c0392b}'
+       . '@media (prefers-color-scheme:dark){:root{--bg:#1b1d21;--card:#24272c;--fg:#e8eaed;--muted:#a0a6b0;--border:#363a41;--accent:#ff6b5e}}'
+       . ':root[data-theme="light"]{--bg:#f4f5f7;--card:#fff;--fg:#1b1b1f;--muted:#5a5f6a;--border:#dfe2e8;--accent:#c0392b}'
+       . ':root[data-theme="dark"]{--bg:#1b1d21;--card:#24272c;--fg:#e8eaed;--muted:#a0a6b0;--border:#363a41;--accent:#ff6b5e}'
+       . 'html,body{margin:0;background:var(--bg);color:var(--fg);'
+       . 'font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;line-height:1.55}'
+       . '.wrap{max-width:560px;margin:8vh auto;padding:0 20px}'
+       . '.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:28px 30px}'
+       . 'h1{margin:0 0 4px;font-size:1.35rem}.lead{color:var(--muted);margin:0 0 18px}'
+       . 'p{margin:0 0 14px}.muted{color:var(--muted);font-size:.92rem}'
+       . 'code{background:rgba(127,127,127,.18);padding:1px 6px;border-radius:4px;font-size:.9em}'
+       . '.bar{height:3px;background:var(--accent);border-radius:10px 10px 0 0;margin:-28px -30px 22px}'
+       . '</style></head><body><div class="wrap"><div class="card"><div class="bar"></div>'
+       . '<h1>Text My Lights isn&rsquo;t running</h1>'
+       . '<p class="lead">The plugin service on <code>127.0.0.1:5000</code> didn&rsquo;t respond.</p>'
+       . '<p>If you&rsquo;ve just <strong>installed or updated</strong> the plugin, restart FPPD using the '
+       . '<strong>restart button in the banner at the top of the page</strong>. The service starts with FPPD.</p>'
+       . '<p class="muted">If it still doesn&rsquo;t start, check <code>plugin-fpp-plugin-textmylights.log</code> '
+       . 'under <strong>Content Setup &rarr; File Manager &rarr; Logs</strong>.</p>'
+       . '</div></div></body></html>';
     exit;
 }
-http_response_code($code);
+// Status was already set from the daemon's status line during the header phase (see the
+// HEADERFUNCTION and the output_buffering note there). Fall back to setting it here only if
+// no status line was seen AND nothing has been flushed yet - so this can never be the call
+// that triggers a "headers already sent" warning.
+if (!$statusSet && !headers_sent()) {
+    http_response_code($code);
+}

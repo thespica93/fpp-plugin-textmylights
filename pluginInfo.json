@@ -35,19 +35,19 @@
 		"sends": [
 			{
 				"to": "api.twilio.com",
-				"what": "Reads inbound SMS (sender number + text) from your Twilio account. Read-only: the plugin never sends replies via Twilio.",
+				"what": "Reads inbound SMS (sender number + text) from your Twilio account (read-only).",
 				"why": "Receive the names people text",
 				"alwaysOn": false
 			},
 			{
 				"to": "Gmail (imap.gmail.com / smtp.gmail.com)",
-				"what": "Reads Google Voice SMS-to-email (sender + text); sends reply texts (on by default) and texts the admin for Live Name Approval.",
+				"what": "Reads Google Voice SMS-to-email (sender + text); sends reply texts and admin approval prompts.",
 				"why": "Receive texted names via Google Voice; send replies and approval prompts",
 				"alwaysOn": false
 			},
 			{
 				"to": "Other FPP instances on your LAN (http://<peer>:5000)",
-				"what": "In Master/Remote mode the master pushes the texted name and show state to remotes (/api/tml/state, /api/tml/stop) to display in sync.",
+				"what": "In Master/Remote mode the master pushes the texted name and show state to remotes.",
 				"why": "Multi-instance Master/Remote synchronization",
 				"alwaysOn": false
 			}
@@ -75,7 +75,7 @@
 				"where": "/home/fpp/media/plugindata/fpp-plugin-textmylights/admin_reply_ctx.json"
 			},
 			{
-				"what": "Pending/expired name-approval requests: texter number, message and name (kept indefinitely when the timeout is 0)",
+				"what": "Pending/expired name-approval requests: texter number, message and name.",
 				"about": "visitors",
 				"keptDays": null,
 				"canDelete": true,
@@ -117,6 +117,6 @@
 			}
 		],
 		"closedCode": false,
-		"other": "Credentials are stored in an owner-only (0600) file and removed on uninstall. In Master/Remote mode the texted name and show state are also sent to your other FPP instances on the LAN. No data goes to third parties beyond your own Twilio/Google accounts and your own FPP devices."
+		"other": "Credentials are stored in an owner-only (0600) file and removed on uninstall. Twilio is read-only: the plugin never sends via Twilio. Google Voice reply texts are on by default, and Live Name Approval also texts the admin approval prompts. In Master/Remote mode the master pushes the texted name and show state to your other FPP instances on the LAN (/api/tml/state, /api/tml/stop) to display in sync. Pending/expired name-approval requests are kept indefinitely when the approval timeout is set to 0. The settings UI has no separate login: anyone who can open this device's FPP web UI can reach it, consistent with FPP itself. No data goes to third parties beyond your own Twilio/Google accounts and your own FPP devices."
 	}
 }

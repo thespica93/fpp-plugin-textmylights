@@ -250,6 +250,37 @@ touch /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log
 chmod 644 /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log
 chown fpp:fpp /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log || true
 
+# Bound the plugin log's size with a logrotate drop-in (named after the plugin, §5). The plugin
+# appends via a WatchedFileHandler and never self-rotates, so a rename+create rule is handled
+# cleanly (it reopens the fresh inode) - do NOT use copytruncate. We install this ONLY if nothing
+# already rotates this file or the media/logs dir, so we never create a duplicate-entry conflict
+# with an FPP or other-plugin rule (--exclude skips our own file so re-running an update is idempotent).
+LOGROTATE_FILE="/etc/logrotate.d/fpp-plugin-textmylights"
+if command -v logrotate >/dev/null 2>&1; then
+    if grep -rslE "plugin-fpp-plugin-textmylights\.log|media/logs/\*" \
+            --exclude="fpp-plugin-textmylights" /etc/logrotate.conf /etc/logrotate.d 2>/dev/null \
+            | grep -q .; then
+        rm -f "$LOGROTATE_FILE"
+        log_and_show "Log rotation already handled by an existing system rule; skipping plugin size cap"
+    else
+        cat > "$LOGROTATE_FILE" <<'LR'
+/home/fpp/media/logs/plugin-fpp-plugin-textmylights.log {
+    size 5M
+    rotate 3
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0644 fpp fpp
+}
+LR
+        chmod 644 "$LOGROTATE_FILE"
+        log_and_show "Log size cap installed (/etc/logrotate.d/fpp-plugin-textmylights: 5MB x3)"
+    fi
+else
+    log_and_show "logrotate not present; skipping log size cap (FPP/system manages logs)"
+fi
+
 # Install scheduler scripts into FPP's scripts directory so they appear in the scheduler under:
 # Command → Run Script. They live in the shared media/scripts, so they are named after the
 # plugin (§5): fpp-plugin-textmylights-Start.sh / -Stop.sh.

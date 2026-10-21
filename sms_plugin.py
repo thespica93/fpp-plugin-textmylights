@@ -4560,7 +4560,7 @@ def send_to_fpp(name, override=None, preselected=_UNSET):
                     effect_url = f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Start')}/{urllib.parse.quote(seq_name)}/true/true"
                     # SYNC DIAGNOSTIC: fire instant in the MASTER's clock so master's and each
                     # remote's log lines are directly comparable (matching => co-triggered).
-                    logging.info(f"🎞️ NAME FSEQ '{seq_name}' fire @ master_epoch={_master_epoch_now()}ms "
+                    logging.debug(f"🎞️ NAME FSEQ '{seq_name}' fire @ master_epoch={_master_epoch_now()}ms "
                                  f"role={get_plugin_role()} offset={_master_clock_offset_ms:.0f}ms")
                     requests.get(effect_url, timeout=3)
 
@@ -4755,7 +4755,7 @@ def start_default_playlist(content=None):
             # loop=true, background=true: loops natively, auto-suppressed by foreground
             # sequences, auto-resumes when foreground stops
             effect_url = f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Start')}/{urllib.parse.quote(seq_name)}/true/true"
-            logging.info(f"🎞️ WAITING FSEQ '{seq_name}' fire @ master_epoch={_master_epoch_now()}ms "
+            logging.debug(f"🎞️ WAITING FSEQ '{seq_name}' fire @ master_epoch={_master_epoch_now()}ms "
                          f"role={get_plugin_role()} offset={_master_clock_offset_ms:.0f}ms")
             response = requests.get(effect_url, timeout=3)
 
@@ -4895,7 +4895,7 @@ def waiting_rotator():
             #    natural end so the next content covers the tail instead of the current
             #    (loop=true) sequence briefly restarting from frame 0 - a seamless handoff.
             hold = _waiting_hold_seconds(cur)
-            logging.info(f"🔁 Rotator showing waiting content '{cur}' for {hold}s")
+            logging.debug(f"🔁 Rotator showing waiting content '{cur}' for {hold}s")
             deadline = time.time() + max(0.5, hold - 0.25)
             while time.time() < deadline and not _rotator_should_idle() and not _rotator_busy():
                 time.sleep(min(0.5, max(0.05, deadline - time.time())))

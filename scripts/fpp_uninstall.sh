@@ -73,6 +73,8 @@ log_and_show "✓ Scheduler command scripts removed"
 log_and_show "Removing log files..."
 rm -f /home/fpp/media/logs/plugin-fpp-plugin-textmylights.log
 rm -f /home/fpp/media/logs/fpp-plugin-textmylights-install.log
+# Remove the logrotate drop-in the installer may have added for the plugin log.
+rm -f /etc/logrotate.d/fpp-plugin-textmylights
 log_and_show "✓ Log files removed"
 
 log_and_show "========================================"

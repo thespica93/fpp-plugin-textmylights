@@ -103,7 +103,7 @@ $fppTheme = tml_fpp_theme_help();
     <h1>📱 Text My Lights — Help</h1>
     <p>Visitors text their name to your number and it appears on your pixel display. Messages can come from <strong>Twilio</strong> or <strong>Google Voice</strong> — pick one under <em>Settings → Message Source</em>.</p>
 
-    <div class="note"><strong>Runs as a background layer.</strong> Text My Lights is designed to run as a <strong>background effect</strong> on the Pi so it can play alongside your main show without taking it over. For this to work, set your <strong>Waiting</strong> and <strong>Name Display</strong> content to <strong>sequences (.fseq)</strong>. <strong>Video and playlists are not supported at this time</strong> — they run as foreground content and would take over the player.</div>
+    <div class="note"><strong>Runs as a background layer.</strong> Text My Lights is designed to run as a <strong>background effect</strong> on the Pi so it can play alongside your main show without taking it over. For this to work, set your <strong>Waiting</strong> and <strong>Name Display</strong> content to <strong>sequences (.fseq)</strong>. Both are optional: leave Waiting empty and the projector stays with your main show between names (see <a href="#waiting-content">Waiting &amp; Name Display content</a>). <strong>Video and playlists are not supported at this time</strong> — they run as foreground content and would take over the player.</div>
 
     <a href="plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=ui.php" target="_top" class="ui-link">🔧 Open Config UI</a>
     <a href="plugin.php?_menu=content&plugin=fpp-plugin-textmylights&page=messages.php" target="_top" class="ui-link secondary">📋 View Message Queue</a>
@@ -196,8 +196,8 @@ $fppTheme = tml_fpp_theme_help();
         <tr><td>Runs as a background layer</td><td>Text My Lights always plays its content as a <strong>background effect</strong> (+ overlay), never as a foreground playlist, and <strong>Stop</strong> only stops <em>its own</em> content. So it can run on the projector while a separate foreground sequence drives your house pixels — the plugin never stops that other show. For this, set your <strong>Waiting</strong> and <strong>Name Display</strong> content to <strong>sequences (.fseq)</strong>, which run as background effects. <strong>Video and playlists are not supported at this time</strong> — they are foreground content and would take over the player.</td></tr>
         <tr><td>Credentials</td><td>Twilio: Account SID, Auth Token, Phone Number. Google Voice: Gmail Address + App Password.</td></tr>
         <tr><td>Poll Interval</td><td>How often (seconds) to check for new messages. 2–5 is typical.</td></tr>
-        <tr><td>Default “Waiting” Content</td><td><strong>Required.</strong> The sequence (.fseq) or image that loops while waiting for texts. (Playlists aren’t supported — they’re foreground and would take over the player.)</td></tr>
-        <tr><td>Name Display Content</td><td>Optional content to play while a name is on screen (defaults to the waiting content).</td></tr>
+        <tr><td>Default “Waiting” Content</td><td><strong>Optional.</strong> The sequence (.fseq) or image that loops while waiting for texts. Add 2+ to rotate between them. Leave it empty to keep the projector on your main show between names — see <a href="#waiting-content">below</a>. (Playlists aren’t supported — they’re foreground and would take over the player.)</td></tr>
+        <tr><td>Name Display Content</td><td><strong>Optional.</strong> Content to play while a name is on screen. If empty, the name is drawn over the Waiting content — or, with no Waiting content either, over your main show.</td></tr>
         <tr><td>Overlay Model</td><td>The FPP overlay model the name text is drawn onto. Use a <strong>standard RGB matrix</strong> model — see the note below on supported layouts.</td></tr>
         <tr><td>Max messages / phone</td><td>Per-day rate limit per phone number (0 = unlimited).</td></tr>
         <tr><td>Max message length</td><td>Longest name accepted, in characters.</td></tr>
@@ -206,6 +206,18 @@ $fppTheme = tml_fpp_theme_help();
         <tr><td>Use whitelist</td><td>Only show names on your approved list.</td></tr>
     </table></div>
     <div class="note"><strong>Supported overlay layouts.</strong> The plugin draws names by writing the picture straight into the overlay model's memory, top-left to bottom-right. That only comes out right on a <strong>standard RGB matrix</strong>: <strong>3 channels per pixel (RGB, not RGBW)</strong>, laid out as a <strong>progressive</strong> grid — <strong>not serpentine / zig-zag</strong> — starting at the <strong>top-left</strong>. On those, text reads correctly. On a zig-zag, vertical, bottom-start, or RGBW model the output would come out scrambled, so the plugin <strong>detects a non-matching model and skips drawing</strong> rather than show garbage (it logs a warning naming the model). If your matrix is wired zig-zag, define the Pixel Overlay Model in FPP as a plain progressive RGB grid for the plugin to use. <em>(FPP&nbsp;10 adds an API that maps the data for any layout; a future release will use it to lift this restriction.)</em></div>
+
+    <h3 id="waiting-content">Waiting &amp; Name Display content</h3>
+    <p>Neither is required — you can <strong>Start</strong> the show with both empty. What the projector shows depends on which ones you set:</p>
+    <div class="ref"><table>
+        <tr><th>Waiting</th><th>Name Display</th><th>Between names</th><th>When a name arrives</th></tr>
+        <tr><td>Set</td><td>Set</td><td>Your Waiting content loops</td><td>Name Display content plays with the name on top</td></tr>
+        <tr><td>Set</td><td>Empty</td><td>Your Waiting content loops</td><td>Name appears on top of the Waiting content</td></tr>
+        <tr><td>Empty</td><td>Set</td><td>Your <strong>main show</strong> plays — the plugin shows nothing</td><td>Name Display content plays with the name on top</td></tr>
+        <tr><td>Empty</td><td>Empty</td><td>Your <strong>main show</strong> plays — the plugin shows nothing</td><td>Name appears <strong>directly on top of your main show</strong></td></tr>
+    </table></div>
+    <div class="note"><strong>Using your own show between names.</strong> If you'd rather run your own sequences on the projector — for example, ones you made that already include your texting phone number — leave <strong>Waiting</strong> empty. The plugin then stays out of the way until someone texts, draws the name on the overlay model for the Display Duration, and clears it so your show is visible again. The Config UI shows a yellow warning when Waiting (or both Waiting and Name Display) is empty, as a reminder of this behavior.</div>
+    <div class="warn">With <strong>both</strong> empty, names are drawn straight over whatever your main show is playing on the overlay model's pixels. Pick text colors and a layout on the <em>Display</em> tab that stay readable over your show.</div>
 
     <h3>Display tab</h3>
     <div class="ref"><table>
@@ -334,7 +346,11 @@ $fppTheme = tml_fpp_theme_help();
     function showFromHash() {
         var name = (location.hash || '').replace('#', '');
         var match = document.getElementById('panel-' + name);
-        if (match) { show(name); }
+        if (match) { show(name); return; }
+        // An anchor inside a panel (e.g. #waiting-content): open its panel, then scroll to it.
+        var target = name && document.getElementById(name);
+        var panel = target && target.closest('.tml-panel');
+        if (panel) { show(panel.id.replace('panel-', '')); target.scrollIntoView(); }
     }
     showFromHash();
     window.addEventListener('hashchange', showFromHash);

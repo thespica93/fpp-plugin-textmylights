@@ -4472,6 +4472,10 @@ def send_to_fpp(name, override=None, preselected=_UNSET):
             name_playlist = _forced_content
             if override.get('duration'):
                 _active_display_duration = int(override['duration'])
+        # Back-to-back names never pass through return_to_default_playlist, so the previous
+        # name's FSEQ effect is still looping. Remember it so Step 1 can stop it once this
+        # name's content is up - otherwise, with 2+ names sequences, it is orphaned forever.
+        _prev_name_content = _active_name_content or ''
         _active_name_content = name_playlist
         # send_to_fpp is now RENDER-ONLY. The master mirrors the name to remotes through the
         # authoritative show state + beacon (see display_worker / master_beacon), scheduled on an
@@ -4585,6 +4589,22 @@ def send_to_fpp(name, override=None, preselected=_UNSET):
             # No names content configured - seq:/playlist waiting content composites
             # correctly underneath the overlay and is left running.
             pass
+
+        # Step 1b: Stop the PREVIOUS name's sequence if it differs from this one (started
+        # first, stopped after, so there is no gap). Skip it when it is the waiting
+        # background - that single looping FSEQ serves both layers.
+        if _prev_name_content.startswith('seq:'):
+            prev_seq = _prev_name_content[4:].removesuffix('.fseq')
+            cur_seq = name_playlist[4:].removesuffix('.fseq') if name_playlist.startswith('seq:') else None
+            _wait = _active_waiting_content or config.get('default_playlist', '')
+            wait_seq = _wait[4:].removesuffix('.fseq') if _wait.startswith('seq:') else None
+            if prev_seq != cur_seq and prev_seq != wait_seq:
+                try:
+                    import urllib.parse
+                    requests.get(f"{fpp_host}/api/command/{urllib.parse.quote('FSEQ Effect Stop')}/{urllib.parse.quote(prev_seq)}", timeout=3)
+                    logging.info(f"⏹️  Stopped previous name seq '{prev_seq}'")
+                except Exception as e:
+                    logging.warning(f"Could not stop previous name seq '{prev_seq}': {e}")
 
         # Step 2: Display text ON TOP of the sequence
         if overlay_model:

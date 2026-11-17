@@ -6359,7 +6359,7 @@ def index():
                         <div id="fpp_content_inputs">
                             <div style="display:flex; gap:20px; flex-wrap:wrap; align-items:flex-start;">
                               <div style="flex:1; min-width:280px;" id="waiting_config_col">
-                            <label>Default "Waiting" Content: <span style="color:#f44336;font-size:12px;">* required</span> <span class="help-text" style="font-weight:normal;margin-left:6px;">📺 Loops while waiting for texts. Add 2+ to rotate between them (each sequence plays full length.)</span></label>
+                            <label>Default "Waiting" Content: <span style="color:var(--fg-muted);font-size:12px;">(optional)</span> <span class="help-text" style="font-weight:normal;margin-left:6px;">📺 Loops while waiting for texts. Add 2+ to rotate between them (each sequence plays full length.)</span></label>
                             <!-- Hidden legacy single-value select: kept in sync with the first
                                  list item. Drives the canvas preview background + the
                                  deleted-file prune, and is the value saved as default_playlist. -->
@@ -6376,7 +6376,7 @@ def index():
                                 </div>
                             </div>
                             <div id="waiting_content_none_warning" style="display:none; background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn-fg); border-radius:5px; padding:8px 12px; margin-top:6px; font-size:13px;">
-                                ⚠️ No Waiting content selected - required before you can Start the show.
+                                ⚠️ No Waiting content selected - the plugin won't play anything between names, so the projector stays with your main sequencer.
                             </div>
                               </div>
                               <div style="flex:1; min-width:280px;" id="names_config_col">
@@ -6394,7 +6394,7 @@ def index():
                                 </div>
                             </div>
                             <div id="name_display_none_warning" style="display:none; background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn-fg); border-radius:5px; padding:8px 12px; margin-top:6px; font-size:13px;">
-                                ⚠️ No Names content - names will appear directly over the Waiting content (using the Display-tab text layout).
+                                <span id="name_display_none_text">⚠️ No Names content - names will appear directly over the Waiting content (using the Display-tab text layout).</span>
                             </div>
                               </div>
                             </div>
@@ -9382,8 +9382,7 @@ def index():
                     var rnd=document.querySelector('input[name="names_mode"][value="random"]');
                     if (rr) rr.checked=(window._namesMode!=='random');
                     if (rnd) rnd.checked=(window._namesMode==='random');
-                    var warn=document.getElementById('name_display_none_warning');
-                    if (warn) warn.style.display=(lst.length===0)?'block':'none';
+                    if (window.refreshNoContentWarnings) window.refreshNoContentWarnings();
                     var sel=document.getElementById('preview_content_select');
                     if (sel) { sel.innerHTML=''; lst.forEach(function(it,i){ sel.appendChild(new Option((i+1)+'. '+(it.content||'(none)'), i, false, i===window._namesSelectedIndex)); }); }
                     var prow=document.getElementById('preview_content_row');
@@ -9657,6 +9656,22 @@ def index():
 
                 // Render the Waiting list rows + mode toggle + none-warning, and keep the hidden
                 // legacy default_playlist select synced to the first item (drives preview + save).
+                // Waiting + Names "none" warnings. With neither configured the plugin plays no
+                // background at all, so names land straight on top of the main sequence.
+                function refreshNoContentWarnings() {
+                    var noWaiting=(window._waitingContentList||[]).length===0;
+                    var noNames=(window._namesContentList||[]).length===0;
+                    var ww=document.getElementById('waiting_content_none_warning');
+                    if (ww) ww.style.display=noWaiting?'block':'none';
+                    var nw=document.getElementById('name_display_none_warning');
+                    if (nw) nw.style.display=noNames?'block':'none';
+                    var nt=document.getElementById('name_display_none_text');
+                    if (nt) nt.textContent=(noNames&&noWaiting)
+                        ? '⚠️ No Waiting or Names content - incoming names will show directly on top of your main sequence (using the Display-tab text layout).'
+                        : '⚠️ No Names content - names will appear directly over the Waiting content (using the Display-tab text layout).';
+                }
+                window.refreshNoContentWarnings=refreshNoContentWarnings;
+
                 function renderWaitingList() {
                     var lst=window._waitingContentList||[];
                     var box=document.getElementById('waiting_content_items');
@@ -9713,8 +9728,7 @@ def index():
                     var rnd=document.querySelector('input[name="waiting_mode"][value="random"]');
                     if (rr) rr.checked=(window._waitingMode!=='random');
                     if (rnd) rnd.checked=(window._waitingMode==='random');
-                    var warn=document.getElementById('waiting_content_none_warning');
-                    if (warn) warn.style.display=(lst.length===0)?'block':'none';
+                    refreshNoContentWarnings();
                     // Sync hidden legacy select to the first item so the preview background and
                     // the saved default_playlist both track the list.
                     var dp=document.getElementById('default_playlist');
@@ -10150,8 +10164,7 @@ def index():
             function updateNameDisplayWarning() {
                 // The names list drives the warning + list UI now.
                 if (window.renderNamesList) { window.renderNamesList(); return; }
-                var warn = document.getElementById('name_display_none_warning');
-                if (warn) warn.style.display = ((window._namesContentList || []).length === 0) ? 'block' : 'none';
+                if (window.refreshNoContentWarnings) window.refreshNoContentWarnings();
             }
 
             // All DOM elements are above this script block - call init functions directly.
@@ -13938,13 +13951,12 @@ def api_activate():
         logging.warning("⛔ Start refused (master): no overlay and no synced remotes")
         return jsonify({"success": False, "error": msg}), 400
 
-    # Require waiting content - a single default_playlist or a rotation list. Without one
-    # the show has no defined state.
+    # Waiting content is optional. Without it the plugin plays nothing between names, leaving
+    # the projector to the main sequencer; names then render on the overlay over that show.
     _has_list = len(config.get('default_content_list', []) or []) > 0
-    if not config.get('default_playlist', '').strip() and not _has_list:
-        msg = "ERROR: No Default Waiting Content configured. Set one in the plugin settings before running Text My Lights Start."
-        logging.error(msg)
-        return jsonify({"success": False, "error": msg}), 400
+    _has_waiting = bool(config.get('default_playlist', '').strip()) or _has_list
+    if not _has_waiting:
+        logging.info("ℹ️  Start with no Waiting content - projector stays with the main sequencer between names")
 
     config['enabled'] = True
     stop_polling = False
@@ -13957,7 +13969,10 @@ def api_activate():
     # Start the waiting content (single, or the rotator for a 2+ item list)
     result = start_waiting_content()
 
-    logging.info(f"✅ Text My Lights Start activated - playlist {'started' if result else 'FAILED to start'}")
+    if _has_waiting:
+        logging.info(f"✅ Text My Lights Start activated - playlist {'started' if result else 'FAILED to start'}")
+    else:
+        logging.info("✅ Text My Lights Start activated - no Waiting content")
     return jsonify({"success": True, "playlist_started": result,
                     "message": "Text My Lights plugin activated"})
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Text My Lights Plugin - Activate
-# Enables the plugin, starts SMS polling, and starts the default waiting playlist.
+# Enables the plugin, starts SMS polling, and starts the waiting content (if any).
 # FPP Scheduler: Command → Run Script → fpp-plugin-textmylights-Start.sh
 
 PLUGIN_URL="http://127.0.0.1:5000/api/activate"
@@ -14,7 +14,7 @@ for i in $(seq 1 5); do
         echo "Text My Lights Start OK: $BODY"
         exit 0
     fi
-    # 400 = configuration error (e.g. no default playlist) — don't retry, fail immediately
+    # 400 = configuration error (e.g. no overlay model) — don't retry, fail immediately
     if [ "$HTTP_CODE" = "400" ]; then
         ERROR=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error','Unknown error'))" 2>/dev/null || echo "$BODY")
         echo "Text My Lights Start FAILED: $ERROR"

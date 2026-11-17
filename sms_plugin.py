@@ -6133,6 +6133,9 @@ def index():
               --note-bg: var(--bs-info-bg-subtle, #e3f2fd);
               --note-fg: var(--bs-info-text-emphasis, #0d47a1);
               --note-border: var(--bs-info-border-subtle, #90caf9);
+              --err-bg: var(--bs-danger-bg-subtle, #ffebee);
+              --err-fg: var(--bs-danger-text-emphasis, #b71c1c);
+              --err-border: var(--bs-danger-border-subtle, #f44336);
               --tab-bg: var(--bs-tertiary-bg, #f0f0f0);
               --tab-fg: var(--bs-secondary-color, #555555);
               --tab-hover: var(--bs-secondary-bg, #e8e8e8);
@@ -6398,6 +6401,9 @@ def index():
                             </div>
                               </div>
                             </div>
+                            <!-- Channel-scope guard (see refreshScopeWarnings): lists every Waiting/Names
+                                 sequence that writes channels outside the overlay model. Advisory only. -->
+                            <div id="content_scope_warning" style="display:none; background:var(--err-bg); border:1px solid var(--err-border); color:var(--err-fg); border-radius:5px; padding:8px 12px; margin-top:12px; font-size:13px;"></div>
 
                             <!-- Manage Names Content modal: Available (left) → Names list (right), with arrows.
                                  Top-aligned + high z-index (matching the export modal's overlay) and paired with
@@ -6425,6 +6431,7 @@ def index():
                                             <button type="button" onclick="mngMoveDown()" title="Move down" style="padding:6px 10px; cursor:pointer;">▼</button>
                                         </div>
                                     </div>
+                                    <div id="mng_scope_warning" style="display:none; background:var(--err-bg); border:1px solid var(--err-border); color:var(--err-fg); border-radius:5px; padding:8px 12px; margin-top:12px; font-size:13px;"></div>
                                     <div style="margin-top:16px; display:flex; justify-content:flex-end; gap:8px;">
                                         <button type="button" onclick="closeManageContentModal()" style="background:var(--bs-success, #2e7d32); color:#fff; padding:8px 20px; border:none; border-radius:4px; cursor:pointer;">Done</button>
                                     </div>
@@ -6455,6 +6462,7 @@ def index():
                                             <button type="button" onclick="wmngMoveDown()" title="Move down" style="padding:6px 10px; cursor:pointer;">▼</button>
                                         </div>
                                     </div>
+                                    <div id="wmng_scope_warning" style="display:none; background:var(--err-bg); border:1px solid var(--err-border); color:var(--err-fg); border-radius:5px; padding:8px 12px; margin-top:12px; font-size:13px;"></div>
                                     <div style="margin-top:16px; display:flex; justify-content:flex-end; gap:8px;">
                                         <button type="button" onclick="closeManageWaitingModal()" style="background:var(--bs-success, #2e7d32); color:#fff; padding:8px 20px; border:none; border-radius:4px; cursor:pointer;">Done</button>
                                     </div>
@@ -6750,6 +6758,8 @@ def index():
                 // replies, limits, filters, testing, queue, Start) is handled on the Master,
                 // so hide it here to avoid confusion.
                 function applyRoleVisibility(remote) {
+                    window._tmlIsRemote = !!remote;
+                    if (window.refreshScopeWarnings) window.refreshScopeWarnings();
                     var showIf = function(id, show){ var el=document.getElementById(id); if(el) el.style.display = show ? '' : 'none'; };
                     showIf('message_source_section', !remote);
                     showIf('message_settings_section', !remote);
@@ -9448,6 +9458,7 @@ def index():
                     _mngRenderAvailable();
                     _mngRenderSelected();
                     _openModalCentered(document.getElementById('manage_content_modal'), btn);
+                    if (window.refreshScopeWarnings) window.refreshScopeWarnings();
                 }
                 function closeManageContentModal() {
                     var m=document.getElementById('manage_content_modal'); if(m) m.style.display='none';
@@ -9488,6 +9499,7 @@ def index():
                     });
                     _mngRenderSelected(lst.length-1);
                     _mngRenderAvailable();   // hide the newly-added items from the left list
+                    if (window.refreshScopeWarnings) window.refreshScopeWarnings();
                 }
                 function mngRemove() {
                     var sel=document.getElementById('mng_selected'); if(!sel) return;
@@ -9496,6 +9508,7 @@ def index():
                     idxs.sort(function(a,b){return b-a;}).forEach(function(i){ window._namesContentList.splice(i,1); });
                     _mngRenderSelected();
                     _mngRenderAvailable();   // removed items become available again
+                    if (window.refreshScopeWarnings) window.refreshScopeWarnings();
                 }
                 function mngMoveUp() {
                     var sel=document.getElementById('mng_selected'); if(!sel) return;
@@ -9669,8 +9682,78 @@ def index():
                     if (nt) nt.textContent=(noNames&&noWaiting)
                         ? '⚠️ No Waiting or Names content - incoming names will show directly on top of your main sequence (using the Display-tab text layout).'
                         : '⚠️ No Names content - names will appear directly over the Waiting content (using the Display-tab text layout).';
+                    refreshScopeWarnings();
                 }
                 window.refreshNoContentWarnings=refreshNoContentWarnings;
+
+                // Channel-scope guard. Waiting/Names sequences play as FSEQ Effects, and FPP copies
+                // every channel in the file over the show - so a full-channel (non model-only)
+                // export would overwrite lights outside the overlay model. The server checks each
+                // seq: item against the overlay model (/api/fseq/channel_check); we only warn, never
+                // block. Results are cached per overlay model; a changed model clears the cache.
+                window._scopeWarn={}; window._scopeWarnModel=null; window._scopePending={};
+                function _scopeModel(){ var el=document.getElementById('overlay_model_name'); return el?(el.value||''):''; }
+                function _scopeIssues(groups){
+                    var out=[], seen={};
+                    groups.forEach(function(g){
+                        (g[1]||[]).forEach(function(it){
+                            var c=it&&it.content; if(!c||seen[g[0]+c]) return;
+                            seen[g[0]+c]=true;
+                            if (window._scopeWarn[c]) out.push({kind:g[0], content:c, msg:window._scopeWarn[c]});
+                        });
+                    });
+                    return out;
+                }
+                function _fillScopeBox(id, issues, footer){
+                    var box=document.getElementById(id); if(!box) return;
+                    box.innerHTML='';
+                    if (!issues.length) { box.style.display='none'; return; }
+                    var h=document.createElement('div');
+                    h.style.cssText='font-weight:bold;margin-bottom:4px;';
+                    h.textContent='⛔ This content will affect lights outside the overlay model';
+                    box.appendChild(h);
+                    var ul=document.createElement('ul'); ul.style.cssText='margin:4px 0 6px 18px;padding:0;';
+                    issues.forEach(function(x){
+                        var li=document.createElement('li'); li.style.marginBottom='3px';
+                        var b=document.createElement('strong');
+                        b.textContent=(x.kind?x.kind+': ':'')+x.content.replace(/^seq:/,'');
+                        li.appendChild(b); li.appendChild(document.createTextNode(' - '+x.msg));
+                        ul.appendChild(li);
+                    });
+                    box.appendChild(ul);
+                    var f=document.createElement('div'); f.textContent=footer; box.appendChild(f);
+                    box.style.display='block';
+                }
+                function renderScopeWarnings(){
+                    var w=window._waitingContentList||[], n=window._namesContentList||[];
+                    var fix='Re-export it from xLights with only the overlay model (a model-only, sparse sequence) to keep the rest of your display unaffected. You can still use it as-is.';
+                    _fillScopeBox('wmng_scope_warning', _scopeIssues([['',w]]), fix);
+                    _fillScopeBox('mng_scope_warning',  _scopeIssues([['',n]]), fix);
+                    // Page box: content is master-driven, so a remote doesn't show it.
+                    _fillScopeBox('content_scope_warning',
+                                  window._tmlIsRemote?[]:_scopeIssues([['Waiting',w],['Names',n]]),
+                                  'While these play, they overwrite every light in the listed channels - not just the overlay model. '+fix);
+                }
+                function refreshScopeWarnings(){
+                    var model=_scopeModel();
+                    if (model!==window._scopeWarnModel){ window._scopeWarn={}; window._scopePending={}; window._scopeWarnModel=model; }
+                    var need=[];
+                    (window._waitingContentList||[]).concat(window._namesContentList||[]).forEach(function(it){
+                        var c=it&&it.content;
+                        if (c && c.indexOf('seq:')===0 && !(c in window._scopeWarn) && !window._scopePending[c] && need.indexOf(c)<0) need.push(c);
+                    });
+                    renderScopeWarnings();
+                    if (!need.length) return;
+                    need.forEach(function(c){ window._scopePending[c]=true; });
+                    var q='model='+encodeURIComponent(model)+need.map(function(c){ return '&content='+encodeURIComponent(c); }).join('');
+                    fetch('/api/fseq/channel_check?'+q).then(function(r){ return r.json(); }).then(function(d){
+                        if (window._scopeWarnModel!==model) return;   // model changed mid-flight
+                        var res=(d&&d.results)||{};
+                        need.forEach(function(c){ window._scopeWarn[c]=res[c]||null; delete window._scopePending[c]; });
+                        renderScopeWarnings();
+                    }).catch(function(){ need.forEach(function(c){ delete window._scopePending[c]; }); });
+                }
+                window.refreshScopeWarnings=refreshScopeWarnings;
 
                 function renderWaitingList() {
                     var lst=window._waitingContentList||[];
@@ -9763,6 +9846,7 @@ def index():
                     _wmngRenderAvailable();
                     _wmngRenderSelected();
                     _openModalCentered(document.getElementById('manage_waiting_modal'), btn);
+                    if (window.refreshScopeWarnings) window.refreshScopeWarnings();
                 }
                 function closeManageWaitingModal() {
                     var m=document.getElementById('manage_waiting_modal'); if(m) m.style.display='none';
@@ -9777,6 +9861,7 @@ def index():
                     chosen.forEach(function(val){ lst.push({content:val, display_duration:30}); });
                     _wmngRenderSelected(lst.length-1);
                     _wmngRenderAvailable();
+                    if (window.refreshScopeWarnings) window.refreshScopeWarnings();
                 }
                 function wmngRemove() {
                     var sel=document.getElementById('wmng_selected'); if(!sel) return;
@@ -9785,6 +9870,7 @@ def index():
                     idxs.sort(function(a,b){return b-a;}).forEach(function(i){ window._waitingContentList.splice(i,1); });
                     _wmngRenderSelected();
                     _wmngRenderAvailable();
+                    if (window.refreshScopeWarnings) window.refreshScopeWarnings();
                 }
                 function wmngMoveUp() {
                     var sel=document.getElementById('wmng_selected'); if(!sel) return;
@@ -10462,6 +10548,7 @@ def index():
                             document.getElementById('overlay_model_height').value = 0;
                         }
                         saveConfig();
+                        if (window.refreshScopeWarnings) window.refreshScopeWarnings();
                         // Overlay changed -> re-evaluate the preview target NOW (don't wait for the 15s
                         // poll) so the dropdown, editor layout, and canvas stay in sync: gained an
                         // overlay -> "This box"; lost it -> a remote. Use the cached remote list + this
@@ -11692,6 +11779,62 @@ def fseq_debug():
             result['frame0_error'] = str(e)
 
     return jsonify(result)
+
+def _fseq_channel_scope_warning(content, overlay_sc, overlay_cc):
+    """Warn when a seq: Waiting/Names item would write channels OUTSIDE the overlay model.
+    The plugin plays these as FSEQ Effects, and fppd copies an effect's frame straight over
+    the main show's channel data: a sparse .fseq writes only its ranges, but a non-sparse one
+    writes channels 1..channel_count - every light in that span - and zeroes them for a frame
+    when the effect stops (core src/effects.cpp OverlayEffect / StopEffectHelper). Returns a
+    message, or None when the item is fine or can't be judged (not a sequence, missing file,
+    unknown overlay range). Advisory only - the content is still allowed."""
+    if not content or not content.startswith('seq:'):
+        return None
+    name = os.path.basename(content[4:].removesuffix('.fseq'))
+    filepath = os.path.join(FSEQ_SEQUENCE_PATH, name + '.fseq')
+    if not os.path.exists(filepath):
+        return None
+    try:
+        hdr = parse_fseq_header(filepath)
+    except Exception:
+        return None
+    overlay_end = (overlay_sc + overlay_cc - 1) if (overlay_sc and overlay_cc) else None
+
+    if not hdr['num_sparse_ranges']:
+        total = hdr['channel_count']
+        if overlay_end and overlay_sc == 1 and total <= overlay_end:
+            return None   # the full file IS the overlay model's channels
+        return (f"Not exported as a model-only (sparse) sequence: it covers channels 1-{total:,}. "
+                f"While it plays it overwrites every light in that range, and blanks them briefly "
+                f"when it stops - not just the overlay model.")
+
+    ranges = hdr['sparse_ranges']
+    if overlay_end:
+        outside = [r for r in ranges
+                   if r['start'] + 1 < overlay_sc or r['start'] + r['count'] > overlay_end]
+        if outside:
+            spans = ', '.join(f"{r['start'] + 1:,}-{r['start'] + r['count']:,}" for r in outside)
+            return (f"Writes channels {spans}, outside the overlay model "
+                    f"({overlay_sc:,}-{overlay_end:,}). Those lights are overwritten while it plays.")
+        return None
+    total = sum(r['count'] for r in ranges)
+    if overlay_cc and total > overlay_cc:
+        return (f"Covers {total:,} channels but the overlay model has only {overlay_cc:,}, so it "
+                f"writes lights outside the overlay model while it plays.")
+    return None
+
+
+@app.route('/api/fseq/channel_check')
+def fseq_channel_check():
+    """Check Waiting/Names sequences against the overlay model's channels (see
+    _fseq_channel_scope_warning). ?content=seq:A&content=seq:B[&model=...]"""
+    contents   = request.args.getlist('content')[:100]
+    model_name = request.args.get('model', config.get('overlay_model_name', '')).strip()
+    sc, cc = get_model_channel_info(model_name) if model_name else (None, None)
+    results = {c: _fseq_channel_scope_warning(c, sc, cc) for c in contents}
+    return jsonify({'model': model_name, 'overlay_start': sc, 'overlay_count': cc,
+                    'results': results})
+
 
 @app.route('/api/fseq/info')
 def fseq_info():

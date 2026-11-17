@@ -602,6 +602,11 @@ _active_waiting_content = ''
 rotator_thread = None
 stop_rotator = True               # pause flag: True = don't switch/idle. Cleared on start.
 rotator_lock = threading.Lock()   # serializes a rotator switch against stop_show_playback teardown
+# fppd restart handling (see fppd_restart_watcher): set once fppd is up and the show content has
+# been restored; the display worker holds queued names while it's clear.
+_fppd_ready = threading.Event()
+FPPD_POLL_S = 5                   # how often the watcher checks fppd's status/uptime
+FPPD_SETTLE_S = 3                 # grace after fppd answers before sending it commands
 _fseq_dur_cache = {}              # {seq_name: duration_seconds} - parsed FSEQ lengths
 
 # ── Multi-instance (master/remote) ──────────────────────────────────────────
@@ -4962,6 +4967,83 @@ def start_waiting_content():
     return ok
 
 
+def _fppd_status():
+    """(ready, uptime_seconds) for the local fppd. The web UI still answers /api/fppd/status
+    while fppd itself is down, but without the uptime/status fields - that reads as not ready.
+    uptime is None when this FPP version doesn't report it (restarts are then detected only by
+    the down→up transition)."""
+    try:
+        r = requests.get(f"{FPP_HOST}/api/fppd/status", timeout=3)
+        if r.status_code == 200:
+            data = r.json()
+            up = data.get('uptimeTotalSeconds')
+            up = up if isinstance(up, (int, float)) else None
+            status_name = str(data.get('status_name', '') or '').strip().lower()
+            return (up is not None or status_name not in ('', 'unknown')), up
+    except Exception:
+        pass
+    return False, None
+
+
+def _restore_after_fppd_restart():
+    """fppd (re)started: every FSEQ effect and the overlay state are gone. If the show is live,
+    bring the waiting content back up; if that keeps failing, run the same Stop as the button so
+    the plugin never claims to be live over a dark projector."""
+    global _active_waiting_content, _remote_applied_gen
+    if not config.get('enabled', False):
+        return
+    if is_remote():
+        # The follower re-applies the master's current state from scratch (its "content changed?"
+        # check would otherwise skip a waiting seq fppd just dropped). Own waiting content is the
+        # fallback until the master's beacon lands, exactly as at boot before.
+        _active_waiting_content = ''
+        _remote_applied_gen = None
+        start_waiting_content()
+        return
+    lst = config.get('default_content_list', []) or []
+    has_waiting = bool(lst) or bool(config.get('default_playlist', '').strip())
+    for attempt in range(1, 6):
+        if start_waiting_content() or not has_waiting:
+            logging.info(f"✅ fppd up - show content restored (attempt {attempt})")
+            return
+        logging.warning(f"⚠️  fppd up but waiting content didn't start (attempt {attempt}/5) - retrying")
+        time.sleep(3)
+    logging.error("⛔ Could not restart waiting content after fppd started - stopping the show "
+                  "so the plugin is in a known state")
+    broadcast_stop_to_remotes()
+    _deactivate_local()
+
+
+def fppd_restart_watcher():
+    """Restore the show whenever fppd (re)starts: at plugin launch (postStart.sh after FPPD
+    Restart / boot) and when fppd restarts underneath a running plugin (uptime goes backwards,
+    or it was unreachable and came back). Names are held (_fppd_ready) until it's back."""
+    logging.info("🩺 fppd restart watcher started")
+    last_up = None
+    was_down = True   # plugin launch counts as "fppd just came up"
+    while True:
+        try:
+            ready, up = _fppd_status()
+            if not ready:
+                if not was_down:
+                    logging.warning("⚠️  fppd is down - holding names until it's back")
+                was_down = True
+                _fppd_ready.clear()
+            else:
+                restarted = was_down or (up is not None and last_up is not None and up < last_up)
+                last_up = up
+                if restarted:
+                    if not was_down:
+                        logging.warning("⚠️  fppd restarted underneath the plugin - restoring show content")
+                    was_down = False
+                    time.sleep(FPPD_SETTLE_S)   # let fppd finish loading models/sequences
+                    _restore_after_fppd_restart()
+                    _fppd_ready.set()
+        except Exception as e:
+            logging.error(f"fppd_restart_watcher: {e}")
+        time.sleep(FPPD_POLL_S)
+
+
 def return_to_default_playlist():
     """Clear text overlay and stop the names sequence/playlist.
     If the default is a seq: (FSEQ Effect background), the background auto-resumes.
@@ -5181,6 +5263,12 @@ def display_worker():
             # not by a local queue/timer - so the worker stays idle there and never double-drives
             # the overlay. It owns the display only on a master / standalone box.
             if is_remote():
+                time.sleep(0.2)
+                continue
+
+            # Hold queued names while fppd is down/restarting - anything sent now would be lost
+            # (and a restored queue would otherwise fire before the waiting content is back).
+            if not _fppd_ready.is_set():
                 time.sleep(0.2)
                 continue
 
@@ -14260,13 +14348,9 @@ if __name__ == '__main__':
     # when enabled. Picks Twilio or Google Voice based on message_source.
     start_polling_if_needed()
 
-    # Start the waiting content on launch if the plugin is already enabled
-    if config['enabled']:
-        def _start_default():
-            import time
-            time.sleep(3)  # brief delay to let FPP settle before sending commands
-            start_waiting_content()
-        threading.Thread(target=_start_default, daemon=True).start()
+    # Start the waiting content once fppd is actually up (if the plugin is enabled), and restore
+    # it again whenever fppd restarts underneath us - or Stop if it can't be brought back.
+    threading.Thread(target=fppd_restart_watcher, daemon=True).start()
 
     logging.info("Text My Lights plugin starting...")
     if os.path.exists(AUTH_DISABLE_FILE):

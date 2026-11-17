@@ -6133,9 +6133,6 @@ def index():
               --note-bg: var(--bs-info-bg-subtle, #e3f2fd);
               --note-fg: var(--bs-info-text-emphasis, #0d47a1);
               --note-border: var(--bs-info-border-subtle, #90caf9);
-              --err-bg: var(--bs-danger-bg-subtle, #ffebee);
-              --err-fg: var(--bs-danger-text-emphasis, #b71c1c);
-              --err-border: var(--bs-danger-border-subtle, #f44336);
               --tab-bg: var(--bs-tertiary-bg, #f0f0f0);
               --tab-fg: var(--bs-secondary-color, #555555);
               --tab-hover: var(--bs-secondary-bg, #e8e8e8);
@@ -6403,7 +6400,7 @@ def index():
                             </div>
                             <!-- Channel-scope guard (see refreshScopeWarnings): lists every Waiting/Names
                                  sequence that writes channels outside the overlay model. Advisory only. -->
-                            <div id="content_scope_warning" style="display:none; background:var(--err-bg); border:1px solid var(--err-border); color:var(--err-fg); border-radius:5px; padding:8px 12px; margin-top:12px; font-size:13px;"></div>
+                            <div id="content_scope_warning" style="display:none; background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn-fg); border-radius:5px; padding:8px 12px; margin-top:12px; font-size:13px;"></div>
 
                             <!-- Manage Names Content modal: Available (left) → Names list (right), with arrows.
                                  Top-aligned + high z-index (matching the export modal's overlay) and paired with
@@ -6431,7 +6428,7 @@ def index():
                                             <button type="button" onclick="mngMoveDown()" title="Move down" style="padding:6px 10px; cursor:pointer;">▼</button>
                                         </div>
                                     </div>
-                                    <div id="mng_scope_warning" style="display:none; background:var(--err-bg); border:1px solid var(--err-border); color:var(--err-fg); border-radius:5px; padding:8px 12px; margin-top:12px; font-size:13px;"></div>
+                                    <div id="mng_scope_warning" style="display:none; background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn-fg); border-radius:5px; padding:8px 12px; margin-top:12px; font-size:13px;"></div>
                                     <div style="margin-top:16px; display:flex; justify-content:flex-end; gap:8px;">
                                         <button type="button" onclick="closeManageContentModal()" style="background:var(--bs-success, #2e7d32); color:#fff; padding:8px 20px; border:none; border-radius:4px; cursor:pointer;">Done</button>
                                     </div>
@@ -6462,7 +6459,7 @@ def index():
                                             <button type="button" onclick="wmngMoveDown()" title="Move down" style="padding:6px 10px; cursor:pointer;">▼</button>
                                         </div>
                                     </div>
-                                    <div id="wmng_scope_warning" style="display:none; background:var(--err-bg); border:1px solid var(--err-border); color:var(--err-fg); border-radius:5px; padding:8px 12px; margin-top:12px; font-size:13px;"></div>
+                                    <div id="wmng_scope_warning" style="display:none; background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn-fg); border-radius:5px; padding:8px 12px; margin-top:12px; font-size:13px;"></div>
                                     <div style="margin-top:16px; display:flex; justify-content:flex-end; gap:8px;">
                                         <button type="button" onclick="closeManageWaitingModal()" style="background:var(--bs-success, #2e7d32); color:#fff; padding:8px 20px; border:none; border-radius:4px; cursor:pointer;">Done</button>
                                     </div>
@@ -9710,7 +9707,7 @@ def index():
                     if (!issues.length) { box.style.display='none'; return; }
                     var h=document.createElement('div');
                     h.style.cssText='font-weight:bold;margin-bottom:4px;';
-                    h.textContent='⛔ This content will affect lights outside the overlay model';
+                    h.textContent='⚠️ Content includes channels outside the overlay model';
                     box.appendChild(h);
                     var ul=document.createElement('ul'); ul.style.cssText='margin:4px 0 6px 18px;padding:0;';
                     issues.forEach(function(x){
@@ -9726,13 +9723,12 @@ def index():
                 }
                 function renderScopeWarnings(){
                     var w=window._waitingContentList||[], n=window._namesContentList||[];
-                    var fix='Re-export it from xLights with only the overlay model (a model-only, sparse sequence) to keep the rest of your display unaffected. You can still use it as-is.';
-                    _fillScopeBox('wmng_scope_warning', _scopeIssues([['',w]]), fix);
-                    _fillScopeBox('mng_scope_warning',  _scopeIssues([['',n]]), fix);
+                    var note='This is expected when the plugin runs your display on its own. If a scheduled show runs at the same time, these channels are overwritten while the content plays.';
+                    _fillScopeBox('wmng_scope_warning', _scopeIssues([['',w]]), note);
+                    _fillScopeBox('mng_scope_warning',  _scopeIssues([['',n]]), note);
                     // Page box: content is master-driven, so a remote doesn't show it.
                     _fillScopeBox('content_scope_warning',
-                                  window._tmlIsRemote?[]:_scopeIssues([['Waiting',w],['Names',n]]),
-                                  'While these play, they overwrite every light in the listed channels - not just the overlay model. '+fix);
+                                  window._tmlIsRemote?[]:_scopeIssues([['Waiting',w],['Names',n]]), note);
                 }
                 function refreshScopeWarnings(){
                     var model=_scopeModel();
@@ -11804,9 +11800,8 @@ def _fseq_channel_scope_warning(content, overlay_sc, overlay_cc):
         total = hdr['channel_count']
         if overlay_end and overlay_sc == 1 and total <= overlay_end:
             return None   # the full file IS the overlay model's channels
-        return (f"Not exported as a model-only (sparse) sequence: it covers channels 1-{total:,}. "
-                f"While it plays it overwrites every light in that range, and blanks them briefly "
-                f"when it stops - not just the overlay model.")
+        return (f"Full-channel sequence: writes channels 1-{total:,}, beyond the overlay model. "
+                f"Those lights are overwritten while it plays and blank briefly when it stops.")
 
     ranges = hdr['sparse_ranges']
     if overlay_end:
@@ -11819,8 +11814,8 @@ def _fseq_channel_scope_warning(content, overlay_sc, overlay_cc):
         return None
     total = sum(r['count'] for r in ranges)
     if overlay_cc and total > overlay_cc:
-        return (f"Covers {total:,} channels but the overlay model has only {overlay_cc:,}, so it "
-                f"writes lights outside the overlay model while it plays.")
+        return (f"Writes {total:,} channels but the overlay model has only {overlay_cc:,}. "
+                f"Lights outside the overlay model are overwritten while it plays.")
     return None
 
 

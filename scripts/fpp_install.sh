@@ -113,6 +113,16 @@ else
     log_and_show "[1/7] Fonts already installed"
 fi
 
+# Color emoji font, used to draw emoji in submitted names (sms_plugin.py _emoji_font()).
+# Optional: without it names still display, just with their emoji left off.
+if ls /usr/share/fonts/truetype/noto/NotoColorEmoji*.ttf >/dev/null 2>&1; then
+    log_and_show "[1/7] Emoji font already installed"
+elif apt_install_safe fonts-noto-color-emoji; then
+    log_and_show "[1/7] Emoji font complete"
+else
+    log_and_show "[1/7] Emoji font skipped (apt busy/Pi not fully updated); emoji in names won't be drawn"
+fi
+
 # Install the plugin's bundled theme fonts (see fonts/<category>/NOTICE.md in
 # each category folder for license/attribution — all "100% Free" per
 # dafont.com). Installed into our OWN subdirectory of /usr/local/share/fonts so

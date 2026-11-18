@@ -109,7 +109,7 @@
 			},
 			{
 				"kind": "download",
-				"what": "Installs apt packages: fonts-freefont-ttf, fontconfig, python3-zstandard, and the Python libraries listed in dependencies."
+				"what": "Installs apt packages: fonts-freefont-ttf, fonts-noto-color-emoji, fontconfig, python3-zstandard, and the Python libraries listed in dependencies."
 			},
 			{
 				"kind": "core-settings",

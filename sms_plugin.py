@@ -16,7 +16,7 @@ import random
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from twilio.rest import Client
-from collections import deque
+from collections import deque, Counter
 import os
 import sys
 import atexit
@@ -180,6 +180,13 @@ BLACKLIST_ADDED_FILE = os.path.join(PLUGIN_DIR, "blacklist_added.txt")
 WHITELIST_FILE = os.path.join(PLUGIN_DIR, "whitelist.txt")
 WHITELIST_REMOVED_FILE = os.path.join(PLUGIN_DIR, "whitelist_removed.txt")
 WHITELIST_ADDED_FILE = os.path.join(PLUGIN_DIR, "whitelist_added.txt")
+# Emoji: the full Unicode emoji list (picker data, generated from Unicode emoji-test.txt) and
+# the emoji blacklist (shipped list + the operator's own additions/removals, same model as the
+# word blacklist above).
+EMOJI_DATA_FILE = os.path.join(PLUGIN_DIR, "emoji_data.json")
+EMOJI_BLACKLIST_FILE = os.path.join(PLUGIN_DIR, "emoji_blacklist.txt")
+EMOJI_BLACKLIST_REMOVED_FILE = os.path.join(PLUGIN_DIR, "emoji_blacklist_removed.txt")
+EMOJI_BLACKLIST_ADDED_FILE = os.path.join(PLUGIN_DIR, "emoji_blacklist_added.txt")
 
 # Create directory structure before logging setup
 os.makedirs(os.path.join(PLUGIN_DATA_DIR, "logs", "messages"), exist_ok=True)
@@ -408,6 +415,8 @@ def inject_iframe_resize(response):
 # ============================================================================
 _blacklist_cache = None
 _blacklist_mtime = None
+_emoji_blacklist_cache = None
+_emoji_blacklist_mtime = None
 
 _whitelist_cache = None
 _whitelist_mtime = None
@@ -461,6 +470,9 @@ DEFAULT_CONFIG = {
     "one_word_only": False,
     "two_words_max": True,
     "use_whitelist": False,
+    # Keep emoji in submitted names (rendered with the color emoji font). Off = emoji are
+    # stripped like any other symbol. The emoji blacklist screens either way.
+    "allow_emoji": True,
     "profanity_filter": True,
     # Auto-block a sender after they text this many blacklisted words in one day
     # (tally resets at midnight). 0 disables the feature. Once blocked, only the
@@ -1818,6 +1830,153 @@ def _find_font(font_name, font_size):
     except Exception:
         return None
 
+# ---- Emoji rendering --------------------------------------------------------------------
+# PIL has no font fallback, so a name like "Nick 🎄" is laid out in runs: letters in the
+# line's own font, each emoji cluster drawn from the color emoji font (Noto Color Emoji,
+# installed by fpp_install.sh). Noto is a bitmap (CBDT) font that only loads at its native
+# 109px strike, so each emoji is rendered once at that size, cached, and scaled to the line.
+# Text without emoji takes the plain PIL path, unchanged. Emoji ignore the line color.
+_EMOJI_NATIVE_SIZE = 109
+_emoji_font_state = {}       # 'font' -> ImageFont | None once resolved
+_emoji_glyph_cache = {}      # cluster -> (rgba_ink_image, cell_w, cell_h, ink_x, ink_y) | None
+_emoji_scaled_cache = {}     # (cluster, w, h) -> resized rgba image
+_emoji_missing_warned = set()
+
+def _emoji_font():
+    """The color emoji font at its native size, or None when it isn't installed."""
+    if 'font' in _emoji_font_state:
+        return _emoji_font_state['font']
+    font = None
+    path = _resolve_font_path('Noto Color Emoji')
+    # fc-match always answers with SOME font; only accept an actual emoji font.
+    if path and 'emoji' in os.path.basename(path).lower():
+        try:
+            kw = {}
+            from PIL import features
+            _emoji_font_state['raqm'] = bool(features.check('raqm'))
+            if _emoji_font_state['raqm']:
+                # Raqm shapes ZWJ sequences / flags into their single combined glyph.
+                kw['layout_engine'] = ImageFont.Layout.RAQM
+            font = ImageFont.truetype(path, _EMOJI_NATIVE_SIZE, **kw)
+        except Exception as e:
+            logging.warning(f"Emoji font could not be loaded ({path}): {e}")
+    else:
+        logging.warning("No color emoji font found (fonts-noto-color-emoji) - emoji in names "
+                        "will be left off the display")
+    _emoji_font_state['font'] = font
+    return font
+
+def _emoji_glyph(cluster):
+    """Render one emoji cluster at the emoji font's native size. Returns (ink, cell_w, cell_h,
+    ink_x, ink_y): the cropped RGBA ink plus its offset inside the glyph cell - or None when
+    the font is missing or has no glyph for it (e.g. an emoji newer than the installed font)."""
+    if cluster in _emoji_glyph_cache:
+        return _emoji_glyph_cache[cluster]
+    result = None
+    font = _emoji_font()
+    if font is not None:
+        try:
+            glyph = cluster
+            if not _emoji_font_state.get('raqm'):
+                # PIL's basic layout can't combine a sequence into one glyph - it would draw
+                # each part side by side (👨‍👩‍👧 as three people, 🎅🏽 plus a tone swatch). Draw
+                # the base emoji instead: first part of a ZWJ sequence, without skin tone;
+                # just the digit of a keycap. Flags have no single-part form and are drawn
+                # as their two letters.
+                if cluster.endswith('⃣'):
+                    glyph = cluster[0]
+                elif not re.match(r'[\U0001F1E6-\U0001F1FF]', cluster):
+                    glyph = re.sub(r'[\U0001F3FB-\U0001F3FF]', '', cluster.split('‍')[0]) or cluster
+            l, t, r, b = font.getbbox(glyph)
+            cell_w, cell_h = max(1, r), max(1, b)
+            im = Image.new('RGBA', (cell_w, cell_h), (0, 0, 0, 0))
+            ImageDraw.Draw(im).text((0, 0), glyph, font=font, embedded_color=True)
+            ink = im.getbbox()
+            if ink:
+                result = (im.crop(ink), cell_w, cell_h, ink[0], ink[1])
+        except Exception as e:
+            logging.debug(f"Emoji render failed: {e}")
+    if result is None and cluster not in _emoji_missing_warned and font is not None:
+        _emoji_missing_warned.add(cluster)
+        logging.info(f"Emoji font has no glyph for {cluster!r} - left off the display")
+    _emoji_glyph_cache[cluster] = result
+    return result
+
+def _text_units(text):
+    """Characters of text for one-per-row (stacked) layout, keeping each emoji cluster whole."""
+    units = []
+    for is_emoji, run in split_emoji_runs(text):
+        units.extend([run] if is_emoji else list(run))
+    return units
+
+def _layout_mixed(text, font):
+    """Lay out text containing emoji as if drawn by ImageDraw.text at (0, 0). Returns
+    (pieces, bbox): pieces are ('t', x, run) text runs and ('e', x, y, w, h, cluster) emoji
+    ink rects; bbox is the overall ink box like textbbox."""
+    size = getattr(font, 'size', 10) or 10
+    try:
+        ascent = font.getmetrics()[0]
+    except Exception:
+        ascent = size
+    pieces, x = [], 0.0
+    x0 = y0 = float('inf')
+    x1 = y1 = float('-inf')
+    for is_emoji, run in split_emoji_runs(text):
+        if not is_emoji:
+            bb = font.getbbox(run)
+            if bb[2] > bb[0]:
+                x0, y0 = min(x0, x + bb[0]), min(y0, bb[1])
+                x1, y1 = max(x1, x + bb[2]), max(y1, bb[3])
+            pieces.append(('t', x, run))
+            x += font.getlength(run)
+            continue
+        g = _emoji_glyph(run)
+        if g is None:
+            continue
+        ink, cell_w, cell_h, ink_x, ink_y = g
+        # The emoji cell is one em tall, its bottom a little below the baseline (where a
+        # descender would end), so it sits level with the letters around it.
+        f = size / cell_h
+        cell_top = ascent + 0.12 * size - size
+        ex, ey = x + ink_x * f, cell_top + ink_y * f
+        ew, eh = max(1, round(ink.width * f)), max(1, round(ink.height * f))
+        pieces.append(('e', ex, ey, ew, eh, run))
+        x0, y0 = min(x0, ex), min(y0, ey)
+        x1, y1 = max(x1, ex + ew), max(y1, ey + eh)
+        x += cell_w * f
+    if x0 == float('inf'):
+        return pieces, (0, 0, 0, 0)
+    return pieces, (int(x0), int(y0), int(round(x1)), int(round(y1)))
+
+def _text_bbox(draw, text, font):
+    """draw.textbbox((0, 0), text, font=font), emoji-aware."""
+    if not text or not _emoji_re().search(text):
+        return draw.textbbox((0, 0), text, font=font)
+    return _layout_mixed(text, font)[1]
+
+def _draw_text(img, xy, text, fill, font):
+    """ImageDraw.Draw(img).text(xy, text, fill=fill, font=font), emoji-aware (emoji are
+    pasted in their own colors, alpha-blended onto img)."""
+    draw = ImageDraw.Draw(img)
+    if not text or not _emoji_re().search(text):
+        draw.text(xy, text, fill=fill, font=font)
+        return
+    ox, oy = xy
+    for p in _layout_mixed(text, font)[0]:
+        if p[0] == 't':
+            draw.text((ox + p[1], oy), p[2], fill=fill, font=font)
+            continue
+        _, ex, ey, ew, eh, cluster = p
+        key = (cluster, ew, eh)
+        scaled = _emoji_scaled_cache.get(key)
+        if scaled is None:
+            scaled = _emoji_glyph(cluster)[0].resize((ew, eh), Image.LANCZOS)
+            if len(_emoji_scaled_cache) > 256:
+                _emoji_scaled_cache.clear()
+            _emoji_scaled_cache[key] = scaled
+        img.paste(scaled.convert(img.mode) if img.mode != 'RGBA' else scaled,
+                  (int(round(ox + ex)), int(round(oy + ey))), scaled)
+
 def _fit_text_to_box(draw, text, font_name, box_w, box_h, min_size=6, max_size=None):
     """Binary search the largest font size where `text` fits within box_w x box_h.
     Pass box_w=None to fit width only, or box_h=None to fit height only -- used for
@@ -1836,7 +1995,7 @@ def _fit_text_to_box(draw, text, font_name, box_w, box_h, min_size=6, max_size=N
     # both engines size the text the same way (advance width disagrees between the browser and
     # PIL for decorative fonts, which made the projection bigger than the preview).
     def _wh(font):
-        bbox = draw.textbbox((0, 0), text, font=font)
+        bbox = _text_bbox(draw, text, font)
         return bbox[2] - bbox[0], bbox[3] - bbox[1]
     lo, hi = min_size, max_size
     # Seed with the smallest size so a box too small for even min_size to fit still
@@ -1894,12 +2053,12 @@ def _render_oriented_text_strip(text, font_name, box_w, box_h, color_rgb, orient
         if font is None:
             return None, 0, 0
         strip = Image.new('RGB', (max(1, tw), max(1, th)), (0, 0, 0))
-        ImageDraw.Draw(strip).text((0, 0), text, fill=color_rgb, font=font)
+        _draw_text(strip, (0, 0), text, color_rgb, font)
         rotated = strip.rotate(-90, expand=True)
         return rotated, rotated.width, rotated.height
 
     elif orientation == 'vertical_stacked':
-        chars = list(text)
+        chars = _text_units(text)   # an emoji cluster is one row
         if not chars:
             return None, 0, 0
         lo, hi = 6, 300
@@ -1910,7 +2069,7 @@ def _render_oriented_text_strip(text, font_name, box_w, box_h, color_rgb, orient
             if font is not None:
                 max_w = max_h = 0
                 for c in chars:
-                    bbox = pdraw.textbbox((0, 0), c, font=font)
+                    bbox = _text_bbox(pdraw, c, font)
                     max_w = max(max_w, bbox[2] - bbox[0])
                     max_h = max(max_h, bbox[3] - bbox[1])
             else:
@@ -1925,13 +2084,12 @@ def _render_oriented_text_strip(text, font_name, box_w, box_h, color_rgb, orient
             return None, 0, 0
         total_h = best_lh * len(chars)
         strip = Image.new('RGB', (max(1, best_w), max(1, total_h)), (0, 0, 0))
-        sdraw = ImageDraw.Draw(strip)
         for idx, c in enumerate(chars):
-            bbox = pdraw.textbbox((0, 0), c, font=best_font)
+            bbox = _text_bbox(pdraw, c, best_font)
             cw = bbox[2] - bbox[0]
             cx = max(0, (best_w - cw) // 2)
             cy = idx * best_lh
-            sdraw.text((cx - bbox[0], cy - bbox[1]), c, fill=color_rgb, font=best_font)
+            _draw_text(strip, (cx - bbox[0], cy - bbox[1]), c, color_rgb, best_font)
         return strip, strip.width, strip.height
 
     else:  # 'horizontal'
@@ -1942,9 +2100,9 @@ def _render_oriented_text_strip(text, font_name, box_w, box_h, color_rgb, orient
         # the tightly-sized strip. PIL's default anchor leaves the font's ascender gap at the
         # top, which pushed the text to the BOTTOM of the box on the device while the preview
         # centered it. (The vertical_stacked branch already does this same -bbox offset.)
-        bbox = pdraw.textbbox((0, 0), text, font=font)
+        bbox = _text_bbox(pdraw, text, font)
         strip = Image.new('RGB', (max(1, tw), max(1, th)), (0, 0, 0))
-        ImageDraw.Draw(strip).text((-bbox[0], -bbox[1]), text, fill=color_rgb, font=font)
+        _draw_text(strip, (-bbox[0], -bbox[1]), text, color_rgb, font)
         return strip, strip.width, strip.height
 
 
@@ -2283,7 +2441,7 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
                 tw, th = max(1, tw), max(1, th)
                 strip = Image.new('RGB', (tw, th), (0, 0, 0))
                 if font is not None:
-                    ImageDraw.Draw(strip).text((0, 0), text, fill=_hex_to_rgb(color_hex), font=font)
+                    _draw_text(strip, (0, 0), text, _hex_to_rgb(color_hex), font)
             else:
                 strip, tw, th = _render_oriented_text_strip(text, font_name, box_w, box_h,
                                                               _hex_to_rgb(color_hex), orientation)
@@ -2980,7 +3138,9 @@ def _enumerate_fonts():
             for fname in filenames:
                 if fname.lower().endswith(_FONT_EXTENSIONS):
                     name = os.path.splitext(fname)[0]
-                    if name in claimed_names:
+                    # The color emoji font only draws emoji (used automatically for them),
+                    # so it isn't offered as a line font.
+                    if name in claimed_names or 'emoji' in name.lower():
                         continue
                     claimed_names.add(name)
                     fonts.append({'name': name, 'category': 'System',
@@ -3146,8 +3306,7 @@ def is_on_whitelist(name):
         # unreadable list would disable the whitelist AND the profanity screen at once.)
         return False
 
-    name_lower = name.lower().strip()
-    return name_lower in whitelist
+    return _whitelist_key(name) in whitelist
 
 def _is_operator_approved_name(name):
     """True only if the OPERATOR added or admin-approved this exact name
@@ -3155,7 +3314,7 @@ def _is_operator_approved_name(name):
     re-screening - the shipped ~22k global whitelist is NOT trusted to be slur-free, but a
     name the operator vetted is."""
     try:
-        return name.strip().lower() in load_whitelist_added()
+        return _whitelist_key(name) in load_whitelist_added()
     except Exception:
         return False
 
@@ -3206,6 +3365,14 @@ def clear_admin_ctx():
             os.remove(ADMIN_CTX_FILE)
     except Exception as e:
         logging.error(f"Error clearing admin reply ctx: {e}")
+
+def _is_admin_sender(from_number):
+    """True when `from_number` is the configured admin phone (Google Voice only, the
+    same scope as the rest of the admin feature). Admin texts skip every filter."""
+    if config.get('message_source') != 'google_voice':
+        return False
+    admin_phone = config.get('admin_phone', '').strip()
+    return bool(admin_phone) and _normalize_phone(from_number) == _normalize_phone(admin_phone)
 
 def admin_ctx_is_seeded():
     """True only when an admin reply context is stored AND it belongs to the number
@@ -3377,7 +3544,7 @@ def add_name_to_whitelist(name):
     lowercase, add to WHITELIST_ADDED_FILE, un-remove from WHITELIST_REMOVED_FILE,
     invalidate the cache. Returns True on success."""
     global _whitelist_cache, _whitelist_mtime
-    name = (name or '').strip().lower()
+    name = _whitelist_key(name or '')   # whitelist holds the name only, never its emoji
     if not name:
         return False
     try:
@@ -3801,11 +3968,171 @@ def send_gv_reply(text, message_type="", ctx=None, priority=False):
         logging.error(f"Error sending Google Voice reply: {e}")
         return False
 
+# ============================================================================
+# EMOJI
+# ----------------------------------------------------------------------------
+# Emoji are handled as whole clusters - ZWJ sequences (👨‍👩‍👧), skin tones (👋🏽), flags
+# (🇺🇸), keycaps (1️⃣) and tag flags (🏴󠁧󠁢󠁳󠁣󠁴󠁿) - so one is never split apart. The set of
+# emoji codepoints comes from emoji_data.json (Unicode emoji-test.txt, the RGI list that
+# both iOS and Android implement). Blacklist matching ignores skin tones and the FE0F
+# presentation selector, so one entry covers every tone of an emoji.
+# ============================================================================
+
+_emoji_re_cache = None
+
+def load_emoji_data():
+    """The full emoji list for the picker: {"unicode_version", "count", "groups": [{group,
+    subgroups: [{name, emoji: [[emoji, name, version], ...]}]}]}. Skin-tone variants are
+    left out (they match their base emoji)."""
+    try:
+        with open(EMOJI_DATA_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        logging.error(f"Error reading emoji data: {e}")
+        return {"groups": []}
+
+def _emoji_re():
+    """Compiled regex matching ONE emoji cluster, built once from emoji_data.json."""
+    global _emoji_re_cache
+    if _emoji_re_cache is not None:
+        return _emoji_re_cache
+    base = set()
+    for g in load_emoji_data().get('groups', []):
+        for sg in g.get('subgroups', []):
+            for e in sg.get('emoji', []):
+                for ch in e[0]:
+                    cp = ord(ch)
+                    # Joiners/modifiers/tags/flag letters are matched by the sequence rules
+                    # below; ASCII (digits, # and * of keycaps) is never an emoji on its own.
+                    if (cp < 0x80 or cp in (0x200D, 0xFE0F, 0x20E3)
+                            or 0x1F3FB <= cp <= 0x1F3FF or 0xE0020 <= cp <= 0xE007F
+                            or 0x1F1E6 <= cp <= 0x1F1FF):
+                        continue
+                    base.add(cp)
+    if base:
+        parts, cps = [], sorted(base)
+        start = prev = cps[0]
+        for cp in cps[1:] + [None]:
+            if cp is not None and cp == prev + 1:
+                prev = cp
+                continue
+            parts.append(f'\\U{start:08X}' if start == prev else f'\\U{start:08X}-\\U{prev:08X}')
+            if cp is not None:
+                start = prev = cp
+        cls = '[' + ''.join(parts) + ']'
+    else:
+        # Data file missing - fall back to the main emoji blocks.
+        cls = '[\\u2600-\\u27BF\\U0001F000-\\U0001FAFF]'
+    mod = r'(?:️|[\U0001F3FB-\U0001F3FF])*'
+    _emoji_re_cache = re.compile(
+        r'[\U0001F1E6-\U0001F1FF]{2}'                         # flag (regional indicator pair)
+        r'|[0-9#*]️?⃣'                              # keycap
+        r'|\U0001F3F4[\U000E0020-\U000E007E]+\U000E007F'      # tag flag (England, Scotland...)
+        + '|' + cls + mod + r'(?:‍' + cls + mod + ')*')  # emoji, tones, ZWJ sequence
+    return _emoji_re_cache
+
+def split_emoji_runs(text):
+    """Split text into [(is_emoji, str)] runs; every emoji cluster is its own run."""
+    out, pos = [], 0
+    for m in _emoji_re().finditer(text or ''):
+        if m.start() > pos:
+            out.append((False, text[pos:m.start()]))
+        out.append((True, m.group()))
+        pos = m.end()
+    if pos < len(text or ''):
+        out.append((False, text[pos:]))
+    return out
+
+def emoji_clusters(text):
+    """Every emoji cluster in text, in order."""
+    return _emoji_re().findall(text or '')
+
+def strip_emoji(text):
+    return _emoji_re().sub('', text or '')
+
+def _emoji_key(cluster):
+    """Matching form of an emoji: no FE0F selector, no skin tones."""
+    return re.sub(r'[️\U0001F3FB-\U0001F3FF]', '', cluster)
+
+def _emoji_entry(line):
+    """Parse one blacklist line into (key, text): key is the sorted tuple of emoji keys (a
+    combination when more than one), text is the clusters space-joined for display. Anything
+    that isn't an emoji is ignored. Returns None for a line with no emoji."""
+    clusters = emoji_clusters(line)
+    if not clusters:
+        return None
+    return tuple(sorted(_emoji_key(c) for c in clusters)), ' '.join(clusters)
+
+def _read_emoji_entries(path):
+    """{key: text} for every entry in an emoji list file ('#' lines are comments)."""
+    entries = {}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parsed = _emoji_entry(line)
+                if parsed:
+                    entries.setdefault(parsed[0], parsed[1])
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logging.error(f"Error reading {os.path.basename(path)}: {e}")
+    return entries
+
+def _write_emoji_entries(path, entries):
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(sorted(entries.values())) + '\n' if entries else '')
+
+def load_emoji_blacklist():
+    """Effective emoji blacklist {key: text}: shipped + user-added - user-removed, cached
+    until one of the three files changes."""
+    global _emoji_blacklist_cache, _emoji_blacklist_mtime
+    paths = (EMOJI_BLACKLIST_FILE, EMOJI_BLACKLIST_ADDED_FILE, EMOJI_BLACKLIST_REMOVED_FILE)
+    mtimes = tuple(os.path.getmtime(p) if os.path.exists(p) else 0 for p in paths)
+    if _emoji_blacklist_cache is None or _emoji_blacklist_mtime != mtimes:
+        shipped = _read_emoji_entries(EMOJI_BLACKLIST_FILE)
+        added = _read_emoji_entries(EMOJI_BLACKLIST_ADDED_FILE)
+        removed = _read_emoji_entries(EMOJI_BLACKLIST_REMOVED_FILE)
+        effective = {k: v for k, v in shipped.items() if k not in removed}
+        effective.update(added)
+        _emoji_blacklist_cache = effective
+        _emoji_blacklist_mtime = mtimes
+        logging.info(f"Loaded {len(effective)} entries into emoji blacklist cache")
+    return _emoji_blacklist_cache
+
+def blocked_emoji_hits(text):
+    """Emoji blacklist entries (display text) that `text` triggers. A single-emoji entry hits
+    when that emoji appears anywhere; a combination hits when ALL of its emoji appear (any
+    order, anywhere - a repeated emoji must appear that many times)."""
+    have = Counter(_emoji_key(c) for c in emoji_clusters(text))
+    if not have:
+        return []
+    hits = []
+    for key, disp in load_emoji_blacklist().items():
+        if all(have[k] >= n for k, n in Counter(key).items()):
+            hits.append(disp)
+    return hits
+
+def _display_len(text):
+    """Length as the viewer sees it: each emoji cluster counts as one character."""
+    return len(_emoji_re().sub('x', text or ''))
+
+def _whitelist_key(name):
+    """Whitelist lookup form of a name: emoji removed, spaces collapsed, lowercase."""
+    return ' '.join(strip_emoji(name).split()).lower()
+
 def extract_name(message):
-    """Extract name from SMS message and convert to proper case"""
+    """Extract name from SMS message and convert to proper case. Emoji are kept (as whole
+    clusters) when allow_emoji is on; every other non-letter is stripped."""
     message = message.strip()
     message = re.sub(r'^(hi|hello|hey|merry christmas|happy holidays)[,!.\s]*', '', message, flags=re.IGNORECASE)
-    message = re.sub(r'[^a-zA-Z\s-]', '', message)
+    if config.get('allow_emoji', True):
+        message = ''.join(run if is_emoji else re.sub(r'[^a-zA-Z\s-]', '', run)
+                          for is_emoji, run in split_emoji_runs(message))
+    else:
+        message = re.sub(r'[^a-zA-Z\s-]', '', message)
     message = message.strip()
     
     if message:
@@ -3853,13 +4180,14 @@ def is_valid_name(text):
     Length is checked FIRST, so an over-length name reports 'too_long' even when
     it also breaks the word rule. Length is enforced regardless of the word
     toggles (the caller only skips this whole check when the whitelist is on,
-    where Max Message Length doesn't apply)."""
+    where Max Message Length doesn't apply). An emoji counts as one character, and a
+    stand-alone emoji (e.g. "Nick 🎄") is not a word."""
     text = ' '.join(text.split())
-    words = text.split()
+    words = [w for w in text.split() if strip_emoji(w)]
     word_count = len(words)
 
     max_len = config.get('max_message_length', 30)
-    if len(text) > max_len:
+    if _display_len(text) > max_len:
         return False, "too_long"
 
     if config.get('one_word_only', False):
@@ -4021,6 +4349,10 @@ def contains_profanity(text):
     if not config['profanity_filter']:
         return False
 
+    if blocked_emoji_hits(text):
+        logging.info("🚫 Blacklisted emoji detected")
+        return True
+
     pattern = load_blacklist()
     if not pattern:
         return False
@@ -4039,11 +4371,12 @@ def count_profanity_words(text):
     auto-block threshold without being double-counted when it shows up in more than one form."""
     if not config.get('profanity_filter', True):
         return 0
+    emoji_hits = len(blocked_emoji_hits(text))   # each blacklisted emoji/combination = 1
     pattern = load_blacklist()
     if not pattern:
-        return 0
-    return max((len(pattern.findall(form.lower())) for form in _profanity_scan_forms(text)),
-               default=0)
+        return emoji_hits
+    return emoji_hits + max((len(pattern.findall(form.lower())) for form in _profanity_scan_forms(text)),
+                            default=0)
 
 def _load_profanity_strikes():
     """Read the per-day profanity tally file, or {} if missing/unreadable."""
@@ -5481,6 +5814,23 @@ def process_incoming_message(from_number, body):
             logging.info(f"🔴 Show not live reply sent to {from_number[-4:]}")
         return
 
+    # The admin phone is trusted: no blocklist, rate limit, duplicate, length/word,
+    # whitelist or profanity checks. Commas / line breaks still split multiple names.
+    if _is_admin_sender(from_number):
+        tokens = [t for t in re.split(r'[\n\r,]+', body) if re.search(r'[a-zA-Z]', t)]
+        queued = []
+        for nm in (extract_name(t) for t in (tokens or [body])):
+            if add_to_queue(nm, from_number, body):
+                logging.info(f"✅ Queued (admin): {_mask_name(nm)}")
+                log_message(from_number, body, nm, "queued", counts=False)
+                queued.append(nm)
+            else:
+                logging.warning(f"❌ Queue error: {_mask_name(nm)}")
+                log_message(from_number, body, nm, "error", counts=False)
+        if queued:
+            send_sms_response(from_number, "success")
+        return
+
     # Exactly one branch fires - only one SMS response is ever sent per message
     if is_blocked(from_number):
         logging.info(f"🚫 Blocked: {from_number[-4:]}")
@@ -6453,6 +6803,7 @@ def index():
 
                             <label>Admin Phone Number:</label>
                             <input type="text" id="admin_phone" value="{{ config.get('admin_phone','') }}" placeholder="e.g. 5551234567" style="width:100%; max-width:260px;">
+                            <p class="help-text" style="margin:6px 0 0; color:var(--bs-danger-text-emphasis, #b71c1c);">🔴 <strong>Names texted from the admin phone are not filtered</strong> - profanity, whitelist, blocklist, length, word, duplicate and rate limits are all skipped.</p>
                         </div>
                     </div>
 
@@ -6601,6 +6952,12 @@ def index():
                             ⚠️ <strong>Max Message Length is disabled</strong> - whitelist is enabled. Names are validated against the approved list, not by length.
                         </div>
 
+                        <div style="margin-top:12px;">
+                            <label class="toggle-switch"><input type="checkbox" id="allow_emoji" {{ 'checked' if config.get('allow_emoji', True) else '' }} onchange="saveConfig();"><span class="toggle-slider"></span></label>
+                            <label class="checkbox-label">Allow Emoji in Names (e.g. "Emma 🎄")</label>
+                            <p class="help-text" style="margin-top:4px;">When off, emoji are removed and only the letters are shown. Each emoji counts as one character toward Max Message Length. A text with only emoji (like a 👍 reply) is still ignored. Emoji on the <strong>Emoji Blacklist</strong> (Filters → Manage Emoji Blacklist) are rejected by the profanity filter either way.</p>
+                        </div>
+
                     </div>
                 </div>
 
@@ -6617,6 +6974,7 @@ def index():
                             <label class="toggle-switch"><input type="checkbox" id="profanity_filter" {{ 'checked' if config.profanity_filter else '' }} onchange="checkFiltersState(); saveConfig();"><span class="toggle-slider"></span></label>
                             <label class="checkbox-label">Enable Profanity Filter</label><br>
                             <button class="view-btn" onclick="showBlacklistWarning()" style="margin-top:6px;">🚫 Manage Blacklist</button>
+                            <button class="view-btn" onclick="tmlGo('/emoji-blacklist')" style="margin-top:6px;">😶 Manage Emoji Blacklist</button>
                             <div style="margin-top:10px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
                                 <label for="profanity_threshold" style="font-weight:bold;">Auto-block after</label>
                                 <input type="number" id="profanity_threshold" value="{{ config.get('profanity_threshold', 3) }}" min="0" max="100" style="width:60px;">
@@ -7497,7 +7855,7 @@ def index():
                             <p id="canvas_hint" style="font-weight:bold; font-size:13px; color:var(--bs-info-text-emphasis, #4fc3f7); margin:4px 0 8px;">🖱️ Click a line to select it, then drag inside its box to move it, or drag an edge/corner to resize. Text auto-sizes to fill the box - the box is the MAX size text can be.</p>
                             <p class="help-text" style="margin:-4px 0 8px;">↔️ For scrolling text (Left/Right/Top/Bottom movement), the box is also where the text is allowed to show - it enters and exits at the box's own edges, not the display's, and always starts fully off-page before scrolling in.</p>
                             <canvas id="matrix_canvas" style="width:100%; display:block; background:#000; border:2px solid var(--border); border-radius:4px; cursor:default;"></canvas>
-                            <div style="display:flex; gap:8px; margin-top:6px; align-items:center;">
+                            <div id="canvas_tools_row" style="display:flex; gap:8px; margin-top:6px; align-items:center;">
                                 <button type="button" onclick="resetAllLines()" style="background:var(--bs-secondary, #6c757d); color:#fff; padding:6px 12px; font-size:12px;">Reset All to Center</button>
                                 <button type="button" id="btn_sync_pos_master" onclick="syncPositionFromMaster(this)" style="display:none; background:#1976d2; color:#fff; padding:6px 12px; font-size:12px;" title="Copy the Master's text layout for this content, scaled to this projector's model">🔗 Sync from Master</button>
                                 <span id="pos_display" style="font-size:12px; color:var(--fg-muted);"></span>
@@ -7524,7 +7882,7 @@ def index():
                                          overlay (its real size + its rendered background). Shown only on a
                                          master that has synced remotes; defaults to the largest overlay. -->
                                     <div id="preview_remote_row" style="display:none; margin-bottom:8px; padding:8px; background:var(--section-bg); border:1px solid var(--border); border-radius:4px;">
-                                        <label style="display:block; margin:0 0 4px; font-size:12px; color:var(--fg);">🖥️ Preview from projector:</label>
+                                        <label style="display:block; margin:0 0 4px; font-size:12px; color:var(--fg);">🖥️ <strong>Which Pi are you previewing and editing?</strong></label>
                                         <select id="preview_remote_select" onchange="onPreviewRemoteChange()" style="width:100%;"></select>
                                         <p class="help-text" id="preview_remote_note" style="margin:4px 0 0; color:var(--fg-muted);"></p>
                                     </div>
@@ -7913,6 +8271,9 @@ def index():
                     <p style="color: #FF9800; font-size: 14px;">
                         ⚠️ Use this to test messages without sending actual texts. Works without SMS credentials.
                     </p>
+                    <div style="background:var(--bs-danger-bg-subtle, #fdecea); border:1px solid #f44336; color:var(--bs-danger-text-emphasis, #b71c1c); border-radius:6px; padding:8px 12px; margin-bottom:10px; font-size:13px;">
+                        🔴 <strong>No filters here:</strong> test messages skip the profanity filter, whitelist, length, word, duplicate and rate limits - anything you type will be displayed.
+                    </div>
 
                     <label>Test Name:</label>
                     <input type="text" id="test_name" placeholder="Enter a name to test">
@@ -8101,16 +8462,16 @@ def index():
                 }).catch(function(){});
             }
 
-            // Master "preview from a projector": populate the selector from the synced-remote list
-            // (with overlay sizes), defaulting to the LARGEST overlay - it's easier to scale a
-            // layout down to smaller remotes than up. The selector is hidden when there are no
-            // synced remotes with usable dimensions.
+            // Master "which Pi are you previewing": This Pi first, then each synced remote Pi (with
+            // overlay sizes). With no local overlay it defaults to the LARGEST remote overlay - it's
+            // easier to scale a layout down to smaller remotes than up. The selector is hidden only
+            // when this Pi has an overlay and there are no remotes (nothing to choose between).
             window._previewRemote = null;            // {address,name,w,h} or null (= this box)
             window._editTarget = null;               // same, but the EDIT/push target (null = master)
             window._previewRemotesList = [];
             // masterOverlay = this master's own overlay model name ('' = None). With no local
-            // overlay there is no "This box" to render on, so the selector offers only remotes;
-            // with no overlay AND no remotes the preview is a blank with a message.
+            // overlay, "This Pi" is still listed; picking it shows a blank with a message saying to
+            // select an overlay or switch to a remote Pi.
             function updatePreviewRemotes(remotes, masterOverlay) {
                 var row = document.getElementById('preview_remote_row');
                 var sel = document.getElementById('preview_remote_select');
@@ -8128,55 +8489,49 @@ def index():
 
                 // Rebuild only when the real choices change, so the periodic poll never stomps the
                 // user's current selection or reloads the editor mid-edit.
-                var sig = (hasOverlay ? 'O|' : '-|')
+                var sig = (hasOverlay ? 'O:' + masterOverlay + '|' : '-|')
                         + usable.map(function(r){ return r.address + ':' + r.model_w + 'x' + r.model_h; }).join(',');
                 if (sig === window._previewRemotesSig) return;
                 window._previewRemotesSig = sig;
 
-                // Nothing to render on (no local overlay AND no remotes): clear any target; the
-                // preview shows its blank + message state (renderCanvasPreview / loadBgPreview).
-                if (!hasOverlay && usable.length === 0) {
-                    row.style.display = 'none';
-                    window._previewRemote = null; window._editTarget = null;
-                    if (typeof window.loadMasterIntoEditor === 'function') window.loadMasterIntoEditor();
-                    return;
-                }
-                // Local overlay but no remotes: only "This box" exists, so no selector is needed.
+                // Local overlay but no remotes: this Pi is the only device, so no selector is needed.
                 if (hasOverlay && usable.length === 0) {
                     row.style.display = 'none';
-                    if (window._editTarget) {
+                    if (window._editTarget || overlayChanged) {
                         window._editTarget = null; window._previewRemote = null;
                         if (typeof window.loadMasterIntoEditor === 'function') window.loadMasterIntoEditor();
                     }
                     return;
                 }
 
-                // Largest overlay by pixel area - the easiest layout to scale down from.
-                var largest = usable.slice().sort(function(a,b){ return (b.model_w*b.model_h)-(a.model_w*a.model_h); })[0];
+                // The dropdown always lists THIS Pi first, then each remote Pi, so it's clear which
+                // device the preview shows and which one text edits save to. With no overlay here,
+                // "This Pi" is still listed (marked) - selecting it explains what to do instead of
+                // silently offering only remotes.
+                var largest = usable.length
+                    ? usable.slice().sort(function(a,b){ return (b.model_w*b.model_h)-(a.model_w*a.model_h); })[0]
+                    : null;   // largest overlay by pixel area - the easiest layout to scale down from
                 var prev = sel.value;
                 sel.innerHTML = '';
-                if (hasOverlay) {
-                    var optThis = document.createElement('option');
-                    optThis.value = ''; optThis.textContent = 'This box (local overlay)';
-                    sel.appendChild(optThis);
-                }
+                var optThis = document.createElement('option');
+                optThis.value = '';
+                optThis.textContent = 'This Pi (master) — ' + (hasOverlay ? ('overlay: ' + masterOverlay) : 'no overlay selected');
+                sel.appendChild(optThis);
                 usable.forEach(function(r){
                     var o = document.createElement('option');
                     o.value = r.address;
-                    o.textContent = r.name + ' (' + r.model_w + '×' + r.model_h + ')' + (r === largest ? ' — largest' : '');
+                    o.textContent = 'Remote Pi: ' + r.name + ' — ' + r.model_w + '×' + r.model_h + (usable.length > 1 && r === largest ? ' (largest)' : '');
                     sel.appendChild(o);
                 });
                 // When the overlay state just flipped, FOLLOW it (ignore the stale prior choice):
-                // gained an overlay -> "This box"; lost it -> the largest remote. Otherwise keep a
-                // still-valid prior choice; with no local overlay default to a remote.
-                var validPrev = (prev === '' && hasOverlay) || usable.some(function(r){ return r.address === prev; });
-                if (overlayChanged) {
-                    sel.value = hasOverlay ? '' : largest.address;
-                } else {
-                    sel.value = validPrev ? prev : (hasOverlay ? '' : largest.address);
-                }
+                // gained an overlay -> This Pi; lost it -> the largest remote. Otherwise keep a
+                // still-valid prior choice (including This Pi picked on purpose with no overlay);
+                // on first load with no local overlay, default to a remote.
+                var fallback = (hasOverlay || !largest) ? '' : largest.address;
+                var validPrev = (prev === '' && (hasOverlay || window._previewRemoteInit))
+                             || usable.some(function(r){ return r.address === prev; });
+                sel.value = overlayChanged ? fallback : (validPrev ? prev : fallback);
                 row.style.display = 'block';
-                if (note) note.textContent = 'Shows what that projector will display, at its real size, using its overlay.';
                 // Reload the editor on first populate, when the selection changed, or when the overlay
                 // flipped (so the editor + canvas follow This box <-> remote even if the value matches).
                 if (!window._previewRemoteInit || sel.value !== prev || overlayChanged) { window._previewRemoteInit = true; onPreviewRemoteChange(); }
@@ -8230,11 +8585,39 @@ def index():
 
             // Load a synced remote's REAL layout + fonts for the current content into the editor,
             // so the preview is exactly what that projector will show and edits target it.
+            // Grey out the text lines, preview canvas and its controls when there is nothing that
+            // edits there would save to (the selected projector doesn't have this content), so
+            // typing/dragging can't look like it worked and then vanish. Only the EDITING controls
+            // are locked - the projector + content dropdowns stay usable so you can switch away.
+            var _EDITOR_LOCK_IDS = ['message_lines_section', 'matrix_canvas', 'canvas_tools_row',
+                                    'content_duration_row', 'fseq_scrubber_row'];
+            function _setEditorLocked(locked, opts) {
+                var keepCanvas = !!(opts && opts.keepCanvas);   // canvas is showing a message - don't dim it
+                window._remoteContentMissing = !!locked && !keepCanvas;
+                _EDITOR_LOCK_IDS.forEach(function(id) {
+                    var el = document.getElementById(id);
+                    if (!el) return;
+                    el.style.opacity = (locked && !(keepCanvas && id === 'matrix_canvas')) ? '0.4' : '';
+                    el.style.pointerEvents = locked ? 'none' : '';
+                    if (locked) el.setAttribute('inert', ''); else el.removeAttribute('inert');
+                });
+            }
+            window._setEditorLocked = _setEditorLocked;
+
             function loadRemoteIntoEditor() {
                 var t = window._editTarget;
                 if (!t) return;
                 var content = _currentContentId();
                 var note = document.getElementById('preview_remote_note');
+                // Each load gets a token. A response that arrives after the user picked another
+                // projector (or went back to This box) is stale and must be dropped - applying it
+                // would put the remote's (often blank) layout in the editor, and the next autosave
+                // would then save that over this box's own text.
+                var token = window._remoteLoadToken = (window._remoteLoadToken || 0) + 1;
+                function _stale() {
+                    return token !== window._remoteLoadToken || !window._editTarget
+                        || window._editTarget.address !== t.address;
+                }
                 window._loadingTarget = true;
                 window._editTargetFound = false;   // block pushes until we confirm the remote has it
                 if (note) note.textContent = 'Loading ' + t.name + '…';
@@ -8242,6 +8625,23 @@ def index():
                       + '&content=' + encodeURIComponent(content))
                   .then(function(r){ return r.json(); })
                   .then(function(d){
+                    if (_stale()) return;
+                    // Limit the content dropdown to what this projector has (older remotes don't
+                    // report it - then the full list stays and missing content just greys out).
+                    window._remoteContents = Array.isArray(d.contents) ? d.contents : null;
+                    if (typeof window.renderNamesList === 'function') window.renderNamesList();
+                    // This projector doesn't have the selected content: switch the preview to the
+                    // first content it DOES have (selectNamesItem reloads from it), else grey out.
+                    if (!d.found && Array.isArray(d.contents)) {
+                        var lst = window._namesContentList || [];
+                        for (var i = 0; i < lst.length; i++) {
+                            if (i !== window._namesSelectedIndex && d.contents.indexOf(lst[i].content) >= 0) {
+                                window._remoteSwitchedFrom = content;
+                                window.selectNamesItem(i);
+                                return;
+                            }
+                        }
+                    }
                     var fobjs = (d.fonts || []).map(function(n){ return {name: n, category: 'Fonts on ' + t.name}; });
                     var L = d.layout || null;
                     var cf = (L && L.line_fonts) || ['FreeSans','FreeSans','FreeSans','FreeSans'];
@@ -8255,9 +8655,14 @@ def index():
                     // have this content, we must never push - that would overwrite/append a blank
                     // layout on the remote (wiping its real one and churning its list).
                     window._editTargetFound = !!d.found;
+                    _setEditorLocked(!d.found);
+                    var _from = window._remoteSwitchedFrom;
+                    window._remoteSwitchedFrom = null;
                     if (note) note.textContent = d.found
-                        ? ('Editing “' + t.name + '” — changes save to that projector.')
-                        : ('“' + t.name + '” doesn’t have this content, so there’s nothing to edit here — add/sync it on that projector first.');
+                        ? ((_from ? ('Remote Pi “' + t.name + '” doesn’t have ' + _from + ', so the preview switched to content it does have. ') : '')
+                           + 'Previewing remote Pi “' + t.name + '”. Text changes save to that Pi.')
+                        : ('Remote Pi “' + t.name + '” doesn’t have this content' + ((d.contents && !d.contents.length) ? ' (or any of your Name Display content)' : '')
+                           + ', so there’s nothing to preview or edit for it here — add the sequence on that Pi first. Text editing is disabled until then.');
                     // Paint the background now, and keep retrying until it actually resolves. The
                     // first attempt can no-op because the content list isn't migrated yet (flat
                     // config), or the remote's first frame render / discovery cache is warming - any
@@ -8274,23 +8679,48 @@ def index():
                     }
                     _paintRemoteBg();
                   })
-                  .catch(function(){ window._editTargetFound = false; if (note) note.textContent = 'Could not reach ' + t.name + '.'; })
-                  .finally(function(){ window._loadingTarget = false; });
+                  .catch(function(){
+                    if (_stale()) return;
+                    window._editTargetFound = false;
+                    _setEditorLocked(true);
+                    if (note) note.textContent = 'Could not reach ' + t.name + '.';
+                  })
+                  .finally(function(){ if (token === window._remoteLoadToken) window._loadingTarget = false; });
             }
             window.loadRemoteIntoEditor = loadRemoteIntoEditor;
 
             // Restore THIS box's own content/fonts/layout into the editor ("This box", or the
             // empty state when this box has no overlay and nothing is selected).
             function loadMasterIntoEditor() {
+                window._remoteLoadToken = (window._remoteLoadToken || 0) + 1;   // drop any in-flight remote load
                 window._loadingTarget = true;
+                // No overlay model on this Pi = nothing here to preview or put text on. Lock the
+                // editing controls (the canvas itself stays readable for its message) and say what
+                // to do about it.
+                var _hasOv = !!(((document.getElementById('overlay_model_name') || {}).value || '').trim());
+                _setEditorLocked(!_hasOv, {keepCanvas: true});
+                var _note = document.getElementById('preview_remote_note');
+                if (_note) {
+                    var _haveRemotes = (window._previewRemotesList || []).length > 0;
+                    _note.textContent = _hasOv
+                        ? 'Previewing this Pi’s own overlay. Text changes save to this Pi.'
+                        : ('This Pi has no overlay model selected, so there is nothing to preview or edit here. '
+                           + 'Select an overlay model in FPP Display Settings'
+                           + (_haveRemotes ? ', or switch this dropdown to a remote Pi to configure it.' : '.'));
+                }
+                window._remoteContents = null;   // back to this box: offer its full content list again
+                if (typeof window.renderNamesList === 'function') window.renderNamesList();
                 var lst = window._namesContentList || []; var idx = window._namesSelectedIndex;
                 var item = (lst.length > 0 && idx >= 0 && idx < lst.length) ? lst[idx] : null;
-                populateFontSelects(window._masterFontObjs, item ? item.line_fonts : null);
+                // No names list: this box's text lives only in the editor, so restore the snapshot
+                // taken when we left it (onPreviewRemoteChange) instead of a blank layout.
+                var flat = item ? null : window._masterFlatLayout;
+                populateFontSelects(window._masterFontObjs, item ? item.line_fonts : (flat ? flat.line_fonts : null));
                 window._fontsReady = !!(window._masterFontObjs && window._masterFontObjs.length);
                 window._canvasModelW = parseInt(document.getElementById('overlay_model_width').value) || 480;
                 window._canvasModelH = parseInt(document.getElementById('overlay_model_height').value) || 270;
                 _reshapeCanvasToModel();
-                window.applyLayoutToEditor(item || undefined);
+                window.applyLayoutToEditor(item || flat || undefined);
                 if (typeof window.loadBgPreview === 'function') window.loadBgPreview();
                 window._loadingTarget = false;
             }
@@ -8302,7 +8732,15 @@ def index():
                 var r = (window._previewRemotesList || []).filter(function(x){ return x.address === sel.value; })[0];
                 // Leaving "This box"? persist its current edits into its item before we overwrite
                 // the editor with the remote's layout. (flushEditorToSelected no-ops in remote mode.)
-                if (!window._editTarget && typeof window.flushEditorToSelected === 'function') window.flushEditorToSelected();
+                if (!window._editTarget && typeof window.flushEditorToSelected === 'function') {
+                    window.flushEditorToSelected();
+                    // With no names list there is no item to flush into - keep a copy of this
+                    // box's editor so loadMasterIntoEditor can put it back.
+                    var _l = window._namesContentList || [];
+                    if (!_l.length && typeof window.collectEditorLayout === 'function') {
+                        window._masterFlatLayout = window.collectEditorLayout();
+                    }
+                }
                 if (r) {
                     window._previewRemote = {address: r.address, name: r.name, w: r.model_w, h: r.model_h};
                     window._editTarget   = {address: r.address, name: r.name, w: r.model_w, h: r.model_h};
@@ -8778,11 +9216,14 @@ def index():
                             ctx.textBaseline = 'middle';
                             ctx.font = '14px Arial, sans-serif';
                             var _cx = canvas.width / 2, _cy = canvas.height / 2;
-                            ctx.fillText('No overlay model and no remotes', _cx, _cy - 12);
-                            ctx.fillText('— nothing to display text on.', _cx, _cy + 6);
+                            var _hasRemotes = (window._previewRemotesList || []).length > 0;
+                            ctx.fillText('No overlay model selected on this Pi', _cx, _cy - 12);
+                            ctx.fillText('— nothing to preview here.', _cx, _cy + 6);
                             ctx.font = '12px Arial, sans-serif';
                             ctx.fillStyle = '#6b7178';
-                            ctx.fillText('Select an overlay model, or connect a remote projector.', _cx, _cy + 28);
+                            ctx.fillText(_hasRemotes
+                                ? 'Select an overlay in FPP Display Settings, or pick a remote Pi above.'
+                                : 'Select an overlay in FPP Display Settings, or connect a remote Pi.', _cx, _cy + 28);
                             ctx.textAlign = 'left';
                         }
                         lineRects = [null, null, null, null];
@@ -9498,10 +9939,25 @@ def index():
                     if (rr) rr.checked=(window._namesMode!=='random');
                     if (rnd) rnd.checked=(window._namesMode==='random');
                     if (window.refreshNoContentWarnings) window.refreshNoContentWarnings();
+                    // Previewing a remote projector: only offer the content that projector has
+                    // (window._remoteContents, from its editinfo) - the rest can't be shown there.
+                    var rc=(window._editTarget && Array.isArray(window._remoteContents)) ? window._remoteContents : null;
+                    var shown=0;
                     var sel=document.getElementById('preview_content_select');
-                    if (sel) { sel.innerHTML=''; lst.forEach(function(it,i){ sel.appendChild(new Option((i+1)+'. '+(it.content||'(none)'), i, false, i===window._namesSelectedIndex)); }); }
+                    if (sel) {
+                        sel.innerHTML='';
+                        lst.forEach(function(it,i){
+                            if (rc && rc.indexOf(it.content)<0) return;
+                            shown++;
+                            sel.appendChild(new Option((i+1)+'. '+(it.content||'(none)'), i, false, i===window._namesSelectedIndex));
+                        });
+                        if (rc && !shown) {
+                            var _none=new Option('No Name Display content on '+window._editTarget.name, '', true, true);
+                            _none.disabled=true; sel.appendChild(_none);
+                        }
+                    }
                     var prow=document.getElementById('preview_content_row');
-                    if (prow) prow.style.display=(lst.length>1)?'block':'none';
+                    if (prow) prow.style.display=rc ? ((shown!==1)?'block':'none') : ((lst.length>1)?'block':'none');
                     var scope=document.getElementById('content_duration_scope');
                     if (scope) scope.textContent=(lst.length>0)?('- for content '+(window._namesSelectedIndex+1)):'- shown over waiting content';
                 }
@@ -10100,13 +10556,26 @@ def index():
                         var _sr0 = document.getElementById('fseq_scrubber_row'); if (_sr0) _sr0.style.display = 'none';
                         return;
                     }
+                    var loadEl = document.getElementById('fseq_load_status');
+                    var scrubHint = document.getElementById('fseq_scrub_hint');
+
+                    // Previewing a projector that doesn't have this content: there is no background
+                    // there to show, so drop whatever frame is up (e.g. this box's own Grinch frame)
+                    // and leave the greyed-out blank - the note above says why.
+                    if (window._previewRemote && window._remoteContentMissing) {
+                        window._fseqBgImage = null;
+                        _fseqSeq = null;
+                        loadEl.textContent = '';
+                        var _srm = document.getElementById('fseq_scrubber_row'); if (_srm) _srm.style.display = 'none';
+                        if (scrubHint) scrubHint.style.display = 'none';
+                        if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
+                        return;
+                    }
+
                     _contentType = ct.type;
                     _contentFile = ct.file;
                     _fseqSeq     = (ct.type === 'seq') ? ct.file : null;
                     window._previewAssumedSize = false;   // reset; set true only in the no-model branch
-
-                    var loadEl = document.getElementById('fseq_load_status');
-                    var scrubHint = document.getElementById('fseq_scrub_hint');
                     loadEl.textContent = 'Loading\u2026';
                     loadEl.style.color = 'var(--fg-muted)';
                     if (scrubHint) scrubHint.style.display = (ct.type === 'img') ? 'none' : '';
@@ -10476,9 +10945,22 @@ def index():
                     if (!window._editTarget || window._editTarget.address !== t.address) return;   // re-selected since
                     if (window._loadingTarget) return;
                     if (typeof window._recentlyEdited === 'function' && window._recentlyEdited()) return;
+                    // Content added to / removed from that projector since: refresh the dropdown.
+                    if (d && Array.isArray(d.contents)
+                            && JSON.stringify(d.contents) !== JSON.stringify(window._remoteContents || null)) {
+                        window._remoteContents = d.contents;
+                        if (typeof window.renderNamesList === 'function') window.renderNamesList();
+                    }
                     if (!d || !d.found || !d.layout) return;
-                    if (window._layoutSig(d.layout) !== window._layoutSig(collectEditorLayout())) {
+                    if (!window._editTargetFound) {
+                        // The content just showed up on that projector - unlock the editor.
                         window._editTargetFound = true;
+                        if (typeof window._setEditorLocked === 'function') window._setEditorLocked(false);
+                        var _n = document.getElementById('preview_remote_note');
+                        if (_n) _n.textContent = 'Previewing remote Pi “' + t.name + '”. Text changes save to that Pi.';
+                        if (typeof window.loadBgPreview === 'function') window.loadBgPreview();
+                    }
+                    if (window._layoutSig(d.layout) !== window._layoutSig(collectEditorLayout())) {
                         if (typeof applyLayoutToEditor === 'function') applyLayoutToEditor(d.layout);
                         if (typeof window.loadBgPreview === 'function') window.loadBgPreview();
                     }
@@ -10724,6 +11206,7 @@ var _saveTimer = null;
                     profanity_filter: document.getElementById('profanity_filter').checked,
                     profanity_threshold: parseInt(document.getElementById('profanity_threshold').value) || 0,
                     use_whitelist: document.getElementById('use_whitelist').checked,
+                    allow_emoji: document.getElementById('allow_emoji')?.checked ?? true,
                     default_playlist: document.getElementById('default_playlist').value,
                     // Waiting content is a rotation list; default_playlist above is kept in
                     // sync with its first item server-side for the required-field/legacy paths.
@@ -11432,6 +11915,8 @@ def export_config():
                 ('settings', BLACKLIST_FILE),
                 ('settings', BLACKLIST_ADDED_FILE),
                 ('settings', BLACKLIST_REMOVED_FILE),
+                ('settings', EMOJI_BLACKLIST_ADDED_FILE),
+                ('settings', EMOJI_BLACKLIST_REMOVED_FILE),
             ]
 
         # Stream the zip straight to the HTTP response AS it is built - we never
@@ -11578,6 +12063,8 @@ def import_config():
             os.path.basename(BLACKLIST_FILE):         BLACKLIST_FILE,
             os.path.basename(BLACKLIST_ADDED_FILE):   BLACKLIST_ADDED_FILE,
             os.path.basename(BLACKLIST_REMOVED_FILE): BLACKLIST_REMOVED_FILE,
+            os.path.basename(EMOJI_BLACKLIST_ADDED_FILE):   EMOJI_BLACKLIST_ADDED_FILE,
+            os.path.basename(EMOJI_BLACKLIST_REMOVED_FILE): EMOJI_BLACKLIST_REMOVED_FILE,
         }
 
         # Reject a "zip bomb": a small archive that expands to a huge amount of data.
@@ -12490,19 +12977,9 @@ def test_message_submission():
         if not test_name:
             return jsonify({"success": False, "error": "Name is required"})
 
+        # Testing is operator-only, so it bypasses every filter (length, word count,
+        # whitelist, profanity) - whatever is typed goes straight to the queue.
         test_name = extract_name(test_name)
-        is_valid, reason = is_valid_name(test_name)
-
-        if not is_valid and not config.get('use_whitelist', False):
-            if reason == "too_long":
-                return jsonify({"success": False, "error": "Message exceeds Max Message Length", "reason": "too_long"})
-            return jsonify({"success": False, "error": "Invalid name format", "reason": "invalid_format"})
-
-        if not is_on_whitelist(test_name):
-            return jsonify({"success": False, "error": "Name not on whitelist", "reason": "not_on_whitelist"})
-
-        if config['profanity_filter'] and contains_profanity(test_name):
-            return jsonify({"success": False, "error": "Profanity detected", "reason": "profanity"})
 
         success = add_to_queue(test_name, test_phone, f"TEST: {test_name}")
 
@@ -12653,6 +13130,81 @@ def api_remove_blacklist():
         return jsonify({"success": True})
     except Exception as e:
         return _client_error("api_remove_blacklist", e)
+
+@app.route('/api/emoji/data')
+def api_emoji_data():
+    try:
+        return jsonify(load_emoji_data())
+    except Exception as e:
+        return _client_error("api_emoji_data", e)
+
+@app.route('/api/emoji-blacklist')
+def api_get_emoji_blacklist():
+    """Effective emoji blacklist plus the shipped entries the operator removed (so they can
+    be restored). Each entry: {entry, emoji: [...], combo, shipped}."""
+    try:
+        shipped = _read_emoji_entries(EMOJI_BLACKLIST_FILE)
+        removed = _read_emoji_entries(EMOJI_BLACKLIST_REMOVED_FILE)
+        def _row(key, text):
+            parts = text.split(' ')
+            return {"entry": text, "emoji": parts, "combo": len(parts) > 1, "shipped": key in shipped}
+        return jsonify({
+            "entries": [_row(k, v) for k, v in load_emoji_blacklist().items()],
+            "removed": [_row(k, v) for k, v in removed.items() if k in shipped],
+        })
+    except Exception as e:
+        return _client_error("api_get_emoji_blacklist", e)
+
+@app.route('/api/emoji-blacklist/add', methods=['POST'])
+def api_add_emoji_blacklist():
+    """Block an emoji (or a combination: several emoji in one entry). Re-adding a shipped
+    entry the operator removed just restores it."""
+    try:
+        parsed = _emoji_entry((request.json or {}).get('entry', ''))
+        if not parsed:
+            return jsonify({"success": False, "error": "Pick at least one emoji"})
+        key, text = parsed
+        if len(key) > 8:
+            return jsonify({"success": False, "error": "A combination can have at most 8 emoji"})
+        if key in load_emoji_blacklist():
+            return jsonify({"success": False, "error": "Already on the emoji blacklist"})
+        removed = _read_emoji_entries(EMOJI_BLACKLIST_REMOVED_FILE)
+        if key in removed:
+            removed.pop(key)
+            _write_emoji_entries(EMOJI_BLACKLIST_REMOVED_FILE, removed)
+        if key not in _read_emoji_entries(EMOJI_BLACKLIST_FILE):
+            added = _read_emoji_entries(EMOJI_BLACKLIST_ADDED_FILE)
+            added[key] = text
+            _write_emoji_entries(EMOJI_BLACKLIST_ADDED_FILE, added)
+        global _emoji_blacklist_cache
+        _emoji_blacklist_cache = None
+        logging.info(f"Added '{text}' to emoji blacklist")
+        return jsonify({"success": True, "entry": text})
+    except Exception as e:
+        return _client_error("api_add_emoji_blacklist", e)
+
+@app.route('/api/emoji-blacklist/remove', methods=['POST'])
+def api_remove_emoji_blacklist():
+    try:
+        parsed = _emoji_entry((request.json or {}).get('entry', ''))
+        if not parsed:
+            return jsonify({"success": False, "error": "No emoji given"})
+        key, text = parsed
+        added = _read_emoji_entries(EMOJI_BLACKLIST_ADDED_FILE)
+        if key in added:
+            added.pop(key)
+            _write_emoji_entries(EMOJI_BLACKLIST_ADDED_FILE, added)
+        # A shipped entry is tracked as removed so a plugin update can't re-add it.
+        if key in _read_emoji_entries(EMOJI_BLACKLIST_FILE):
+            removed = _read_emoji_entries(EMOJI_BLACKLIST_REMOVED_FILE)
+            removed[key] = text
+            _write_emoji_entries(EMOJI_BLACKLIST_REMOVED_FILE, removed)
+        global _emoji_blacklist_cache
+        _emoji_blacklist_cache = None
+        logging.info(f"Removed '{text}' from emoji blacklist")
+        return jsonify({"success": True})
+    except Exception as e:
+        return _client_error("api_remove_emoji_blacklist", e)
 
 @app.route('/api/whitelist')
 def api_get_whitelist():
@@ -13241,6 +13793,293 @@ def view_blacklist_page():
             }
 
             loadBlacklist();
+        </script>
+    </body>
+    </html>
+    """
+    return render_template_string(html, config=config)
+
+@app.route('/emoji-blacklist')
+def view_emoji_blacklist_page():
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Profanity Filter - Emoji Blacklist</title>
+        <meta charset="utf-8">
+        <script>
+            (function(){ try { var p=new URLSearchParams(location.search).get('theme');
+              var dark=p?(p==='dark'):(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches);
+              document.documentElement.setAttribute('data-theme',dark?'dark':'light'); } catch(e){}
+              window.addEventListener('message',function(e){ if(e.data&&e.data.type==='tml_theme'&&(e.data.theme==='dark'||e.data.theme==='light'))
+                document.documentElement.setAttribute('data-theme',e.data.theme); }); })();
+        </script>
+        <style>
+            :root {
+              --bg: var(--bs-body-bg, #ffffff);
+              --fg: var(--bs-body-color, #333333);
+              --fg-muted: var(--bs-secondary-color, #666666);
+              --border: var(--bs-border-color, #dddddd);
+              --border-strong: var(--bs-border-color, #cccccc);
+              --warn-bg: var(--bs-warning-bg-subtle, #fff3cd);
+              --warn-fg: var(--bs-warning-text-emphasis, #856404);
+              --warn-border: var(--bs-warning-border-subtle, #ffc107);
+              --ok-bg: var(--bs-success-bg-subtle, #e8f5e9);
+              --row-alt: var(--bs-tertiary-bg, #f5f5f5);
+              --chip-bg: var(--bs-tertiary-bg, #f3f3f3);
+            }
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: var(--bg); color: var(--fg); }
+            h1 { color: #f44336; }
+            h3 { margin: 18px 0 8px; }
+            button { background: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin: 5px 5px 5px 0; }
+            button:hover { background: #45a049; }
+            button:disabled { opacity: .5; cursor: default; }
+            .add-btn { background: #2196F3; }
+            .add-btn:hover { background: #0b7dda; }
+            .ghost-btn { background: transparent; color: var(--fg); border: 1px solid var(--border-strong); }
+            .ghost-btn:hover { background: var(--row-alt); }
+            .info { background: var(--bs-danger-bg-subtle, #fce4e4); padding: 10px; border-radius: 5px; margin: 10px 0; font-size: 14px; border: 1px solid var(--bs-danger-border-subtle, #f5c6c6); line-height: 1.5; }
+            .hint { color: var(--fg-muted); font-size: 13px; margin: 6px 0; }
+            .error { color: #f44336; font-size: 13px; }
+            .success { color: #4CAF50; font-size: 13px; }
+            .emo { font-family: "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif; }
+            #tray { min-height: 54px; border: 2px dashed var(--border-strong); border-radius: 8px; padding: 8px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+            #tray .empty-tray { color: var(--fg-muted); font-size: 13px; }
+            .tray-item { font-size: 30px; background: var(--chip-bg); border-radius: 6px; padding: 2px 6px; cursor: pointer; border: 1px solid var(--border); }
+            .tray-plus { color: var(--fg-muted); font-size: 18px; }
+            .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+            .row input { flex: 1; min-width: 180px; padding: 10px; border: 1px solid var(--border-strong); border-radius: 4px; font-size: 14px; background: var(--bg); color: var(--fg); }
+            .search { border: 2px solid #f44336 !important; }
+            .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+            .chip { display: inline-flex; align-items: center; gap: 6px; background: var(--chip-bg); border: 1px solid var(--border); border-radius: 18px; padding: 3px 4px 3px 10px; font-size: 22px; }
+            .chip .x { background: #f44336; color: #fff; border-radius: 50%; width: 22px; height: 22px; padding: 0; margin: 0; font-size: 12px; line-height: 22px; }
+            .chip .r { background: #4CAF50; color: #fff; border-radius: 12px; padding: 2px 8px; margin: 0; font-size: 12px; }
+            .chip .tag { font-size: 10px; color: var(--fg-muted); font-family: Arial, sans-serif; }
+            .chip .plus { font-size: 12px; color: var(--fg-muted); }
+            .groups { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+            .groups button { margin: 0; padding: 6px 10px; font-size: 13px; background: var(--chip-bg); color: var(--fg); border: 1px solid var(--border); }
+            .groups button.active { background: #f44336; color: #fff; border-color: #f44336; }
+            .subgroup { font-size: 12px; color: var(--fg-muted); margin: 10px 0 4px; text-transform: capitalize; }
+            .grid { display: flex; flex-wrap: wrap; gap: 2px; }
+            .e { font-size: 28px; width: 44px; height: 44px; padding: 0; margin: 0; background: transparent; border: 2px solid transparent; border-radius: 6px; position: relative; color: inherit; }
+            .e:hover { background: var(--row-alt); }
+            .e.blocked { border-color: #f44336; background: var(--bs-danger-bg-subtle, #fce4e4); }
+            .e.incombo::after { content: ''; position: absolute; right: 3px; top: 3px; width: 8px; height: 8px; border-radius: 50%; background: #FF9800; }
+            .legend { font-size: 12px; color: var(--fg-muted); display: flex; gap: 14px; flex-wrap: wrap; margin: 6px 0; align-items: center; }
+            .sw { display: inline-block; width: 14px; height: 14px; border-radius: 3px; vertical-align: middle; margin-right: 4px; }
+            details { margin: 10px 0; }
+            summary { cursor: pointer; font-weight: bold; }
+        </style>
+    </head>
+    <body><script>if('scrollRestoration'in history)history.scrollRestoration='manual';function _toTop(){window.scrollTo(0,0);document.documentElement.scrollTop=0;document.body.scrollTop=0;try{window.parent.postMessage({type:'scrollTop'},'*');}catch(e){}}_toTop();document.addEventListener('DOMContentLoaded',_toTop);window.addEventListener('load',_toTop);</script>
+        <h1>😶 Emoji Blacklist</h1>
+        <div class="info">
+            ℹ️ A <strong>single emoji</strong> is blocked anywhere in a text. A <strong>combination</strong> is blocked only when <em>all</em> of its emoji are in the same text, in any order - so ❄️ on its own is fine, but ❄️ with 👃 is not.
+            Skin tones don't matter: blocking 🖕 also blocks 🖕🏻 🖕🏽 🖕🏿. Blocked emoji get the <strong>Profanity</strong> response and count toward the daily auto-block tally.
+            &nbsp;|&nbsp; <strong id="count">Loading...</strong>
+        </div>
+        {% if not config.get('profanity_filter', True) %}
+        <div style="background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn-fg); padding:10px 14px; border-radius:5px; margin:10px 0; font-size:14px; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+            <span>⚠️ <strong>Profanity filter is not enabled</strong> - emoji on this list will still be shown.</span>
+            <button onclick="toggleSetting('profanity_filter', true)" style="padding:6px 14px; font-size:13px;">✓ Enable Profanity Filter</button>
+        </div>
+        {% endif %}
+        {% if not config.get('allow_emoji', True) %}
+        <div style="background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn-fg); padding:10px 14px; border-radius:5px; margin:10px 0; font-size:14px;">
+            ℹ️ <strong>Allow Emoji in Names is off</strong> - emoji are removed from names before display. Texts with blocked emoji are still rejected.
+        </div>
+        {% endif %}
+        <button onclick="tmlGo('/')">← Back to Config</button>
+
+        <h3>Add to the Blacklist</h3>
+        <p class="hint">Tap emoji in the full list below (or paste them here) to build an entry. One emoji = blocked on its own; two or more = blocked as a combination.</p>
+        <div class="row">
+            <input type="text" id="paste" class="emo" placeholder="Paste emoji here, e.g. 🍆💦" oninput="pasteToTray()">
+        </div>
+        <div id="tray"></div>
+        <div class="row">
+            <button class="add-btn" id="add_btn" onclick="addEntry()" disabled>+ Add to Blacklist</button>
+            <button class="ghost-btn" onclick="clearTray()">Clear</button>
+            <span id="add_result"></span>
+        </div>
+
+        <h3>Current Blacklist</h3>
+        <div class="row">
+            <input type="text" id="bl_search" class="search" placeholder="Filter by emoji or name (e.g. snow, 🍃)..." oninput="renderBlacklist()">
+        </div>
+        <div id="bl_area"></div>
+        <details id="removed_wrap" style="display:none;">
+            <summary>Removed built-in entries (<span id="removed_count">0</span>)</summary>
+            <p class="hint">Built-in entries you removed. Plugin updates won't bring them back unless you restore them.</p>
+            <div id="removed_area" class="chips emo"></div>
+        </details>
+
+        <h3>All Emoji (<span id="all_count">...</span>)</h3>
+        <p class="hint">The full Unicode emoji list (<span id="uver"></span>) - the same set iOS and Android both support. Skin-tone versions aren't listed separately; they match their base emoji.</p>
+        <div class="legend">
+            <span><span class="sw" style="border:2px solid #f44336; background:var(--bs-danger-bg-subtle,#fce4e4);"></span>blocked on its own</span>
+            <span><span class="sw" style="background:#FF9800; border-radius:50%; width:9px; height:9px;"></span>part of a blocked combination</span>
+        </div>
+        <div class="row">
+            <input type="text" id="emoji_search" placeholder="Search all emoji by name (e.g. eggplant, fire, flag)..." oninput="renderGrid()">
+        </div>
+        <div class="groups" id="groups"></div>
+        <div id="grid_area" class="emo"></div>
+
+        <script>
+            var DATA = null, ENTRIES = [], REMOVED = [], tray = [];
+            var NAME = {}, activeGroup = 0;
+            function nk(s) { return s.replace(/[\\uFE0F\\u{1F3FB}-\\u{1F3FF}]/gu, ''); }
+            function esc(s) { return String(s).replace(/[&<>"']/g, function(c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+            function nameOf(e) { return NAME[nk(e)] || ''; }
+
+            function toggleSetting(key, value) {
+                fetch('/api/config', { method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({[key]: value}) }).then(function() { location.reload(); });
+            }
+
+            function loadAll() {
+                Promise.all([
+                    fetch('/api/emoji/data').then(function(r) { return r.json(); }),
+                    fetch('/api/emoji-blacklist').then(function(r) { return r.json(); })
+                ]).then(function(res) {
+                    DATA = res[0];
+                    DATA.groups.forEach(function(g) { g.subgroups.forEach(function(sg) {
+                        sg.emoji.forEach(function(e) { NAME[nk(e[0])] = e[1]; }); }); });
+                    document.getElementById('all_count').textContent = (DATA.count || 0).toLocaleString();
+                    document.getElementById('uver').textContent = 'Emoji ' + (DATA.unicode_version || '');
+                    renderGroups();
+                    applyBlacklist(res[1]);
+                }).catch(function() { document.getElementById('count').textContent = 'Error loading'; });
+            }
+            function reloadBlacklist() {
+                fetch('/api/emoji-blacklist').then(function(r) { return r.json(); }).then(applyBlacklist);
+            }
+            function applyBlacklist(d) {
+                ENTRIES = d.entries || [];
+                REMOVED = d.removed || [];
+                var singles = ENTRIES.filter(function(x) { return !x.combo; }).length;
+                document.getElementById('count').textContent = singles + ' single emoji, ' + (ENTRIES.length - singles) + ' combinations';
+                renderBlacklist();
+                renderGrid();
+            }
+
+            function chip(entry, btn) {
+                var parts = entry.emoji, title = parts.map(nameOf).join(' + ');
+                var inner = parts.map(function(p) { return '<span>' + esc(p) + '</span>'; }).join('<span class="plus">+</span>');
+                return '<span class="chip" title="' + esc(title) + '">' + inner + btn + '</span>';
+            }
+            function renderBlacklist() {
+                var q = document.getElementById('bl_search').value.trim().toLowerCase();
+                var qk = nk(q);
+                var list = ENTRIES.filter(function(x) {
+                    if (!q) return true;
+                    return x.emoji.some(function(p) { return nk(p) === qk || nameOf(p).toLowerCase().indexOf(q) >= 0; })
+                        || nk(x.entry).indexOf(qk) >= 0;
+                });
+                var singles = list.filter(function(x) { return !x.combo; });
+                var combos = list.filter(function(x) { return x.combo; });
+                function btns(arr) {
+                    return arr.map(function(x) {
+                        return chip(x, '<button class="x" title="Remove" data-entry="' + esc(x.entry) + '" onclick="removeEntry(this.dataset.entry)">✕</button>');
+                    }).join('');
+                }
+                document.getElementById('bl_area').innerHTML =
+                    '<div class="hint">Blocked on their own (' + singles.length + ')</div><div class="chips emo">' + (btns(singles) || '<span class="hint">None</span>') + '</div>' +
+                    '<div class="hint" style="margin-top:12px;">Blocked combinations (' + combos.length + ')</div><div class="chips emo">' + (btns(combos) || '<span class="hint">None</span>') + '</div>';
+                var rw = document.getElementById('removed_wrap');
+                rw.style.display = REMOVED.length ? '' : 'none';
+                document.getElementById('removed_count').textContent = REMOVED.length;
+                document.getElementById('removed_area').innerHTML = REMOVED.map(function(x) {
+                    return chip(x, '<button class="r" data-entry="' + esc(x.entry) + '" onclick="addEntry(this.dataset.entry)">Restore</button>');
+                }).join('');
+            }
+
+            function renderGroups() {
+                document.getElementById('groups').innerHTML = DATA.groups.map(function(g, i) {
+                    return '<button class="' + (i === activeGroup ? 'active' : '') + '" onclick="activeGroup=' + i + '; renderGroups(); renderGrid();">' + esc(g.group) + '</button>';
+                }).join('');
+            }
+            function renderGrid() {
+                if (!DATA) return;
+                var single = {}, combo = {};
+                ENTRIES.forEach(function(x) { x.emoji.forEach(function(p) { (x.combo ? combo : single)[nk(p)] = 1; }); });
+                var q = document.getElementById('emoji_search').value.trim().toLowerCase();
+                var groups = q ? DATA.groups : [DATA.groups[activeGroup]];
+                document.getElementById('groups').style.display = q ? 'none' : '';
+                var html = '';
+                groups.forEach(function(g) {
+                    g.subgroups.forEach(function(sg) {
+                        var items = sg.emoji.filter(function(e) { return !q || e[1].toLowerCase().indexOf(q) >= 0; });
+                        if (!items.length) return;
+                        html += '<div class="subgroup">' + esc((q ? g.group + ' · ' : '') + sg.name.replace(/-/g, ' ')) + '</div><div class="grid">';
+                        items.forEach(function(e) {
+                            var k = nk(e[0]);
+                            var cls = 'e' + (single[k] ? ' blocked' : '') + (combo[k] ? ' incombo' : '');
+                            html += '<button class="' + cls + '" title="' + esc(e[1]) + '" data-e="' + esc(e[0]) + '" onclick="addToTray(this.dataset.e)">' + esc(e[0]) + '</button>';
+                        });
+                        html += '</div>';
+                    });
+                });
+                document.getElementById('grid_area').innerHTML = html || '<p class="hint">No emoji match "' + esc(q) + '".</p>';
+            }
+
+            function renderTray() {
+                var t = document.getElementById('tray');
+                t.innerHTML = tray.length
+                    ? tray.map(function(e, i) {
+                        return (i ? '<span class="tray-plus">+</span>' : '') +
+                            '<span class="tray-item emo" title="' + esc(nameOf(e) + ' - click to remove') + '" onclick="tray.splice(' + i + ',1); renderTray();">' + esc(e) + '</span>';
+                      }).join('') + '<span class="hint" style="margin-left:8px;">' + (tray.length === 1 ? 'single emoji' : 'combination of ' + tray.length) + '</span>'
+                    : '<span class="empty-tray">Nothing selected yet</span>';
+                document.getElementById('add_btn').disabled = !tray.length;
+            }
+            function addToTray(e) {
+                if (tray.length >= 8) return;
+                tray.push(e);
+                renderTray();
+                document.getElementById('tray').scrollIntoView({block: 'nearest'});
+            }
+            function clearTray() { tray = []; document.getElementById('paste').value = ''; renderTray(); }
+            function pasteToTray() {
+                var v = document.getElementById('paste').value, out = [];
+                var segs = (window.Intl && Intl.Segmenter)
+                    ? Array.from(new Intl.Segmenter('en', {granularity: 'grapheme'}).segment(v), function(s) { return s.segment; })
+                    : Array.from(v);
+                segs.forEach(function(s) { if (/\\p{Extended_Pictographic}|\\p{Regional_Indicator}|\\u20E3/u.test(s)) out.push(s); });
+                tray = out.slice(0, 8);
+                renderTray();
+            }
+
+            function addEntry(entry) {
+                var text = entry || tray.join(' ');
+                var result = document.getElementById('add_result');
+                if (!text) return;
+                fetch('/api/emoji-blacklist/add', { method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({entry: text}) })
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    if (d.success) {
+                        result.innerHTML = '<span class="success">✅ Added ' + esc(d.entry) + '</span>';
+                        if (!entry) clearTray();
+                        reloadBlacklist();
+                    } else {
+                        result.innerHTML = '<span class="error">❌ ' + esc(d.error) + '</span>';
+                    }
+                    setTimeout(function() { result.innerHTML = ''; }, 3000);
+                });
+            }
+            function removeEntry(entry) {
+                tmlConfirm('Remove ' + entry + ' from the emoji blacklist?', { danger: true, okText: 'Remove' }).then(function(ok) {
+                    if (!ok) return;
+                    fetch('/api/emoji-blacklist/remove', { method: 'POST', headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({entry: entry}) })
+                    .then(function(r) { return r.json(); }).then(reloadBlacklist);
+                });
+            }
+
+            renderTray();
+            loadAll();
         </script>
     </body>
     </html>
@@ -13988,9 +14827,13 @@ def api_tml_editinfo():
     except Exception:
         fonts = []
     layout = {k: item.get(k) for k in _LAYOUT_KEYS} if item else None
+    # Every content id this box has, so the master's Preview can switch to one this projector
+    # can actually show when the requested content isn't here.
+    contents = [it.get('content') for it in (config.get('names_content_list', []) or [])
+                if it.get('content')]
     return jsonify({"found": bool(item), "model_w": mw, "model_h": mh,
                     "fonts": fonts, "overlay_model": config.get('overlay_model_name', '') or '',
-                    "layout": layout})
+                    "layout": layout, "contents": contents})
 
 
 @app.route('/api/tml/fseq-info', methods=['GET'])

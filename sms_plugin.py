@@ -2200,7 +2200,7 @@ def render_to_shm(line_items, model_name, width, height):
                 logging.info(f"🅰️ TEXTPOS model={width}x{height} box=(x{box_x},y{box_y},w{box_w},h{box_h}) "
                              f"font={font_name!r} text={text!r} rendered_text={sw}x{sh} "
                              f"draw=(x{draw_x},y{draw_y}) orient={orientation}")
-                img.paste(strip, (draw_x, draw_y))
+                _paste_lighter(img, strip, (draw_x, draw_y))   # overlapping lines both stay visible
 
         shm_path = f"/dev/shm/FPP-Model-Data-{model_name}"
         raw = img.tobytes()
@@ -2232,6 +2232,21 @@ def render_to_shm(line_items, model_name, width, height):
     except Exception as e:
         logging.error(f"render_to_shm failed: {e}")
         return False
+
+
+def _paste_lighter(dst, src, xy):
+    """Composite a text strip (glyphs on BLACK) onto dst by keeping the brighter pixel. On a
+    black canvas this equals a plain paste wherever lines don't overlap - but where one
+    line's box overlaps another's (tall script fonts reaching past their box), the strip's
+    black background no longer paints over the other line's glyphs, so both stay visible
+    the way the preview shows them. Clipped to dst's bounds."""
+    from PIL import ImageChops
+    x, y = xy
+    box = (max(0, x), max(0, y), min(dst.width, x + src.width), min(dst.height, y + src.height))
+    if box[2] <= box[0] or box[3] <= box[1]:
+        return
+    s = src.crop((box[0] - x, box[1] - y, box[2] - x, box[3] - y))
+    dst.paste(ImageChops.lighter(dst.crop(box), s), box[:2])
 
 
 def _text_coverage_mask(strip):
@@ -2451,8 +2466,8 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
             entry = {'strip': strip, 'tw': tw, 'th': th, 'movement': movement,
                      'clip': (resolved_bx, resolved_by, box_w, box_h)}
             # Over an image background, paste only the glyph (mask out the strip's black
-            # box). Over a black background (no image) leave it None - pasting opaquely on
-            # black is identical and cheaper.
+            # box). Over a black background (no image) leave it None - those strips are
+            # combined with _paste_lighter so overlapping lines don't cover each other.
             entry['mask'] = _text_coverage_mask(strip) if bg_image_path else None
             # speed == 0 is the "fit to display time" sentinel: instead of a fixed
             # px/s speed (which, with dynamic-length text, either loops a short name
@@ -2533,8 +2548,10 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
                 return
             crop_x0, crop_y0 = src_x + (x0 - dst_x), src_y + (y0 - dst_y)
             crop_box = (crop_x0, crop_y0, crop_x0 + (x1 - x0), crop_y0 + (y1 - y0))
-            crop_mask = mask.crop(crop_box) if mask is not None else None
-            frame.paste(strip.crop(crop_box), (x0, y0), crop_mask)
+            if mask is not None:
+                frame.paste(strip.crop(crop_box), (x0, y0), mask.crop(crop_box))
+            else:
+                _paste_lighter(frame, strip.crop(crop_box), (x0, y0))
 
         def _pos_at(e, t):
             # Closed-form scroll position at elapsed time `t` (seconds). Motion is a pure
@@ -2584,8 +2601,10 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
                             vis_h = min(e['th'] - src_y, height - dst_y)
                             if vis_h > 0:
                                 _clip_paste(frame, e['strip'], e['mask'], 0, src_y, e['dx'], dst_y, e['tw'], vis_h, e['clip'])
-                        else:
+                        elif e['mask'] is not None:
                             frame.paste(e['strip'], (e['dx'], e['dy']), e['mask'])
+                        else:
+                            _paste_lighter(frame, e['strip'], (e['dx'], e['dy']))
                     try:
                         buf = frame.tobytes()
                         shm.seek(0)

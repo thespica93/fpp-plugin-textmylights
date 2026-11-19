@@ -8651,6 +8651,8 @@ def index():
                     window._canvasModelH = t.h || d.model_h || 270;
                     _reshapeCanvasToModel();
                     window.applyLayoutToEditor(L || undefined);   // undefined -> blank layout
+                    // Baseline for the live-sync poll: only a later change on that Pi re-applies.
+                    window._lastRemoteLayoutSig = L ? window._layoutSig(L) : null;
                     // Only edits to content the remote ACTUALLY has are pushed back. If it doesn't
                     // have this content, we must never push - that would overwrite/append a blank
                     // layout on the remote (wiping its real one and churning its list).
@@ -8772,11 +8774,14 @@ def index():
                 var content = _currentContentId();
                 var status = document.getElementById('autosave_status');
                 if (status) { status.style.color = '#888'; status.textContent = 'Saving to ' + t.name + '…'; }
+                var _pushed = window.collectEditorLayout();
                 fetch('/api/plugin/remote-config?remote=' + encodeURIComponent(t.address), {
                     method: 'POST', headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({content: content, layout: window.collectEditorLayout()})
+                    body: JSON.stringify({content: content, layout: _pushed})
                 }).then(function(r){ return r.json(); })
                   .then(function(d){
+                    // Our own save isn't a change "from the remote" - don't re-apply it on the next poll.
+                    if (d && d.success !== false) window._lastRemoteLayoutSig = window._layoutSig(_pushed);
                     if (!status) return;
                     if (d && d.success !== false) { status.style.color = '#4CAF50'; status.textContent = '✓ Saved to ' + t.name; }
                     else { status.style.color = '#f44336'; status.textContent = 'Save to ' + t.name + ' failed'; }
@@ -10586,6 +10591,8 @@ def index():
                     // never keeps showing the previous content's background while the new one loads
                     // (or if it fails to load).
                     var _bgKey = (window._previewRemote ? window._previewRemote.address : '') + '|' + ct.type + ':' + ct.file;
+                    // Reloading the SAME content on the same Pi keeps the scrub position.
+                    var _keepSec = (_bgKey === window._bgKey) ? (window._scrubSeconds || 0) : 0;
                     if (_bgKey !== window._bgKey) {
                         window._fseqBgImage = null;
                         _fseqMeta = null;
@@ -10672,13 +10679,14 @@ def index():
                                 var displayDur = _previewCapSeconds();
                                 var totalSec = Math.min(displayDur, Math.max(1, Math.floor(data.duration_ms / 1000)));
                                 var scrubber = document.getElementById('fseq_scrubber');
+                                var _startSec = Math.min(_keepSec, totalSec);
                                 scrubber.max = totalSec;
-                                scrubber.value = 0;
-                                window._scrubSeconds = 0;
+                                scrubber.value = _startSec;
+                                window._scrubSeconds = _startSec;
                                 document.getElementById('fseq_scrubber_row').style.display = '';
                                 document.getElementById('fseq_time_display').textContent =
-                                    '0:00 / ' + fmtTime(totalSec * 1000);
-                                doFseqFetch(0);
+                                    fmtTime(_startSec * 1000) + ' / ' + fmtTime(totalSec * 1000);
+                                doFseqFetch(_startSec);
                                 if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
                             })
                             .catch(function(e) {
@@ -10991,9 +10999,14 @@ def index():
                         if (_n) _n.textContent = 'Previewing remote Pi “' + t.name + '”. Text changes save to that Pi.';
                         if (typeof window.loadBgPreview === 'function') window.loadBgPreview();
                     }
-                    if (window._layoutSig(d.layout) !== window._layoutSig(collectEditorLayout())) {
+                    // Compare against the layout we last loaded from / pushed to that Pi - NOT the
+                    // editor DOM, which normalizes some fields (color case, fonts it doesn't list)
+                    // and so never matched exactly, reloading every poll. A layout change only
+                    // re-applies the text; the background (and scrub position) is left alone.
+                    var _sig = window._layoutSig(d.layout);
+                    if (_sig !== window._lastRemoteLayoutSig) {
+                        window._lastRemoteLayoutSig = _sig;
                         if (typeof applyLayoutToEditor === 'function') applyLayoutToEditor(d.layout);
-                        if (typeof window.loadBgPreview === 'function') window.loadBgPreview();
                     }
                   }).catch(function(){});
             }

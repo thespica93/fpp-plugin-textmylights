@@ -10551,6 +10551,9 @@ def index():
                     if (!ct) {
                         // Nothing previewable behind the text (no sequence/image/video set for this
                         // item). Say so instead of silently leaving a black background + no scrubber.
+                        // Drop the previous content's frame/timeline so it can't linger or be scrubbed.
+                        window._bgKey = null;
+                        _clearState();
                         var _le0 = document.getElementById('fseq_load_status');
                         if (_le0) {
                             _le0.textContent = window._previewRemote
@@ -10571,6 +10574,7 @@ def index():
                         window._fseqBgImage = null;
                         window._bgKey = null;
                         _fseqSeq = null;
+                        _fseqMeta = null;
                         loadEl.textContent = '';
                         var _srm = document.getElementById('fseq_scrubber_row'); if (_srm) _srm.style.display = 'none';
                         if (scrubHint) scrubHint.style.display = 'none';
@@ -10584,6 +10588,7 @@ def index():
                     var _bgKey = (window._previewRemote ? window._previewRemote.address : '') + '|' + ct.type + ':' + ct.file;
                     if (_bgKey !== window._bgKey) {
                         window._fseqBgImage = null;
+                        _fseqMeta = null;
                         window._bgKey = _bgKey;
                         if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
                     }
@@ -10710,6 +10715,9 @@ def index():
 
                 // Alias so old callers still work
                 window.loadFseqPreview = loadBgPreview;
+                // The Pi switcher, content auto-switch and live-sync poll all call this name -
+                // without it they silently did nothing and the previous background stayed up.
+                window.loadBgPreview = loadBgPreview;
 
                 var _scrubTimer = null;
                 var _pendingImg  = null;

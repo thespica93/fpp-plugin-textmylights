@@ -532,6 +532,8 @@ DEFAULT_CONFIG = {
     # own color. Sizes are a percent of the fitted font size so they scale with auto-fit.
     "line_effects": [dict(LINE_EFFECT_DEFAULT) for _ in range(4)],
     "custom_colors": [],
+    # User-saved Quick Styles: [{"name", "color" ('' = keep the line's color), "fx"}].
+    "custom_styles": [],
     "scroll_speed": 5,
     "overlay_model_width": 0,
     "overlay_model_height": 0,
@@ -1423,6 +1425,24 @@ def _sanitize_line_effects(raw):
                 if re.fullmatch(r'#[0-9A-Fa-f]{6}', c):
                     d[k] = c.upper()
         out.append(d)
+    return out
+
+
+def _sanitize_custom_styles(raw):
+    """User-saved Quick Styles: at most 50, each {name (1-30 chars), color ('#RRGGBB' or ''),
+    fx (a sanitized line-effects dict)}. Drops blank names and later duplicates."""
+    out, seen = [], set()
+    for st in (raw if isinstance(raw, list) else [])[:50]:
+        if not isinstance(st, dict):
+            continue
+        name = ' '.join(str(st.get('name', '') or '').split())[:30]
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        color = str(st.get('color', '') or '')
+        out.append({"name": name,
+                    "color": color.upper() if re.fullmatch(r'#[0-9A-Fa-f]{6}', color) else '',
+                    "fx": _sanitize_line_effects([st.get('fx')])[0]})
     return out
 
 
@@ -7576,11 +7596,23 @@ def index():
                     <p class="help-text" style="margin:0 0 14px;">This exports only the plugin's <strong>own</strong> data. FPP's sequences, images, videos and the overlay model are not included (distribute sequences with xLights FPP Connect; set the overlay model in FPP). <strong>Credentials are never included.</strong></p>
                     <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 12px;">
                         <input type="checkbox" id="exp_settings" checked style="width:auto; margin:3px 0 0;">
-                        <span><strong>Plugin settings</strong><br><span class="help-text">Display lines, message rules, response text, filters, poll interval, and the selected content &amp; overlay model <em>names</em>.</span></span>
+                        <span><strong>Plugin settings</strong><br><span class="help-text">Display lines and text effects, message rules, response text, filters, poll interval, and the selected content &amp; overlay model <em>names</em>.</span></span>
+                    </label>
+                    <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 12px;">
+                        <input type="checkbox" id="exp_styles" checked style="width:auto; margin:3px 0 0;">
+                        <span><strong>Saved text styles</strong><br><span class="help-text">Your Quick Styles (My Styles) and saved colors. Merged on import - styles already on the other Pi are kept.</span></span>
+                    </label>
+                    <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 12px;">
+                        <input type="checkbox" id="exp_phones" checked style="width:auto; margin:3px 0 0;">
+                        <span><strong>Phone blocklist</strong><br><span class="help-text">Blocked phone numbers (only included when the list has numbers).</span></span>
+                    </label>
+                    <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 12px;">
+                        <input type="checkbox" id="exp_words" checked style="width:auto; margin:3px 0 0;">
+                        <span><strong>Word lists</strong><br><span class="help-text">Your name whitelist and profanity (word) blacklist.</span></span>
                     </label>
                     <label style="display:flex; gap:10px; align-items:flex-start; font-weight:normal; margin:0 0 18px;">
-                        <input type="checkbox" id="exp_lists" checked style="width:auto; margin:3px 0 0;">
-                        <span><strong>Blocked numbers &amp; word lists</strong><br><span class="help-text">Blocked phone numbers and your whitelist / blacklist words.</span></span>
+                        <input type="checkbox" id="exp_emoji" checked style="width:auto; margin:3px 0 0;">
+                        <span><strong>Emoji blacklist</strong><br><span class="help-text">Emoji and combinations you added to, or removed from, the emoji blacklist.</span></span>
                     </label>
                     <div style="display:flex; gap:10px; justify-content:flex-end;">
                         <button type="button" id="exp_cancel" onclick="closeExportModal()" style="background:#9e9e9e;">Cancel</button>
@@ -7608,7 +7640,8 @@ def index():
                 // has fully downloaded and surface server errors. Returns a Promise.
                 function _tmlDownload(sel) {
                     var url = '/api/config/export?settings=' + (sel.s ? 1 : 0)
-                            + '&lists=' + (sel.l ? 1 : 0);
+                            + '&styles=' + (sel.st ? 1 : 0) + '&phones=' + (sel.p ? 1 : 0)
+                            + '&words=' + (sel.w ? 1 : 0) + '&emoji=' + (sel.e ? 1 : 0);
                     // Stream the download NATIVELY: a plain anchor lets the browser write
                     // the (potentially very large) zip straight to disk. The old
                     // fetch().blob() buffered the ENTIRE zip into JS memory first, which
@@ -7654,11 +7687,10 @@ def index():
                 };
                 window.doExport = function() {
                     if (window._tmlExporting) return;
-                    var sel = {
-                        s: document.getElementById('exp_settings').checked,
-                        l: document.getElementById('exp_lists').checked
-                    };
-                    if (!sel.s && !sel.l) { tmlNotify('Select at least one thing to export.', 'warning'); return; }
+                    var ck = function(id) { return document.getElementById(id).checked; };
+                    var sel = { s: ck('exp_settings'), st: ck('exp_styles'), p: ck('exp_phones'),
+                                w: ck('exp_words'), e: ck('exp_emoji') };
+                    if (!sel.s && !sel.st && !sel.p && !sel.w && !sel.e) { tmlNotify('Select at least one thing to export.', 'warning'); return; }
                     var go = document.getElementById('exp_go');
                     window._tmlExporting = true;
                     go.disabled = true; go.textContent = 'Exporting...';
@@ -7705,7 +7737,8 @@ def index():
                     }
                     // Fallback (page opened directly): confirm + import inline.
                     tmlConfirm('Import configuration from "' + file.name + '"? '
-                        + 'This overwrites the plugin settings and block/whitelist on THIS Pi. '
+                        + 'This overwrites the plugin settings, phone blocklist, word lists and emoji blacklist on THIS Pi '
+                        + '(for whatever the file contains); saved text styles are merged. '
                         + 'FPP sequences, media and the overlay model are not touched. Your saved '
                         + 'credentials are kept. Continue?', { danger: true, okText: 'Import' }).then(function(ok) {
                       if (!ok) { _tmlImportFile = null; return; }
@@ -8095,6 +8128,7 @@ def index():
                             window._lineOrientationsInit = {{ (_active2.get('line_orientations') or ['horizontal', 'horizontal', 'horizontal', 'horizontal']) | tojson }};
                             window._lineEffectsInit = {{ (_active2.get('line_effects') or []) | tojson }};
                             window._customColorsInit = {{ config.get('custom_colors', []) | tojson }};
+                            window._customStylesInit = {{ (config.get('custom_styles') or []) | tojson }};
                             window._namesContentListInit = {{ (config.get('names_content_list') or []) | tojson }};
                             window._namesContentModeInit = {{ config.get('names_content_mode', 'roundrobin') | tojson }};
                             window._flatNameContentInit = {{ config.get('name_display_playlist', '') | tojson }};
@@ -9228,13 +9262,17 @@ def index():
                         g('gradient').checked = !!fx.gradient;
                         g('gradient_color').value = fx.gradient_color;
                         g('gradient_color').style.opacity = fx.gradient ? '1' : '0.35';
-                        // Show the quick style these effects match (None = no effects), or Custom
-                        // once any effect was changed from the preset.
-                        var cur = JSON.stringify(fx), match = 'custom';
+                        // Show the quick style these effects match - a built-in (None = no effects) or
+                        // one of My Styles - or Custom once any effect was changed from it.
+                        _buildStyleOptions(g('style'));
+                        var cur = JSON.stringify(fx), match = '';
                         Object.keys(_FX_STYLES).forEach(function(k) {
-                            if (JSON.stringify(window._normLineEffects([_FX_STYLES[k].fx])[0]) === cur) match = k;
+                            if (!match && JSON.stringify(window._normLineEffects([_FX_STYLES[k].fx])[0]) === cur) match = k;
                         });
-                        g('style').value = match;
+                        (window._customStyles || []).forEach(function(st, k) {
+                            if (!match && JSON.stringify(st.fx) === cur) match = 'u:' + k;
+                        });
+                        g('style').value = match || 'custom';
                     }
                 };
                 window.onLineEffectChange = function(i) {
@@ -9247,9 +9285,133 @@ def index():
                     if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
                     if (typeof saveConfig === 'function') saveConfig();
                 };
+                // ---- My Styles: Quick Styles the user saved from a line's current look ----
+                function _normStyles(arr) {
+                    var out = [], seen = {};
+                    (Array.isArray(arr) ? arr : []).slice(0, 50).forEach(function(st) {
+                        if (!st || typeof st !== 'object') return;
+                        var name = String(st.name || '').replace(/\\s+/g, ' ').trim().slice(0, 30);
+                        if (!name || seen[name.toLowerCase()]) return;
+                        seen[name.toLowerCase()] = 1;
+                        out.push({name: name, color: /^#[0-9a-fA-F]{6}$/.test(st.color || '') ? st.color.toUpperCase() : '',
+                                  fx: window._normLineEffects([st.fx])[0]});
+                    });
+                    return out;
+                }
+                window._customStyles = _normStyles(window._customStylesInit);
+                function _esc(t) { return String(t).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+                function _buildStyleOptions(sel) {
+                    if (!sel) return;
+                    var html = Object.keys(_FX_STYLES).map(function(k){
+                        return '<option value="' + k + '">' + _FX_STYLES[k].label + '</option>'; }).join('');
+                    var mine = window._customStyles || [];
+                    if (mine.length) {
+                        html += '<optgroup label="My Styles">' + mine.map(function(st, k){
+                            return '<option value="u:' + k + '">' + _esc(st.name) + '</option>'; }).join('') + '</optgroup>';
+                    }
+                    html += '<option value="custom" disabled>Custom</option>' +
+                            '<option value="__add">＋ Save current look…</option>' +
+                            (mine.length ? '<option value="__manage">Manage my styles…</option>' : '');
+                    sel.innerHTML = html;
+                }
+                function _persistStyles() {
+                    window._customStyles = _normStyles(window._customStyles);
+                    window.syncLineEffectControls();
+                    if (typeof saveConfig === 'function') saveConfig();
+                }
+                // The Save / Manage modal (built once, positioned next to the menu that opened it).
+                function _styleModal() {
+                    var m = document.getElementById('style_modal');
+                    if (m) return m;
+                    m = document.createElement('div');
+                    m.id = 'style_modal';
+                    m.style.cssText = 'display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:100000;';
+                    m.onclick = function(e) { if (e.target === m) m.style.display = 'none'; };
+                    m.innerHTML =
+                        '<div onclick="event.stopPropagation()" style="background:var(--card-bg); color:var(--fg); border-radius:8px; padding:20px; width:94%; max-width:440px; box-shadow:0 8px 30px rgba(0,0,0,0.35); box-sizing:border-box;">' +
+                        '<h3 style="margin-top:0;">Save Quick Style</h3>' +
+                        '<p class="help-text" id="style_modal_desc" style="margin:4px 0 10px;"></p>' +
+                        '<label for="style_modal_name" style="font-size:13px;">Style name</label>' +
+                        '<input type="text" id="style_modal_name" maxlength="30" placeholder="e.g. Grinch Green" style="width:100%; box-sizing:border-box; margin:4px 0 6px;">' +
+                        '<div id="style_modal_err" style="color:#f44336; font-size:12px; min-height:16px;"></div>' +
+                        '<div style="display:flex; gap:8px; justify-content:flex-end; margin-top:6px;">' +
+                        '<button type="button" id="style_modal_cancel" style="background:var(--bs-secondary, #6c757d);">Cancel</button>' +
+                        '<button type="button" id="style_modal_save">Save Style</button></div>' +
+                        '<div id="style_modal_list_wrap" style="margin-top:16px; border-top:1px solid var(--border); padding-top:10px;">' +
+                        '<div style="font-size:13px; font-weight:bold; margin-bottom:6px;">My Styles</div>' +
+                        '<div id="style_modal_list"></div></div></div>';
+                    document.body.appendChild(m);
+                    document.getElementById('style_modal_cancel').onclick = function() { m.style.display = 'none'; };
+                    return m;
+                }
+                function _renderStyleList() {
+                    var box = document.getElementById('style_modal_list'), mine = window._customStyles || [];
+                    if (!box) return;
+                    box.innerHTML = mine.length ? '' : '<div class="help-text">No saved styles yet.</div>';
+                    mine.forEach(function(st, k) {
+                        var row = document.createElement('div');
+                        row.style.cssText = 'display:flex; align-items:center; gap:8px; padding:4px 0; border-bottom:1px solid var(--border);';
+                        row.innerHTML = '<span style="flex:1; font-size:13px;">' + _esc(st.name) + '</span>';
+                        var del = document.createElement('button');
+                        del.type = 'button'; del.textContent = '✕'; del.title = 'Delete this style';
+                        del.style.cssText = 'background:#f44336; color:#fff; border:none; padding:2px 9px; border-radius:3px; cursor:pointer; font-size:12px;';
+                        del.onclick = function() {
+                            tmlConfirm('Delete the style "' + st.name + '"? Lines already using it keep their look.', {danger: true, okText: 'Delete'}).then(function(ok) {
+                                if (!ok) return;
+                                window._customStyles.splice(k, 1);
+                                _persistStyles(); _renderStyleList();
+                            });
+                        };
+                        row.appendChild(del);
+                        box.appendChild(row);
+                    });
+                }
+                function openStyleModal(i, anchor, manageOnly) {
+                    var m = _styleModal(), n = i + 1;
+                    var nameEl = document.getElementById('style_modal_name'), err = document.getElementById('style_modal_err');
+                    var col = document.getElementById('line_' + n + '_color');
+                    document.getElementById('style_modal_desc').textContent = manageOnly
+                        ? 'Delete styles you no longer need. Lines already using a style keep their look.'
+                        : 'Saves Line ' + n + '’s current effects and text color as a Quick Style you can apply to any line, on any content.';
+                    ['style_modal_name', 'style_modal_save'].forEach(function(id){ document.getElementById(id).style.display = manageOnly ? 'none' : ''; });
+                    m.querySelector('label[for="style_modal_name"]').style.display = manageOnly ? 'none' : '';
+                    m.querySelector('h3').textContent = manageOnly ? 'My Styles' : 'Save Quick Style';
+                    nameEl.value = ''; err.textContent = '';
+                    document.getElementById('style_modal_save').onclick = function() {
+                        var name = nameEl.value.replace(/\\s+/g, ' ').trim();
+                        if (!name) { err.textContent = 'Enter a name for the style.'; return; }
+                        if (Object.keys(_FX_STYLES).some(function(k){ return _FX_STYLES[k].label.toLowerCase() === name.toLowerCase(); })) {
+                            err.textContent = 'That name is a built-in style - pick another.'; return;
+                        }
+                        var entry = {name: name, color: col ? col.value.toUpperCase() : '', fx: window._normLineEffects([window._lineEffects[i]])[0]};
+                        var idx = window._customStyles.findIndex(function(st){ return st.name.toLowerCase() === name.toLowerCase(); });
+                        var save = function() {
+                            if (idx >= 0) window._customStyles[idx] = entry; else window._customStyles.push(entry);
+                            if (window._customStyles.length > 50) { err.textContent = 'You can save up to 50 styles.'; window._customStyles.pop(); return; }
+                            _persistStyles(); _renderStyleList();
+                            m.style.display = 'none';
+                            if (typeof tmlNotify === 'function') tmlNotify('Saved style "' + name + '"', 'success');
+                        };
+                        if (idx >= 0) {
+                            tmlConfirm('Replace your existing style "' + window._customStyles[idx].name + '"?', {okText: 'Replace'}).then(function(ok){ if (ok) save(); });
+                        } else save();
+                    };
+                    nameEl.onkeydown = function(e) { if (e.key === 'Enter') document.getElementById('style_modal_save').click(); };
+                    _renderStyleList();
+                    if (typeof window._openModalCentered === 'function') window._openModalCentered(m, anchor);
+                    else m.style.display = 'block';
+                    if (!manageOnly) setTimeout(function(){ nameEl.focus(); }, 0);
+                }
                 window.onLineStyleChange = function(i) {
                     var sel = document.getElementById('line_' + (i + 1) + '_style');
-                    var st = sel && _FX_STYLES[sel.value];
+                    if (!sel) return;
+                    var v = sel.value;
+                    if (v === '__add' || v === '__manage') {
+                        window.syncLineEffectControls();          // put the menu back on the current look
+                        openStyleModal(i, sel, v === '__manage');
+                        return;
+                    }
+                    var st = (v.indexOf('u:') === 0) ? (window._customStyles || [])[parseInt(v.slice(2), 10)] : _FX_STYLES[v];
                     if (!st) return;
                     window._lineEffects = window._normLineEffects(window._lineEffects);
                     window._lineEffects[i] = window._normLineEffects([st.fx])[0];
@@ -10555,6 +10717,7 @@ def index():
                 }
 
                 window.openManageContentModal=openManageContentModal;
+                window._openModalCentered=_openModalCentered;
                 window.closeManageContentModal=closeManageContentModal;
                 window.mngAdd=mngAdd;
                 window.mngRemove=mngRemove;
@@ -11671,6 +11834,7 @@ var _saveTimer = null;
                     line_orientations: window._lineOrientations || ['horizontal','horizontal','horizontal','horizontal'],
                     line_effects: window._normLineEffects(window._lineEffects),
                     custom_colors: window._customColors || [],
+                    custom_styles: window._customStyles || [],
                     sms_response_show_not_live: document.getElementById('sms_response_show_not_live').checked,
                     sms_response_success: document.getElementById('sms_response_success').checked,
                     sms_response_profanity: document.getElementById('sms_response_profanity').checked,
@@ -12169,6 +12333,8 @@ def update_config():
 
         if 'line_effects' in new_config:
             config['line_effects'] = _sanitize_line_effects(new_config.get('line_effects'))
+        if 'custom_styles' in new_config:
+            config['custom_styles'] = _sanitize_custom_styles(new_config.get('custom_styles'))
         # Sanitize the WAITING content rotation list the same way.
         if 'default_content_list' in new_config:
             raw_wlist = new_config.get('default_content_list')
@@ -12283,6 +12449,27 @@ def api_admin_approval_status():
 # ============================================================================
 BUNDLE_MARKER  = "textmylights-config"
 BUNDLE_FORMAT  = 1
+# The saved-styles section of an export: its own file in the bundle, holding these config keys.
+STYLES_BUNDLE_NAME = "styles.json"
+_STYLE_KEYS = ('custom_styles', 'custom_colors')
+
+
+def _merge_imported_styles(styles, colors):
+    """Merge imported Quick Styles / saved colors INTO this Pi's (never wipe them): a style
+    with the same name (any case) is replaced, others are kept; colors are added if new.
+    Returns how many styles were imported."""
+    mine = _sanitize_custom_styles(config.get('custom_styles', []))
+    incoming = _sanitize_custom_styles(styles)
+    for st in incoming:
+        mine = [m for m in mine if m['name'].lower() != st['name'].lower()]
+        mine.append(st)
+    config['custom_styles'] = _sanitize_custom_styles(mine[-50:])
+    have = [c for c in (config.get('custom_colors', []) or []) if isinstance(c, str)]
+    for c in (colors if isinstance(colors, list) else []):
+        if isinstance(c, str) and re.fullmatch(r'#[0-9A-Fa-f]{6}', c) and c.upper() not in [h.upper() for h in have]:
+            have.append(c.upper())
+    config['custom_colors'] = have[-50:]
+    return len(incoming)
 
 # Export runs as a streamed download in a hidden iframe, so the browser can't read its HTTP
 # status or body. We record progress per client-supplied dl_token here and expose it at
@@ -12318,16 +12505,21 @@ def export_config():
     plugin settings (credentials stripped) plus the block/word lists - and NEVER FPP's
     sequences, playlists, media, or the overlay model. Those belong to FPP: sequences
     and media are distributed by xLights FPP Connect, and the overlay model is set up in
-    FPP's own UI. The modal sends settings/lists=1|0 (both default to included). An
+    FPP's own UI. The modal sends settings / styles / phones / words / emoji = 1|0 (all default
+    to included; an older client's single lists=1|0 sets phones/words/emoji together). An
     optional dl_token lets the UI poll /api/config/export/status to confirm the download
     actually started/finished."""
     tmp = None
     dl_token = request.args.get('dl_token', '')
     _set_export_status(dl_token, 'started')
     try:
-        want = lambda k: request.args.get(k, '1') == '1'
+        want = lambda k, d='1': request.args.get(k, d) == '1'
+        _lists = request.args.get('lists', '1')          # older clients: one switch for all lists
         inc_settings = want('settings')
-        inc_lists    = want('lists')
+        inc_styles   = want('styles')
+        inc_phones   = want('phones', _lists)
+        inc_words    = want('words', _lists)
+        inc_emoji    = want('emoji', _lists)
 
         warnings = []
         # Settings (plugin.json on disk is already secrets-free) and the block /
@@ -12336,7 +12528,7 @@ def export_config():
         settings_files = []
         if inc_settings:
             settings_files.append(('settings', CONFIG_FILE))
-        if inc_lists:
+        if inc_phones:
             # Bundle the blocklist ONLY when a number is actually on it. An empty
             # (or never-created) blocklist is left out so importing never wipes the
             # target Pi's blocked numbers with an empty list.
@@ -12346,6 +12538,7 @@ def export_config():
                 _bl_has_entries = False
             if _bl_has_entries:
                 settings_files.append(('settings', BLOCKLIST_FILE))
+        if inc_words:
             settings_files += [
                 ('settings', WHITELIST_FILE),
                 ('settings', WHITELIST_ADDED_FILE),
@@ -12353,9 +12546,16 @@ def export_config():
                 ('settings', BLACKLIST_FILE),
                 ('settings', BLACKLIST_ADDED_FILE),
                 ('settings', BLACKLIST_REMOVED_FILE),
+            ]
+        if inc_emoji:
+            settings_files += [
                 ('settings', EMOJI_BLACKLIST_ADDED_FILE),
                 ('settings', EMOJI_BLACKLIST_REMOVED_FILE),
             ]
+        # Saved text styles + colors travel in their own file so they can be exported (and
+        # imported - merged, not replaced) independently of the rest of the settings.
+        if inc_styles:
+            settings_files.append(('settings', STYLES_BUNDLE_NAME))
 
         # Stream the zip straight to the HTTP response AS it is built - we never
         # write an intermediate copy to the SD card first. The download's headers flush
@@ -12386,6 +12586,35 @@ def export_config():
                 return b''
             with zipfile.ZipFile(sink, 'w', zipfile.ZIP_STORED, allowZip64=True) as zf:
                 for arc_dir, path in settings_files:
+                    # Generated entries: plugin.json WITHOUT the saved styles/colors (they are
+                    # their own section), and the styles file itself.
+                    gen = None
+                    if path == CONFIG_FILE:
+                        try:
+                            with open(CONFIG_FILE, 'r') as cf:
+                                _cfg = json.load(cf)
+                            for _k in _STYLE_KEYS:
+                                _cfg.pop(_k, None)
+                            gen = json.dumps(_cfg, indent=2).encode('utf-8')
+                        except Exception as ge:
+                            warnings.append(f"Could not add settings/plugin.json: {ge}")
+                            continue
+                    elif path == STYLES_BUNDLE_NAME:
+                        gen = json.dumps({k: config.get(k, []) or [] for k in _STYLE_KEYS},
+                                         indent=2).encode('utf-8')
+                    if gen is not None:
+                        arcname = f"{arc_dir}/{os.path.basename(path)}"
+                        if arcname in seen:
+                            continue
+                        seen.add(arcname)
+                        zi = zipfile.ZipInfo(arcname, date_time=datetime.now().timetuple()[:6])
+                        zi.compress_type = zipfile.ZIP_STORED
+                        zf.writestr(zi, gen)
+                        included.append(arcname)
+                        data = drain()
+                        if data:
+                            yield data
+                        continue
                     if not path or not os.path.isfile(path):
                         continue
                     arcname = f"{arc_dir}/{os.path.basename(path)}"
@@ -12420,7 +12649,11 @@ def export_config():
                     "created": datetime.now(timezone.utc).isoformat(),
                     "includes": {
                         "settings": inc_settings,
-                        "lists": inc_lists,
+                        "styles": inc_styles,
+                        "phones": inc_phones,
+                        "words": inc_words,
+                        "emoji": inc_emoji,
+                        "lists": inc_phones or inc_words or inc_emoji,
                         "credentials": False,
                     },
                     "files": included,
@@ -12489,7 +12722,7 @@ def import_config():
             return jsonify({"success": False, "error": "This .zip is not a Text My Lights config bundle"}), 400
 
         warnings = []
-        summary = {"settings": False, "lists": 0}
+        summary = {"settings": False, "lists": 0, "styles": 0}
 
         # settings files land at their known individual paths, keyed by basename.
         settings_targets = {
@@ -12503,6 +12736,7 @@ def import_config():
             os.path.basename(BLACKLIST_REMOVED_FILE): BLACKLIST_REMOVED_FILE,
             os.path.basename(EMOJI_BLACKLIST_ADDED_FILE):   EMOJI_BLACKLIST_ADDED_FILE,
             os.path.basename(EMOJI_BLACKLIST_REMOVED_FILE): EMOJI_BLACKLIST_REMOVED_FILE,
+            STYLES_BUNDLE_NAME:                       None,  # merged, handled specially below
         }
 
         # Reject a "zip bomb": a small archive that expands to a huge amount of data.
@@ -12564,9 +12798,28 @@ def import_config():
                         for mk in MODE_KEYS:
                             imported.pop(mk, None)
                         logging.info("Import: kept this Pi's Master/Remote mode (import_mode off)")
+                    # Older bundles carried the saved styles/colors inside plugin.json - merge
+                    # those like the styles section instead of overwriting this Pi's.
+                    _old_styles = {k: imported.pop(k, None) for k in _STYLE_KEYS}
                     config.update(imported)
+                    # Same validation the normal save path applies to the layout data.
+                    if 'line_effects' in imported:
+                        config['line_effects'] = _sanitize_line_effects(imported.get('line_effects'))
+                    if isinstance(imported.get('names_content_list'), list):
+                        config['names_content_list'] = [_sanitize_names_item(it) for it in imported['names_content_list']]
+                    if any(v for v in _old_styles.values()):
+                        summary["styles"] += _merge_imported_styles(_old_styles.get('custom_styles') or [],
+                                                                    _old_styles.get('custom_colors') or [])
                     save_config()
                     summary["settings"] = True
+                elif base == STYLES_BUNDLE_NAME:
+                    try:
+                        _st = json.loads(zf.read(entry))
+                        summary["styles"] += _merge_imported_styles(_st.get('custom_styles') or [],
+                                                                    _st.get('custom_colors') or [])
+                        save_config()
+                    except Exception:
+                        warnings.append("styles.json in bundle was invalid - saved styles skipped")
                 elif base in settings_targets and settings_targets[base]:
                     target = settings_targets[base]
                     os.makedirs(os.path.dirname(target), exist_ok=True)

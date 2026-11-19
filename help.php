@@ -243,6 +243,7 @@ $fppTheme = tml_fpp_theme_help();
             <strong>Glow</strong> (a soft halo: Soft, Medium, Strong), and
             <strong>Gradient</strong> (the letters shade from the line color at the top to a second color at the bottom).
             <strong>Quick style</strong> applies a ready-made look in one click — Bubble, Sticker, Neon, Gold, Candy Cane, Frosty (some also set the text color); every effect stays editable afterwards. The menu always shows the line's current look: <strong>None</strong> when no effects are on (choose it to clear them all), the style's name while the effects match it, and <strong>Custom</strong> once you change any effect yourself.
+            <strong>Save your own:</strong> pick <strong>＋ Save current look…</strong> in the Quick style menu, give it a name, and the line's current effects and text color are saved under <strong>My Styles</strong> in every line's menu — on any content. Saving with an existing name replaces that style. <strong>Manage my styles…</strong> lists them so you can delete ones you no longer need (lines already using a style keep their look). Saved styles are stored on this Pi and included in Config Export/Import.
             Effects scale with the text and are counted inside the line's box, so the text shrinks slightly to make room. Layered back to front: glow, shadow, 2nd outline, outline, letters. Pure black is drawn as near-black, because FPP treats black overlay pixels as see-through. Emoji keep their own colors and aren't outlined.</td></tr>
         <tr><td>Overlapping lines</td><td>Line boxes may overlap. Lines are layered in order (Line 1 at the back, Line 4 in front), exactly as the preview shows — no line blacks out another.</td></tr>
         <tr><td>Movement &amp; Speed</td><td>Center (static) or scroll, with a speed for scrolling lines.</td></tr>
@@ -381,15 +382,18 @@ $fppTheme = tml_fpp_theme_help();
     <h3>What's in the export</h3>
     <div class="ref"><table>
         <tr><th>Included</th><th>Details</th></tr>
-        <tr><td>Plugin settings</td><td>Everything in <code>plugin.json</code> — display lines, message rules, response text, filters, poll interval, and the <em>names</em> of the selected content / overlay model. (Your Twilio Account SID, phone number, and Gmail address come along; the auth token / app password do <strong>not</strong>.)</td></tr>
-        <tr><td>Block &amp; name lists</td><td>Blocked phone numbers, your whitelist / blacklist word files, and your emoji blacklist additions/removals.</td></tr>
+        <tr><td>Plugin settings</td><td>Everything in <code>plugin.json</code> — display lines and text effects, message rules, response text, filters, poll interval, and the <em>names</em> of the selected content / overlay model. (Your Twilio Account SID, phone number, and Gmail address come along; the auth token / app password do <strong>not</strong>.)</td></tr>
+        <tr><td>Saved text styles</td><td>Your Quick Styles (<em>My Styles</em>) and saved colors. On import these are <strong>merged</strong>: a style with the same name is replaced, and styles already on the other Pi are kept — handy for sharing a style pack between Pis.</td></tr>
+        <tr><td>Phone blocklist</td><td>Blocked phone numbers. Only included when the list has numbers, so importing never wipes another Pi's blocklist with an empty one.</td></tr>
+        <tr><td>Word lists</td><td>Your name whitelist and profanity (word) blacklist, including your additions and removals.</td></tr>
+        <tr><td>Emoji blacklist</td><td>Emoji and combinations you added to, or removed from, the built-in emoji blacklist.</td></tr>
     </table></div>
 
     <h3>Export</h3>
     <ol>
         <li>Open the Config UI and go to the <em>Settings</em> tab.</li>
         <li>Under <strong>Backup &amp; Restore</strong>, click <strong>⬇️ Export Config</strong>.</li>
-        <li>A dialog lists what to include — <em>Plugin settings</em> and <em>Blocked numbers &amp; word lists</em>. Both are checked by default; untick either to leave it out.</li>
+        <li>A dialog lists what to include — <em>Plugin settings</em>, <em>Saved text styles</em>, <em>Phone blocklist</em>, <em>Word lists</em> and <em>Emoji blacklist</em>. All are checked by default; untick any to leave it out (e.g. export only your styles to share them).</li>
         <li>Click <strong>Export</strong>. A <code>textmylights-config-*.zip</code> downloads to your computer. Keep it somewhere safe.</li>
     </ol>
 
@@ -397,7 +401,7 @@ $fppTheme = tml_fpp_theme_help();
     <ol>
         <li>Install this plugin on the new Pi and open its Config UI.</li>
         <li>On the <em>Settings</em> tab, under <strong>Backup &amp; Restore</strong>, click <strong>⬆️ Import Config</strong> and choose the <code>.zip</code>.</li>
-        <li>Confirm the prompt. The plugin settings and block/word lists are restored; the page reloads with everything in place.</li>
+        <li>Confirm the prompt. Whatever the file contains is restored — plugin settings, phone blocklist, word lists and emoji blacklist replace this Pi's; saved text styles are merged into this Pi's. The page reloads with everything in place.</li>
         <li>Re-enter your <strong>Auth Token</strong> / <strong>App Password</strong> under <em>Message Source</em>, then test the connection.</li>
     </ol>
     <div class="note"><strong>Good to know:</strong> Import keeps the target Pi's own saved credentials — it never clears them. It also never touches FPP's own data: push your sequences/media with <strong>xLights FPP Connect</strong> and create the matching <strong>Pixel Overlay Model</strong> in FPP on the new Pi, so the names the settings reference resolve to real content there.</div>

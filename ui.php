@@ -97,9 +97,15 @@ $pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) :
         <h3>Export Config</h3>
         <p class="tml-sub">This exports only the plugin's <strong>own</strong> data. FPP's sequences, images, videos and the overlay model are not included (distribute sequences with xLights FPP Connect; set the overlay model in FPP). <strong>Credentials are never included.</strong></p>
         <label class="tml-opt"><input type="checkbox" id="tml-exp-settings" checked>
-            <span><strong>Plugin settings</strong><br><span class="tml-desc">Display lines, message rules, response text, filters, poll interval, and the selected content &amp; overlay model <em>names</em>.</span></span></label>
-        <label class="tml-opt"><input type="checkbox" id="tml-exp-lists" checked>
-            <span><strong>Blocked numbers &amp; word lists</strong><br><span class="tml-desc">Blocked phone numbers and your whitelist / blacklist words.</span></span></label>
+            <span><strong>Plugin settings</strong><br><span class="tml-desc">Display lines and text effects, message rules, response text, filters, poll interval, and the selected content &amp; overlay model <em>names</em>.</span></span></label>
+        <label class="tml-opt"><input type="checkbox" id="tml-exp-styles" checked>
+            <span><strong>Saved text styles</strong><br><span class="tml-desc">Your Quick Styles (My Styles) and saved colors. Merged on import &mdash; styles already on the other Pi are kept.</span></span></label>
+        <label class="tml-opt"><input type="checkbox" id="tml-exp-phones" checked>
+            <span><strong>Phone blocklist</strong><br><span class="tml-desc">Blocked phone numbers (only included when the list has numbers).</span></span></label>
+        <label class="tml-opt"><input type="checkbox" id="tml-exp-words" checked>
+            <span><strong>Word lists</strong><br><span class="tml-desc">Your name whitelist and profanity (word) blacklist.</span></span></label>
+        <label class="tml-opt"><input type="checkbox" id="tml-exp-emoji" checked>
+            <span><strong>Emoji blacklist</strong><br><span class="tml-desc">Emoji and combinations you added to, or removed from, the emoji blacklist.</span></span></label>
         <p class="tml-status" id="tml-exp-status"></p>
         <div class="tml-actions">
             <button type="button" id="tml-exp-cancel" class="tml-cancel" onclick="tmlHideExport()">Cancel</button>
@@ -112,7 +118,7 @@ $pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) :
 <div id="tml-import-modal" class="tml-modal" onclick="if(event.target===this)tmlHideImport()">
     <div class="tml-card">
         <h3>Import Config</h3>
-        <p class="tml-sub">Import <strong id="tml-imp-name">the selected file</strong>? This <strong>overwrites</strong> the plugin settings and block / whitelist on <strong>THIS Pi</strong>. FPP's sequences, media and overlay model are not touched. Your saved credentials are kept.</p>
+        <p class="tml-sub">Import <strong id="tml-imp-name">the selected file</strong>? This <strong>overwrites</strong> the plugin settings, phone blocklist, word lists and emoji blacklist on <strong>THIS Pi</strong> (for whatever the file contains). Saved text styles are <strong>merged</strong> &mdash; same-name styles are replaced, others are kept. FPP's sequences, media and overlay model are not touched. Your saved credentials are kept.</p>
         <p class="tml-status" id="tml-imp-status"></p>
         <div class="tml-actions">
             <button type="button" id="tml-imp-cancel" class="tml-cancel" onclick="tmlHideImport()">Cancel</button>
@@ -232,8 +238,9 @@ $pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) :
     function tmlDoExport() {
         if (_tmlExporting) return;
         function ck(id) { return document.getElementById(id).checked ? 1 : 0; }
-        var sel = { s: ck('tml-exp-settings'), l: ck('tml-exp-lists') };
-        if (!sel.s && !sel.l) { tmlToast('Select at least one thing to export.', 'warning'); return; }
+        var sel = { s: ck('tml-exp-settings'), st: ck('tml-exp-styles'), p: ck('tml-exp-phones'),
+                    w: ck('tml-exp-words'), e: ck('tml-exp-emoji') };
+        if (!sel.s && !sel.st && !sel.p && !sel.w && !sel.e) { tmlToast('Select at least one thing to export.', 'warning'); return; }
         _tmlExporting = true;
         var go = document.getElementById('tml-exp-go');
         go.disabled = true; go.textContent = 'Exporting...';
@@ -248,7 +255,8 @@ $pluginUrl = $proxyBase . ($fppTheme !== "" ? "&theme=" . urlencode($fppTheme) :
         // 500, or an error after streaming began would otherwise close the dialog silently.
         var token = 'dl' + Date.now() + '-' + Math.random().toString(36).slice(2);
         var url = TML_PROXY + encodeURIComponent('api/config/export')
-                + '&settings=' + sel.s + '&lists=' + sel.l
+                + '&settings=' + sel.s + '&styles=' + sel.st + '&phones=' + sel.p
+                + '&words=' + sel.w + '&emoji=' + sel.e
                 + '&dl_token=' + encodeURIComponent(token)
                 + '&_ts=' + Date.now();
         var dl = document.getElementById('tml-export-dl');

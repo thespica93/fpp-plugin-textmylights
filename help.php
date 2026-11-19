@@ -116,6 +116,8 @@ $fppTheme = tml_fpp_theme_help();
             <li><a href="#" class="tml-tab active" data-panel="twilio">📞 Twilio Configuration</a></li>
             <li><a href="#" class="tml-tab" data-panel="google-voice">🟢 Google Voice Configuration</a></li>
             <li><a href="#" class="tml-tab" data-panel="settings">⚙️ Plugin Settings</a></li>
+            <li><a href="#" class="tml-tab" data-panel="emoji">😀 Emoji in Names</a></li>
+            <li><a href="#" class="tml-tab" data-panel="multi-pi">🖥️ Master &amp; Remote Pis</a></li>
             <li><a href="#" class="tml-tab" data-panel="backup">💾 Backup &amp; Restore</a></li>
             <li><a href="#" class="tml-tab" data-panel="support">🆘 Support</a></li>
         </ul>
@@ -200,9 +202,10 @@ $fppTheme = tml_fpp_theme_help();
         <tr><td>Name Display Content</td><td><strong>Optional.</strong> Sequence(s) or image(s) played while a name is displayed. If empty, the name is rendered over the Waiting content, or over your scheduled show when no Waiting content is set.</td></tr>
         <tr><td>Overlay Model</td><td>The FPP overlay model the name text is drawn onto. Use a <strong>standard RGB matrix</strong> model — see the note below on supported layouts.</td></tr>
         <tr><td>Max messages / phone</td><td>Per-day rate limit per phone number (0 = unlimited).</td></tr>
-        <tr><td>Max message length</td><td>Longest name accepted, in characters.</td></tr>
+        <tr><td>Max message length</td><td>Longest name accepted, in characters. Each emoji counts as one character.</td></tr>
+        <tr><td>Allow Emoji in Names</td><td><strong>On by default.</strong> Keeps emoji in names (e.g. “Emma 🎄”) and draws them in color on the display. Off = emoji are removed and only the letters are shown. See <a href="#emoji">Emoji in Names</a>.</td></tr>
         <tr><td>Allow duplicate names</td><td>If off, the same name from the same number is only shown once per day.</td></tr>
-        <tr><td>Profanity filter</td><td>Rejects names containing blacklisted words.</td></tr>
+        <tr><td>Profanity filter</td><td>Rejects names containing blacklisted words <strong>or blacklisted emoji</strong> (Filters → <em>Manage Blacklist</em> / <em>Manage Emoji Blacklist</em>).</td></tr>
         <tr><td>Use whitelist</td><td>Only show names on your approved list.</td></tr>
     </table></div>
     <div class="note"><strong>Supported overlay layouts.</strong> The plugin draws names by writing the picture straight into the overlay model's memory, top-left to bottom-right. That only comes out right on a <strong>standard RGB matrix</strong>: <strong>3 channels per pixel (RGB, not RGBW)</strong>, laid out as a <strong>progressive</strong> grid — <strong>not serpentine / zig-zag</strong> — starting at the <strong>top-left</strong>. On those, text reads correctly. On a zig-zag, vertical, bottom-start, or RGBW model the output would come out scrambled, so the plugin <strong>detects a non-matching model and skips drawing</strong> rather than show garbage (it logs a warning naming the model). If your matrix is wired zig-zag, define the Pixel Overlay Model in FPP as a plain progressive RGB grid for the plugin to use. <em>(FPP&nbsp;10 adds an API that maps the data for any layout; a future release will use it to lift this restriction.)</em></div>
@@ -253,10 +256,15 @@ $fppTheme = tml_fpp_theme_help();
         <tr><td>Under rate limit</td><td>Reply: rate limited</td></tr>
         <tr><td>Valid name (1–2 words, letters)</td><td>Reply: invalid format</td></tr>
         <tr><td>Not a duplicate today</td><td>Reply: duplicate</td></tr>
-        <tr><td>Passes profanity filter <span style="color:#888;">(if on)</span></td><td>Reply: blocked</td></tr>
+        <tr><td>Passes profanity filter, including the emoji blacklist <span style="color:#888;">(if on)</span></td><td>Reply: profanity</td></tr>
         <tr><td>On whitelist <span style="color:#888;">(if on)</span></td><td>Reply: not on list</td></tr>
         <tr><td>✅ Added to display queue</td><td>Reply: success</td></tr>
     </table></div>
+    <div class="note">A text that is only emoji or a phone “reaction” (like 👍 or <em>Loved “…”</em>) is ignored — it is not a name, gets no reply, and is never shown.</div>
+
+    <h3 id="unfiltered">🧪 Testing tab &amp; admin phone skip every filter</h3>
+    <p>Names sent from the <strong>Testing</strong> tab, and names texted from the <strong>Admin Phone Number</strong> (Google Voice), go straight to the display queue. They skip <strong>all</strong> of the checks above: profanity and emoji blacklist, whitelist, phone blocklist, max length, word rules, duplicate check, and the per-phone daily limit. They don't count toward any limit or auto-block tally.</p>
+    <div class="warn"><strong>🔴 Profanity is allowed from the Testing tab and the admin phone.</strong> Anything typed there will be displayed, so only use them yourself. Names are still cleaned up the same way (symbols removed, Proper Case), and emoji follow the <em>Allow Emoji in Names</em> setting. Admin replies of <strong>Y</strong>/<strong>N</strong> and the word <strong>admin</strong> are still handled as approvals/connect, never displayed. The admin texting several names separated by commas or line breaks shows each one.</div>
 
     <h3 id="live-approval">🙋 Live Name Approval over text <span style="color:#888;font-weight:normal;">(Google Voice only)</span></h3>
     <p>With the whitelist <strong>on</strong>, a name that is not on the list is normally rejected. Live Name Approval lets you say "yes" from your phone instead: when a visitor texts a name you have not pre-approved, the plugin texts <strong>you</strong> the name and you reply <strong>Y</strong> to add it and show it, or <strong>N</strong> to deny it. It runs only while the show is live, and only for Google Voice. Leave the Admin Phone Number blank to turn it off.</p>
@@ -280,6 +288,73 @@ $fppTheme = tml_fpp_theme_help();
         <tr><td>(no reply in time)</td><td>—</td><td>The request expires after the <strong>Approval Timeout</strong> and the visitor gets the Not on Whitelist reply. If you reply <strong>Y</strong> later, the name is still added to the whitelist for next time, but it is <strong>not</strong> shown now.</td></tr>
     </table></div>
     <p>The approval prompt and the visitor-facing "please wait" message are editable on the <em>SMS Responses</em> tab, under the <strong>Not on Whitelist</strong> response (which is also what a denial sends).</p>
+    <div class="note">Names you text from the admin phone yourself are shown <strong>unfiltered</strong> — see <a href="#unfiltered">Testing tab &amp; admin phone skip every filter</a>.</div>
+    </section>
+
+    <!-- ================= EMOJI ================= -->
+    <section class="tml-panel" id="panel-emoji">
+    <h2 id="emoji">😀 Emoji in Names</h2>
+    <p>Visitors can include emoji with their name — “Emma 🎄”, “The Smiths 👨‍👩‍👧”, “Leo 🇺🇸” — and they are drawn on the display in full color. Turn this on or off with <strong>Allow Emoji in Names</strong> under <em>Settings → Message Settings</em> (on by default). With it off, emoji are simply removed and only the letters are shown.</p>
+
+    <h3>How emoji are counted</h3>
+    <div class="ref"><table>
+        <tr><th>Rule</th><th>Details</th></tr>
+        <tr><td>Length</td><td>Each emoji counts as <strong>one character</strong> toward Max Message Length — including combined emoji like 👨‍👩‍👧, flags 🇺🇸 and skin tones 👋🏽.</td></tr>
+        <tr><td>Word rules</td><td>An emoji on its own is not a word, so “Mary Jane 🎄” still passes <em>Two Words Maximum</em>.</td></tr>
+        <tr><td>Whitelist</td><td>Names are matched <strong>without</strong> their emoji, so “Emma 🎄” matches <em>emma</em> on the list. Admin-approved names are added without emoji.</td></tr>
+        <tr><td>Emoji only</td><td>A text with no letters (just 👍 or 🎄🎄) is ignored, the same as a phone reaction.</td></tr>
+        <tr><td>Color</td><td>Emoji keep their own colors; the line color only applies to the letters.</td></tr>
+    </table></div>
+
+    <h3 id="emoji-blacklist">Emoji Blacklist</h3>
+    <p>Some emoji are used as slang for sex, drugs, violence or hate. The <strong>Emoji Blacklist</strong> screens them as part of the <strong>profanity filter</strong>: a match gets the <strong>Profanity</strong> response and counts toward the daily auto-block tally, just like a blacklisted word. Open it from <em>Filters → 😶 Manage Emoji Blacklist</em>.</p>
+    <div class="ref"><table>
+        <tr><th>Entry type</th><th>Blocked when</th><th>Example</th></tr>
+        <tr><td>Single emoji</td><td>That emoji appears <strong>anywhere</strong> in the text</td><td>🖕 🍆 🔫</td></tr>
+        <tr><td>Combination</td><td><strong>All</strong> of its emoji appear in the same text, in any order</td><td>💦 👅 &nbsp;·&nbsp; ❄️ 👃 &nbsp;·&nbsp; 🍃 💨</td></tr>
+        <tr><td>Repeated emoji</td><td>That emoji appears at least that many times</td><td>6️⃣ 6️⃣ 6️⃣</td></tr>
+    </table></div>
+    <div class="note"><strong>Skin tones don't matter.</strong> Blocking 🖕 also blocks 🖕🏻 🖕🏽 🖕🏿, so one entry covers every tone. Many emoji are innocent on their own — especially at Christmas (❄️ ⛄ 🌲 🍬 🍪) — so the built-in list mostly blocks them only in <em>combinations</em>.</div>
+    <ul>
+        <li><strong>Built-in list.</strong> The plugin ships with a list of ~450 entries (sexual slang, rude gestures, drug codes, weapons/violence, and hate symbols), drawn from the DEA's emoji drug-code chart, parent-safety emoji guides, and the ADL's hate-symbol database. It is updated with the plugin.</li>
+        <li><strong>The full emoji list.</strong> The page shows every emoji iOS and Android support (the official Unicode list), searchable by name and grouped by category. Emoji already blocked are outlined in red; emoji that are part of a blocked combination have an orange dot.</li>
+        <li><strong>Add an entry.</strong> Tap emoji in the list (or paste them) to build an entry: one emoji is blocked on its own, two or more are blocked as a combination. Then click <strong>+ Add to Blacklist</strong>.</li>
+        <li><strong>Remove an entry.</strong> Click ✕ on it. Built-in entries you remove stay removed after plugin updates, and can be brought back from <em>Removed built-in entries</em> → <strong>Restore</strong>.</li>
+    </ul>
+    <div class="warn">The emoji blacklist only works while the <strong>Profanity Filter is on</strong>. It still rejects texts with blocked emoji when <em>Allow Emoji in Names</em> is off. Names from the Testing tab and the admin phone are <a href="#unfiltered">not screened</a>.</div>
+
+    <h3>Display requirements</h3>
+    <ul>
+        <li>Emoji are drawn with the <strong>Noto Color Emoji</strong> font, which the plugin installs automatically. If it couldn't be installed, names still show — just without their emoji. Reinstall the plugin to retry.</li>
+        <li>Emoji newer than the installed font are left off the display.</li>
+        <li>On some systems, combined emoji are drawn as their main emoji: 👨‍👩‍👧 shows as 👨, 🎅🏽 as 🎅, and 1️⃣ as 1. Flags may show as two letters (🇺🇸 as “US”).</li>
+        <li>Send “Emma 🎄” from the <strong>Testing</strong> tab to see how emoji look on your display.</li>
+    </ul>
+    </section>
+
+    <!-- ================= MASTER & REMOTE ================= -->
+    <section class="tml-panel" id="panel-multi-pi">
+    <h2 id="multi-pi">🖥️ Master &amp; Remote Pis</h2>
+    <p>With more than one projector, one Pi runs as the <strong>Master</strong> (it receives the texts and runs the show) and the others run as <strong>Remotes</strong> that display the same names at the same moment, each on its own overlay with its own text layout.</p>
+
+    <h3>Each Pi needs its own copy of the content</h3>
+    <p>The Master tells each Remote <em>which</em> content to play, but the sequence and image files themselves must already be on that Remote. Upload them in FPP's <strong>File Manager</strong> on each Pi (or let FPP MultiSync copy them). Config Export/Import does <strong>not</strong> carry sequences or images.</p>
+    <div class="note"><strong>If a Remote is missing a Name Display content</strong>, the show keeps running: that Remote shows the name over whatever it is currently displaying (usually its Waiting content), using its own text layout, for the Master's display time. With several Name Display contents in round-robin, only the turns that land on the missing content are affected. A Remote that is missing Waiting content keeps showing its current background. Each case is logged on that Pi.</div>
+
+    <h3 id="preview-pi">Previewing &amp; editing each Pi from the Master</h3>
+    <p>On the Master's <em>Display</em> tab, the <strong>“Which Pi are you previewing and editing?”</strong> dropdown (under Background Preview) chooses which device the preview shows and where text changes are saved:</p>
+    <div class="ref"><table>
+        <tr><th>Choice</th><th>Preview shows</th><th>Text changes save to</th></tr>
+        <tr><td><strong>This Pi (master)</strong></td><td>The Master's own overlay and background</td><td>The Master</td></tr>
+        <tr><td><strong>Remote Pi: <em>name</em></strong></td><td>That Remote's overlay, at its real size, with its own background frames and text layout</td><td>That Remote</td></tr>
+    </table></div>
+    <ul>
+        <li>The dropdown appears when Remotes are connected (or when this Pi has no overlay). The note under it says which Pi you're working on.</li>
+        <li><strong>This Pi has no overlay model:</strong> “This Pi” is listed as <em>no overlay selected</em> and the preview starts on the largest Remote. Choosing This Pi shows a message to select an overlay model in FPP Display Settings, or switch to a Remote Pi to configure it; text editing is greyed out until then.</li>
+        <li><strong>While previewing a Remote,</strong> the content dropdown lists only the content that Remote has. If the content you were on isn't there, the preview switches to one it has and the note says so.</li>
+        <li><strong>The Remote has none of your Name Display content:</strong> the background and the text editor are greyed out — there's nothing on that Pi to preview or edit. Add the sequence on that Pi; the preview unlocks within a few seconds.</li>
+        <li>Edits made on a Remote's own Config page show up in the Master's preview automatically.</li>
+    </ul>
     </section>
 
     <!-- ================= BACKUP & RESTORE ================= -->
@@ -295,7 +370,7 @@ $fppTheme = tml_fpp_theme_help();
     <div class="ref"><table>
         <tr><th>Included</th><th>Details</th></tr>
         <tr><td>Plugin settings</td><td>Everything in <code>plugin.json</code> — display lines, message rules, response text, filters, poll interval, and the <em>names</em> of the selected content / overlay model. (Your Twilio Account SID, phone number, and Gmail address come along; the auth token / app password do <strong>not</strong>.)</td></tr>
-        <tr><td>Block &amp; name lists</td><td>Blocked phone numbers, and your whitelist / blacklist word files.</td></tr>
+        <tr><td>Block &amp; name lists</td><td>Blocked phone numbers, your whitelist / blacklist word files, and your emoji blacklist additions/removals.</td></tr>
     </table></div>
 
     <h3>Export</h3>

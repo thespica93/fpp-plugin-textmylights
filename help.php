@@ -242,12 +242,13 @@ $fppTheme = tml_fpp_theme_help();
             <strong>Shadow</strong> (down and to the right: Small, Medium, Large),
             <strong>Glow</strong> (a soft halo: Soft, Medium, Strong), and
             <strong>Gradient</strong> (the letters shade from the line color at the top to a second color at the bottom).
-            <strong>Quick style</strong> applies a ready-made look in one click — Bubble, Sticker, Neon, Gold, Candy Cane, Frosty (some also set the text color); every effect stays editable afterwards.
+            <strong>Quick style</strong> applies a ready-made look in one click — Bubble, Sticker, Neon, Gold, Candy Cane, Frosty (some also set the text color); every effect stays editable afterwards. The menu always shows the line's current look: <strong>None</strong> when no effects are on (choose it to clear them all), the style's name while the effects match it, and <strong>Custom</strong> once you change any effect yourself.
             Effects scale with the text and are counted inside the line's box, so the text shrinks slightly to make room. Layered back to front: glow, shadow, 2nd outline, outline, letters. Pure black is drawn as near-black, because FPP treats black overlay pixels as see-through. Emoji keep their own colors and aren't outlined.</td></tr>
         <tr><td>Overlapping lines</td><td>Line boxes may overlap. Lines are layered in order (Line 1 at the back, Line 4 in front), exactly as the preview shows — no line blacks out another.</td></tr>
         <tr><td>Movement &amp; Speed</td><td>Center (static) or scroll, with a speed for scrolling lines.</td></tr>
-        <tr><td>Display Duration</td><td>How many seconds each name stays on screen.</td></tr>
+        <tr><td>Display Duration</td><td>How many seconds each name stays on screen. Set on the <strong>Master</strong> per Name Display content; every Pi uses it (see <a href="#preview-pi">Master &amp; Remote Pis</a>).</td></tr>
     </table></div>
+    <div class="note"><strong>Glow and soft edges on the matrix.</strong> FPP's overlay can't be partly see-through — a pixel either shows the sequence underneath (pure black) or is drawn solid. So over a <strong>sequence</strong>, the fading part of a <strong>glow</strong> and the smooth edges of letters are drawn as a fine dot pattern: each pixel is either fully lit in the effect's color or left see-through, in proportion to how faded it is. On an LED matrix this reads as a soft glow blending into your sequence (instead of a dark ring around the text). The Display-tab preview shows the smooth version. Over an <strong>image</strong> background the plugin blends the image itself, so glows fade smoothly there. Effects set to a dark color (e.g. the shadow in <em>Bubble</em> or the 2nd outline in <em>Sticker</em>) still show dark, as chosen.</div>
     <div class="note"><strong>Background preview on small boards.</strong> The Display tab shows your sequence or image <em>behind</em> the text so you can see how the names will land. Drawing that background frame uses extra memory, so on boards with <strong>less than 1&nbsp;GB of RAM</strong> (e.g. a Pi Zero or BeagleBone Black) it is turned off automatically — the preview area stays blank and the plugin protects your show from running out of memory mid-display. <strong>You can still position and style the text as normal:</strong> the text boxes, movement, color, and font all work exactly the same; only the picture behind them is hidden. On a 1&nbsp;GB+ board (Pi&nbsp;3/4/5) the background preview appears automatically.</div>
 
     <h3>SMS Responses tab</h3>
@@ -363,6 +364,8 @@ $fppTheme = tml_fpp_theme_help();
         <li><strong>While previewing a Remote,</strong> the content dropdown lists only the content that Remote has. If the content you were on isn't there, the preview switches to one it has and the note says so.</li>
         <li><strong>The Remote has none of your Name Display content:</strong> the background and the text editor are greyed out — there's nothing on that Pi to preview or edit. Add the sequence on that Pi; the preview unlocks within a few seconds.</li>
         <li>Edits made on a Remote's own Config page show up in the Master's preview automatically.</li>
+        <li><strong>Display Duration is always the Master's.</strong> The Master starts and stops every name on every Pi, so while previewing a Remote the Display Duration box shows — and changes — the Master's duration for that content, labelled <em>“set on this Master, applies to every Pi”</em>. A Remote's own Config page shows the duration as controlled by the Master.</li>
+        <li>Text effects (outline, shadow, glow, gradient, quick styles) are saved per Pi, so each projector can have its own look; set them for a Remote by previewing it from the Master or on its own Config page.</li>
     </ul>
     </section>
 

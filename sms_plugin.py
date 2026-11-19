@@ -2044,6 +2044,39 @@ def _paste_rgba(img, src, xy):
     else:
         img.paste(src.convert(img.mode), (x, y), src)
 
+_overlay_dither_cache = {}
+
+def _overlay_flatten(img):
+    """Turn a transparent RGBA text canvas into the RGB frame FPP's overlay expects. The
+    overlay has NO partial transparency - a pure black pixel is see-through, anything else is
+    drawn solid - so a soft edge or glow fading to black would show as a dark ring over the
+    sequence. Instead each partly-transparent pixel is ordered-dithered: drawn at full strength
+    in its own color, or left see-through, in proportion to its alpha. On an LED matrix the
+    pattern reads as a soft fade blending into whatever is underneath. Opaque pixels darker
+    than near-black are lifted to it so they never turn see-through."""
+    from PIL import ImageChops
+    w, h = img.size
+    cached = _overlay_dither_cache.get((w, h))
+    if cached is None:
+        bayer = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]   # 4x4 ordered-dither matrix
+        tile = Image.new('L', (4, 4))
+        tile.putdata([int((v + 0.5) * 16) for v in bayer])               # thresholds 8..248
+        thresh = Image.new('L', (w, h))
+        for ty in range(0, h, 4):
+            for tx in range(0, w, 4):
+                thresh.paste(tile, (tx, ty))
+        if len(_overlay_dither_cache) > 8:
+            _overlay_dither_cache.clear()
+        cached = (thresh, Image.new('RGB', (w, h), (17, 17, 17)))
+        _overlay_dither_cache[(w, h)] = cached
+    thresh, floor = cached
+    r, g, b, a = img.split()
+    on = ImageChops.subtract(a, thresh).point(lambda v: 255 if v > 0 else 0)
+    rgb = ImageChops.lighter(Image.merge('RGB', (r, g, b)), floor)
+    out = Image.new('RGB', (w, h), (0, 0, 0))
+    out.paste(rgb, (0, 0), on)
+    return out
+
 def _draw_text_layer(img, xy, text, fill, font, stroke=0, stroke_fill=None, emoji=True):
     """One pass of text (letters in `fill`, optional stroke), emoji-aware. emoji=False skips
     the emoji (used for the shadow pass, which only shadows the letters)."""
@@ -2326,7 +2359,9 @@ def render_to_shm(line_items, model_name, width, height):
     if not _shm_layout_ok(model_name, width, height):
         return False
     try:
-        img = Image.new('RGB', (width, height), (0, 0, 0))
+        # Compose on a TRANSPARENT canvas, then _overlay_flatten - so glows and soft edges are
+        # dithered into the sequence underneath instead of fading to a dark halo.
+        img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
 
         for _li in line_items:
             text, box_x, box_y, box_w, box_h, color_hex, font_name, orientation = _li[:8]
@@ -2343,10 +2378,11 @@ def render_to_shm(line_items, model_name, width, height):
                 logging.info(f"🅰️ TEXTPOS model={width}x{height} box=(x{box_x},y{box_y},w{box_w},h{box_h}) "
                              f"font={font_name!r} text={text!r} rendered_text={sw}x{sh} "
                              f"draw=(x{draw_x},y{draw_y}) orient={orientation}")
-                # Transparent strip, alpha-pasted: lines layer in order like the preview, so
-                # an overlapping box never blacks out another line's letters.
-                img.paste(strip, (draw_x, draw_y), strip)
+                # Transparent strip, alpha-composited: lines layer in order like the preview,
+                # so an overlapping box never blacks out another line's letters.
+                _paste_rgba(img, strip, (draw_x, draw_y))
 
+        img = _overlay_flatten(img)
         shm_path = f"/dev/shm/FPP-Model-Data-{model_name}"
         raw = img.tobytes()
         expected = width * height * 3
@@ -2653,7 +2689,9 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
                 logging.warning(f"animate bg image load failed ({bg_image_path}): {ex}")
                 base_frame = None
         if base_frame is None:
-            base_frame = Image.new('RGB', (width, height), (0, 0, 0))
+            # No image: compose on a transparent canvas and _overlay_flatten each frame (glow /
+            # soft edges dither into the sequence instead of fading to a dark halo).
+            base_frame = Image.new('RGBA', (width, height), (0, 0, 0, 0))
 
         def _clip_paste(frame, strip, src_x, src_y, dst_x, dst_y, vis_w, vis_h, clip):
             # Intersect the paste rect with the line's own box, so scrolling text is only
@@ -2666,8 +2704,7 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
                 return
             crop_x0, crop_y0 = src_x + (x0 - dst_x), src_y + (y0 - dst_y)
             crop_box = (crop_x0, crop_y0, crop_x0 + (x1 - x0), crop_y0 + (y1 - y0))
-            piece = strip.crop(crop_box)
-            frame.paste(piece, (x0, y0), piece)
+            _paste_rgba(frame, strip.crop(crop_box), (x0, y0))
 
         def _pos_at(e, t):
             # Closed-form scroll position at elapsed time `t` (seconds). Motion is a pure
@@ -2718,7 +2755,9 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
                             if vis_h > 0:
                                 _clip_paste(frame, e['strip'], 0, src_y, e['dx'], dst_y, e['tw'], vis_h, e['clip'])
                         else:
-                            frame.paste(e['strip'], (e['dx'], e['dy']), e['strip'])
+                            _paste_rgba(frame, e['strip'], (e['dx'], e['dy']))
+                    if frame.mode == 'RGBA':
+                        frame = _overlay_flatten(frame)
                     try:
                         buf = frame.tobytes()
                         shm.seek(0)
@@ -9162,7 +9201,7 @@ def index():
                 // Quick styles set several effects at once (and the text color where the look
                 // depends on it). Each stays fully editable afterwards.
                 var _FX_STYLES = {
-                    plain:   {label: 'Plain', fx: {}},
+                    none:    {label: 'None', fx: {}},
                     bubble:  {label: 'Bubble', fx: {outline: 20, outline_color: '#FFFFFF', shadow: 10, shadow_color: '#111111'}},
                     sticker: {label: 'Sticker', fx: {outline: 8, outline_color: '#FFFFFF', outline2: 8, outline2_color: '#111111'}},
                     neon:    {label: 'Neon', color: '#FFFFFF', fx: {outline: 4, outline_color: '#00E5FF', glow: 25, glow_color: '#00E5FF'}},
@@ -9189,7 +9228,13 @@ def index():
                         g('gradient').checked = !!fx.gradient;
                         g('gradient_color').value = fx.gradient_color;
                         g('gradient_color').style.opacity = fx.gradient ? '1' : '0.35';
-                        g('style').value = '';
+                        // Show the quick style these effects match (None = no effects), or Custom
+                        // once any effect was changed from the preset.
+                        var cur = JSON.stringify(fx), match = 'custom';
+                        Object.keys(_FX_STYLES).forEach(function(k) {
+                            if (JSON.stringify(window._normLineEffects([_FX_STYLES[k].fx])[0]) === cur) match = k;
+                        });
+                        g('style').value = match;
                     }
                 };
                 window.onLineEffectChange = function(i) {
@@ -9224,8 +9269,9 @@ def index():
                             '<select id="line_' + _n + '_' + k + '" ' + _ch + ' style="flex:0 1 auto; min-width:84px;" title="' + title + '"></select>' +
                             '<input type="color" id="line_' + _n + '_' + k + '_color" class="line-color-swatch" title="' + label + ' color" ' + _ch + '>';
                     };
-                    var _styleOpts = '<option value="">Choose…</option>' + Object.keys(_FX_STYLES).map(function(k){
-                        return '<option value="' + k + '">' + _FX_STYLES[k].label + '</option>'; }).join('');
+                    var _styleOpts = Object.keys(_FX_STYLES).map(function(k){
+                        return '<option value="' + k + '">' + _FX_STYLES[k].label + '</option>'; }).join('') +
+                        '<option value="custom" disabled>Custom</option>';
                     var _row1 = document.createElement('div');
                     _row1.className = 'line-movement-row';
                     _row1.innerHTML = '<div class="line-group-controls">' +

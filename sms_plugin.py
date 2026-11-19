@@ -8675,7 +8675,9 @@ def index():
                         if (!window._editTarget || window._editTarget.address !== _tgtAddr) return;
                         if (typeof window.loadBgPreview === 'function') window.loadBgPreview();
                         _tries++;
-                        var _haveContent = (typeof getConfiguredContent === 'function') && !!getConfiguredContent();
+                        // (getConfiguredContent lives in the preview block's own scope - reach it via
+                        // window, or this check is always false and the background reloads 6 times.)
+                        var _haveContent = (typeof window.getConfiguredContent === 'function') && !!window.getConfiguredContent();
                         if (_tries < 6 && !_haveContent) setTimeout(_paintRemoteBg, 400);
                     }
                     _paintRemoteBg();
@@ -10639,6 +10641,8 @@ def index():
                         fetch(_seqInfoUrl)
                             .then(function(r) { return r.json(); })
                             .then(function(data) {
+                                // Content or Pi changed while this was in flight - ignore it.
+                                if (_bgKey !== window._bgKey) return;
                                 if (data.error) {
                                     loadEl.textContent = '\u2717 ' + data.error;
                                     loadEl.style.color = '#f44336';
@@ -10798,6 +10802,8 @@ def index():
                     };
                     img.src = window.tmlUrl(url);
                 }
+
+                window.getConfiguredContent = getConfiguredContent;
 
                 window.fseqScrub = function(seconds) {
                     // Drives the scrolling-text preview too (see renderCanvasPreview) --
@@ -14782,7 +14788,16 @@ def api_tml_remote_frame():
     try:
         r = requests.get(f"{base}/api/tml/render-frame", params=params, timeout=8)
         if r.status_code != 200:
-            return jsonify({"error": f"remote render failed ({r.status_code})"}), 502
+            # Pass the remote's own reason through (e.g. "Sequence not found: X.fseq") - a bare
+            # status code hides whether the file, the overlay, or the route is the problem.
+            try:
+                why = (r.json() or {}).get('error') or ''
+            except Exception:
+                why = ''
+            if not why and r.status_code == 404:
+                why = 'the remote has no frame-render endpoint - update the plugin on that Pi'
+            logging.info(f"🖼️ remote-frame {addr} {params} -> {r.status_code} {why}")
+            return jsonify({"error": f"remote render failed ({r.status_code})" + (f": {why}" if why else "")}), 502
         return Response(r.content, mimetype=r.headers.get('Content-Type', 'image/png'),
                         headers={'Cache-Control': 'no-store'})
     except Exception as e:

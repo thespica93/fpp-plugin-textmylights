@@ -6720,7 +6720,7 @@ def index():
                         </select>
 
                         <div id="remote_mode_note" style="display:none; background:var(--note-bg); border:1px solid #90caf9; color:var(--note-fg); border-radius:5px; padding:8px 12px; margin-top:10px; font-size:13px;">
-                            ℹ️ <strong>Remote mode:</strong> the Master's content must also exist on this remote - recommend using <strong>Config → Export/Import</strong>.
+                            ℹ️ <strong>Remote mode:</strong> the Master's sequences and images must also be on this Pi - upload them in FPP's <strong>File Manager</strong> (or let FPP MultiSync copy them). Content missing here is skipped: names still show, over this Pi's current background.
                         </div>
                         <div id="master_sync_box" style="display:none; margin-top:12px;">
                             <label style="display:flex; align-items:center; gap:8px;">🔗 Sync from Plugin Master
@@ -8659,7 +8659,8 @@ def index():
                     var _from = window._remoteSwitchedFrom;
                     window._remoteSwitchedFrom = null;
                     if (note) note.textContent = d.found
-                        ? ((_from ? ('Remote Pi “' + t.name + '” doesn’t have ' + _from + ', so the preview switched to content it does have. ') : '')
+                        ? ((_from ? ('Remote Pi “' + t.name + '” doesn’t have ' + _from + ', so the preview switched to '
+                                     + (content || 'content it does have') + '. ') : '')
                            + 'Previewing remote Pi “' + t.name + '”. Text changes save to that Pi.')
                         : ('Remote Pi “' + t.name + '” doesn’t have this content' + ((d.contents && !d.contents.length) ? ' (or any of your Name Display content)' : '')
                            + ', so there’s nothing to preview or edit for it here — add the sequence on that Pi first. Text editing is disabled until then.');
@@ -9957,7 +9958,9 @@ def index():
                         }
                     }
                     var prow=document.getElementById('preview_content_row');
-                    if (prow) prow.style.display=rc ? ((shown!==1)?'block':'none') : ((lst.length>1)?'block':'none');
+                    // On a remote, always show it (even with one option) so it's clear which
+                    // content is being previewed - it may differ from the one picked on this Pi.
+                    if (prow) prow.style.display=rc ? 'block' : ((lst.length>1)?'block':'none');
                     var scope=document.getElementById('content_duration_scope');
                     if (scope) scope.textContent=(lst.length>0)?('- for content '+(window._namesSelectedIndex+1)):'- shown over waiting content';
                 }
@@ -10564,12 +10567,23 @@ def index():
                     // and leave the greyed-out blank - the note above says why.
                     if (window._previewRemote && window._remoteContentMissing) {
                         window._fseqBgImage = null;
+                        window._bgKey = null;
                         _fseqSeq = null;
                         loadEl.textContent = '';
                         var _srm = document.getElementById('fseq_scrubber_row'); if (_srm) _srm.style.display = 'none';
                         if (scrubHint) scrubHint.style.display = 'none';
                         if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
                         return;
+                    }
+
+                    // New content or a different Pi: drop the old frame right away, so the preview
+                    // never keeps showing the previous content's background while the new one loads
+                    // (or if it fails to load).
+                    var _bgKey = (window._previewRemote ? window._previewRemote.address : '') + '|' + ct.type + ':' + ct.file;
+                    if (_bgKey !== window._bgKey) {
+                        window._fseqBgImage = null;
+                        window._bgKey = _bgKey;
+                        if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
                     }
 
                     _contentType = ct.type;
@@ -10771,6 +10785,9 @@ def index():
                     };
                     img.onerror = function() {
                         if (img !== _pendingImg) return;
+                        // Don't leave an older content's frame up behind a failed load.
+                        window._fseqBgImage = null;
+                        if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
                         fetch(url).then(function(r) { return r.json(); }).then(function(d) {   // fetch shim rewrites url
                             statusEl.textContent = '\u2717 ' + (d.error || 'Failed to load frame');
                             statusEl.style.color = '#f44336';

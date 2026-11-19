@@ -236,6 +236,15 @@ $fppTheme = tml_fpp_theme_help();
         <tr><td>Message Lines</td><td>Up to 4 lines of text; use <code>{name}</code> where the visitor's name should appear.</td></tr>
         <tr><td>Line Box / Position</td><td>Area each line renders into. Font size auto-fits the box; position can be centered or fixed.</td></tr>
         <tr><td>Color &amp; Font</td><td>Per-line text color and font.</td></tr>
+        <tr><td>Text effects</td><td>Per-line effects, each in its own color:
+            <strong>Outline</strong> (Thin, Medium, Thick, or <strong>Bubble</strong> — a fat wrap-around border),
+            <strong>2nd Outline</strong> (a second border outside the first),
+            <strong>Shadow</strong> (down and to the right: Small, Medium, Large),
+            <strong>Glow</strong> (a soft halo: Soft, Medium, Strong), and
+            <strong>Gradient</strong> (the letters shade from the line color at the top to a second color at the bottom).
+            <strong>Quick style</strong> applies a ready-made look in one click — Bubble, Sticker, Neon, Gold, Candy Cane, Frosty (some also set the text color); every effect stays editable afterwards.
+            Effects scale with the text and are counted inside the line's box, so the text shrinks slightly to make room. Layered back to front: glow, shadow, 2nd outline, outline, letters. Pure black is drawn as near-black, because FPP treats black overlay pixels as see-through. Emoji keep their own colors and aren't outlined.</td></tr>
+        <tr><td>Overlapping lines</td><td>Line boxes may overlap. Lines are layered in order (Line 1 at the back, Line 4 in front), exactly as the preview shows — no line blacks out another.</td></tr>
         <tr><td>Movement &amp; Speed</td><td>Center (static) or scroll, with a speed for scrolling lines.</td></tr>
         <tr><td>Display Duration</td><td>How many seconds each name stays on screen.</td></tr>
     </table></div>

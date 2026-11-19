@@ -432,6 +432,16 @@ _FPP_DATA_CACHE_TTL = 60  # seconds
 FPP_HOST = 'http://127.0.0.1'
 
 # Default configuration
+# Per-line text effect defaults: everything off. outline / outline2 / shadow / glow are sizes in
+# percent of the line's fitted font size (0 = off): outline2 is a second border outside the first,
+# the shadow falls down-right, the glow is a soft blurred halo. gradient = 1 shades the letters
+# from the line's own color (top) to gradient_color (bottom).
+LINE_EFFECT_DEFAULT = {"outline": 0, "outline_color": "#FFFFFF",
+                       "outline2": 0, "outline2_color": "#111111",
+                       "shadow": 0, "shadow_color": "#111111",
+                       "glow": 0, "glow_color": "#FFD700",
+                       "gradient": 0, "gradient_color": "#FFFFFF"}
+
 DEFAULT_CONFIG = {
     "enabled": False,
     # Multi-instance role (independent of FPP's own player/remote mode). "" = not yet
@@ -518,6 +528,9 @@ DEFAULT_CONFIG = {
     # 'horizontal'. 'vertical_rotated' = whole line rotated 90deg; 'vertical_stacked' =
     # one upright character per row.
     "line_orientations": ["horizontal", "horizontal", "horizontal", "horizontal"],
+    # Per-line text effects (see LINE_EFFECT_DEFAULT): outline and drop shadow, each with its
+    # own color. Sizes are a percent of the fitted font size so they scale with auto-fit.
+    "line_effects": [dict(LINE_EFFECT_DEFAULT) for _ in range(4)],
     "custom_colors": [],
     "scroll_speed": 5,
     "overlay_model_width": 0,
@@ -1392,6 +1405,27 @@ def master_beacon():
         time.sleep(BEACON_INTERVAL)
 
 
+def _sanitize_line_effects(raw):
+    """Exactly 4 per-line effect dicts with clamped sizes and valid '#RRGGBB' colors - never
+    trusts what a client or an old config sends."""
+    out = []
+    for fx in _coerce_len(raw, 4, None):
+        d = dict(LINE_EFFECT_DEFAULT)
+        if isinstance(fx, dict):
+            for k in ('outline', 'outline2', 'shadow', 'glow'):
+                try:
+                    d[k] = max(0, min(40, int(fx.get(k, 0) or 0)))
+                except (TypeError, ValueError):
+                    pass
+            d['gradient'] = 1 if fx.get('gradient') in (1, True, '1', 'true', 'on') else 0
+            for k in ('outline_color', 'outline2_color', 'shadow_color', 'glow_color', 'gradient_color'):
+                c = str(fx.get(k, '') or '')
+                if re.fullmatch(r'#[0-9A-Fa-f]{6}', c):
+                    d[k] = c.upper()
+        out.append(d)
+    return out
+
+
 def _coerce_len(seq, n, fill):
     """Return a list of exactly n items from seq, truncating or padding with `fill`
     (dicts are copied so padded entries never share a reference)."""
@@ -1414,6 +1448,7 @@ def _names_item_defaults():
         "line_speeds": [50, 50, 50, 50],
         "line_fonts": ["FreeSans", "FreeSans", "FreeSans", "FreeSans"],
         "line_orientations": ["horizontal", "horizontal", "horizontal", "horizontal"],
+        "line_effects": [dict(LINE_EFFECT_DEFAULT) for _ in range(4)],
     }
 
 
@@ -1434,6 +1469,7 @@ def _names_item_from_flat_config():
     item["line_speeds"]       = _coerce_len(config.get("line_speeds", []), 4, 50)
     item["line_fonts"]        = _coerce_len(config.get("line_fonts", []), 4, "FreeSans")
     item["line_orientations"] = _coerce_len(config.get("line_orientations", []), 4, "horizontal")
+    item["line_effects"]      = _sanitize_line_effects(config.get("line_effects", []))
     return item
 
 
@@ -1455,6 +1491,7 @@ def _sanitize_names_item(raw):
     d["line_speeds"]       = _coerce_len(raw.get("line_speeds", []), 4, 50)
     d["line_fonts"]        = _coerce_len(raw.get("line_fonts", []), 4, "FreeSans")
     d["line_orientations"] = _coerce_len(raw.get("line_orientations", []), 4, "horizontal")
+    d["line_effects"]      = _sanitize_line_effects(raw.get("line_effects", []))
     return d
 
 
@@ -1948,23 +1985,79 @@ def _layout_mixed(text, font):
         return pieces, (0, 0, 0, 0)
     return pieces, (int(x0), int(y0), int(round(x1)), int(round(y1)))
 
-def _text_bbox(draw, text, font):
-    """draw.textbbox((0, 0), text, font=font), emoji-aware."""
-    if not text or not _emoji_re().search(text):
-        return draw.textbbox((0, 0), text, font=font)
-    return _layout_mixed(text, font)[1]
+def _fx_px(fx, font):
+    """A line's effects in pixels at this font size, or None when it has none. Sizes are a
+    percent of the font size (min 1px when on), so they scale with auto-fit:
+      t = total border (outline + outline2), o1 = inner outline, g = glow radius, s = shadow.
+    The padding the effects need around the letters is t+g on the left/top and t+max(g, s)
+    on the right/bottom. Pure black is nudged to near-black because FPP treats black overlay
+    pixels as see-through - a black outline/shadow would vanish over a sequence."""
+    if not fx:
+        return None
+    size = getattr(font, 'size', 10) or 10
+    def _px(pct):
+        try:
+            pct = int(pct or 0)
+        except (TypeError, ValueError):
+            return 0
+        return max(1, round(size * pct / 100.0)) if pct > 0 else 0
+    def _rgb(c, default):
+        try:
+            r, g, b = _hex_to_rgb(c or default)
+        except Exception:
+            r, g, b = _hex_to_rgb(default)
+        return (17, 17, 17) if max(r, g, b) < 17 else (r, g, b)
+    o1, o2 = _px(fx.get('outline')), _px(fx.get('outline2'))
+    p = {'o1': o1, 't': o1 + o2, 's': _px(fx.get('shadow')), 'g': _px(fx.get('glow')),
+         'grad': bool(fx.get('gradient')),
+         'oc': _rgb(fx.get('outline_color'), '#FFFFFF'), 'o2c': _rgb(fx.get('outline2_color'), '#111111'),
+         'sc': _rgb(fx.get('shadow_color'), '#111111'), 'gc': _rgb(fx.get('glow_color'), '#FFD700'),
+         'grc': _rgb(fx.get('gradient_color'), '#FFFFFF')}
+    if not (p['t'] or p['s'] or p['g'] or p['grad']):
+        return None
+    return p
 
-def _draw_text(img, xy, text, fill, font):
-    """ImageDraw.Draw(img).text(xy, text, fill=fill, font=font), emoji-aware (emoji are
-    pasted in their own colors, alpha-blended onto img)."""
-    draw = ImageDraw.Draw(img)
+def _text_bbox(draw, text, font, fx=None):
+    """draw.textbbox((0, 0), text, font=font), emoji-aware, grown to include the line's
+    effects (outlines and glow on every side, shadow down-right), so fitting keeps them
+    inside the box."""
+    p = _fx_px(fx, font)
+    t = p['t'] if p else 0
     if not text or not _emoji_re().search(text):
-        draw.text(xy, text, fill=fill, font=font)
+        bb = draw.textbbox((0, 0), text, font=font, stroke_width=t)
+    else:
+        bb = _layout_mixed(text, font)[1]
+        bb = (bb[0] - t, bb[1] - t, bb[2] + t, bb[3] + t)
+    if p and (p['g'] or p['s']):
+        g, far = p['g'], max(p['g'], p['s'])
+        bb = (bb[0] - g, bb[1] - g, bb[2] + far, bb[3] + far)
+    return bb
+
+def _paste_rgba(img, src, xy):
+    """Alpha-blend an RGBA image onto img at xy (any mode, any position - clipped)."""
+    x, y = int(round(xy[0])), int(round(xy[1]))
+    if img.mode == 'RGBA':
+        l, t = max(0, x), max(0, y)
+        r, b = min(img.width, x + src.width), min(img.height, y + src.height)
+        if r > l and b > t:
+            img.alpha_composite(src.crop((l - x, t - y, r - x, b - y)), (l, t))
+    else:
+        img.paste(src.convert(img.mode), (x, y), src)
+
+def _draw_text_layer(img, xy, text, fill, font, stroke=0, stroke_fill=None, emoji=True):
+    """One pass of text (letters in `fill`, optional stroke), emoji-aware. emoji=False skips
+    the emoji (used for the shadow pass, which only shadows the letters)."""
+    draw = ImageDraw.Draw(img)
+    kw = {'stroke_width': stroke, 'stroke_fill': stroke_fill} if stroke else {}
+    if not text or not _emoji_re().search(text):
+        draw.text(xy, text, fill=fill, font=font, **kw)
         return
     ox, oy = xy
     for p in _layout_mixed(text, font)[0]:
         if p[0] == 't':
-            draw.text((ox + p[1], oy), p[2], fill=fill, font=font)
+            draw.text((ox + p[1], oy), p[2], fill=fill, font=font, **kw)
+            continue
+        if not emoji:
             continue
         _, ex, ey, ew, eh, cluster = p
         key = (cluster, ew, eh)
@@ -1974,10 +2067,55 @@ def _draw_text(img, xy, text, fill, font):
             if len(_emoji_scaled_cache) > 256:
                 _emoji_scaled_cache.clear()
             _emoji_scaled_cache[key] = scaled
-        img.paste(scaled.convert(img.mode) if img.mode != 'RGBA' else scaled,
-                  (int(round(ox + ex)), int(round(oy + ey))), scaled)
+        _paste_rgba(img, scaled, (ox + ex, oy + ey))
 
-def _fit_text_to_box(draw, text, font_name, box_w, box_h, min_size=6, max_size=None):
+def _text_mask(img, xy, text, font, stroke=0):
+    """An 'L' coverage mask (img-sized) of the letters at xy, with an optional stroke."""
+    from PIL import Image as _I
+    m = _I.new('L', img.size, 0)
+    _draw_text_layer(m, xy, text, 255, font, stroke, 255 if stroke else None, emoji=False)
+    return m
+
+def _draw_text(img, xy, text, fill, font, fx=None):
+    """ImageDraw.Draw(img).text(xy, text, fill=fill, font=font), emoji-aware, with the line's
+    effects layered back to front: glow (blurred halo), drop shadow (the full outlined
+    silhouette, offset down-right), 2nd outline, outline, then the letters - solid, or a
+    top-to-bottom gradient. Emoji keep their own colors. Glow and gradient need an RGBA
+    target (all text strips are)."""
+    p = _fx_px(fx, font)
+    if not p:
+        _draw_text_layer(img, xy, text, fill, font)
+        return
+    t, o1 = p['t'], p['o1']
+    rgba = img.mode == 'RGBA'
+    if p['g'] and rgba:
+        from PIL import Image as _I, ImageFilter
+        halo = _text_mask(img, xy, text, font, t).filter(ImageFilter.GaussianBlur(max(1, p['g'] / 2.0)))
+        halo = halo.point(lambda v: min(255, v * 2))      # stronger, so the glow reads on LEDs
+        layer = _I.new('RGBA', img.size, p['gc'] + (0,))
+        layer.putalpha(halo)
+        img.alpha_composite(layer)
+    if p['s']:
+        sxy = (xy[0] + p['s'], xy[1] + p['s'])
+        _draw_text_layer(img, sxy, text, p['sc'], font, t, p['sc'] if t else None, emoji=False)
+    if t > o1:   # 2nd outline: the full-width border in its color, under the inner outline
+        _draw_text_layer(img, xy, text, p['o2c'], font, t, p['o2c'], emoji=False)
+    _draw_text_layer(img, xy, text, fill, font, o1, p['oc'] if o1 else None)
+    if p['grad'] and rgba:
+        # Gradient over the letters only (not the outline or emoji), top = the line's color.
+        from PIL import Image as _I
+        bb = _text_bbox(ImageDraw.Draw(img), text, font)
+        y0, y1 = xy[1] + bb[1], max(xy[1] + bb[1] + 1, xy[1] + bb[3])
+        top, bot = tuple(fill[:3]), p['grc']
+        col = _I.new('RGBA', (1, img.height))
+        for y in range(img.height):
+            f = min(1.0, max(0.0, (y - y0) / float(y1 - y0)))
+            col.putpixel((0, y), tuple(int(top[k] + (bot[k] - top[k]) * f) for k in range(3)) + (255,))
+        grad = col.resize(img.size)
+        grad.putalpha(_text_mask(img, xy, text, font))
+        img.alpha_composite(grad)
+
+def _fit_text_to_box(draw, text, font_name, box_w, box_h, min_size=6, max_size=None, fx=None):
     """Binary search the largest font size where `text` fits within box_w x box_h.
     Pass box_w=None to fit width only, or box_h=None to fit height only -- used for
     scrolling lines, where the text is expected to be larger than its box along the
@@ -1985,7 +2123,8 @@ def _fit_text_to_box(draw, text, font_name, box_w, box_h, min_size=6, max_size=N
     max_size defaults to a cap that scales with whichever of box_w/box_h is given,
     rather than a fixed number -- otherwise a constraining dimension bigger than the
     cap leaves real headroom unused forever, since the search can never explore past
-    it. Returns (font_or_None, text_w, text_h) at the best-fit size."""
+    it. fx = the line's effects; the outline/shadow are counted in the size so they stay
+    inside the box too. Returns (font_or_None, text_w, text_h) at the best-fit size."""
     if not PIL_AVAILABLE or not text:
         return None, 0, 0
     if max_size is None:
@@ -1995,7 +2134,7 @@ def _fit_text_to_box(draw, text, font_name, box_w, box_h, min_size=6, max_size=N
     # both engines size the text the same way (advance width disagrees between the browser and
     # PIL for decorative fonts, which made the projection bigger than the preview).
     def _wh(font):
-        bbox = _text_bbox(draw, text, font)
+        bbox = _text_bbox(draw, text, font, fx)
         return bbox[2] - bbox[0], bbox[3] - bbox[1]
     lo, hi = min_size, max_size
     # Seed with the smallest size so a box too small for even min_size to fit still
@@ -2025,10 +2164,11 @@ def _hex_to_rgb(hex_str):
     return (int(hex_str[0:2], 16), int(hex_str[2:4], 16), int(hex_str[4:6], 16))
 
 
-def _render_oriented_text_strip(text, font_name, box_w, box_h, color_rgb, orientation):
+def _render_oriented_text_strip(text, font_name, box_w, box_h, color_rgb, orientation, fx=None):
     """Auto-fit `text` to (box_w, box_h) per `orientation` and render it to a tightly-sized
-    RGB strip (black background, matching the other strip/paste code in this file) for the
-    caller to center/paste within its own box. orientation is 'horizontal' (default),
+    TRANSPARENT RGBA strip (with the line's outline/shadow effects, fx) for the caller to
+    center and alpha-paste within its own box - transparent so overlapping lines layer like
+    the preview instead of one line's background covering another's letters. orientation is 'horizontal' (default),
     'vertical_rotated' (whole line rotated 90 degrees), or 'vertical_stacked' (one
     character per row, each upright). Either box_w or box_h may be None to leave that
     dimension unconstrained -- used for T2B/B2T scrolling, where the travel axis has no
@@ -2040,7 +2180,7 @@ def _render_oriented_text_strip(text, font_name, box_w, box_h, color_rgb, orient
         if box_h is None:
             # Scrolling (T2B/B2T): raw width unconstrained (the travel axis has no
             # fixed extent); raw height (becomes rotated width) fit to box_w.
-            font, tw, th = _fit_text_to_box(pdraw, text, font_name, None, box_w)
+            font, tw, th = _fit_text_to_box(pdraw, text, font_name, None, box_w, fx=fx)
         else:
             # Static (Center, no clip applied): raw width (the string's own length,
             # which becomes the rotated block's VERTICAL extent) must fit box_h, and
@@ -2049,11 +2189,12 @@ def _render_oriented_text_strip(text, font_name, box_w, box_h, color_rgb, orient
             # bounding box" contract as horizontal/stacked. Leaving box_w
             # unconstrained let short strings (e.g. a single character) pick an
             # oversized font whose thickness blew past the box's width.
-            font, tw, th = _fit_text_to_box(pdraw, text, font_name, box_h, box_w)
+            font, tw, th = _fit_text_to_box(pdraw, text, font_name, box_h, box_w, fx=fx)
         if font is None:
             return None, 0, 0
-        strip = Image.new('RGB', (max(1, tw), max(1, th)), (0, 0, 0))
-        _draw_text(strip, (0, 0), text, color_rgb, font)
+        bbox = _text_bbox(pdraw, text, font, fx)
+        strip = Image.new('RGBA', (max(1, tw), max(1, th)), (0, 0, 0, 0))
+        _draw_text(strip, (-bbox[0], -bbox[1]), text, color_rgb, font, fx)
         rotated = strip.rotate(-90, expand=True)
         return rotated, rotated.width, rotated.height
 
@@ -2069,7 +2210,7 @@ def _render_oriented_text_strip(text, font_name, box_w, box_h, color_rgb, orient
             if font is not None:
                 max_w = max_h = 0
                 for c in chars:
-                    bbox = _text_bbox(pdraw, c, font)
+                    bbox = _text_bbox(pdraw, c, font, fx)
                     max_w = max(max_w, bbox[2] - bbox[0])
                     max_h = max(max_h, bbox[3] - bbox[1])
             else:
@@ -2083,26 +2224,26 @@ def _render_oriented_text_strip(text, font_name, box_w, box_h, color_rgb, orient
         if best_font is None:
             return None, 0, 0
         total_h = best_lh * len(chars)
-        strip = Image.new('RGB', (max(1, best_w), max(1, total_h)), (0, 0, 0))
+        strip = Image.new('RGBA', (max(1, best_w), max(1, total_h)), (0, 0, 0, 0))
         for idx, c in enumerate(chars):
-            bbox = _text_bbox(pdraw, c, best_font)
+            bbox = _text_bbox(pdraw, c, best_font, fx)
             cw = bbox[2] - bbox[0]
             cx = max(0, (best_w - cw) // 2)
             cy = idx * best_lh
-            _draw_text(strip, (cx - bbox[0], cy - bbox[1]), c, color_rgb, best_font)
+            _draw_text(strip, (cx - bbox[0], cy - bbox[1]), c, color_rgb, best_font, fx)
         return strip, strip.width, strip.height
 
     else:  # 'horizontal'
-        font, tw, th = _fit_text_to_box(pdraw, text, font_name, box_w, box_h)
+        font, tw, th = _fit_text_to_box(pdraw, text, font_name, box_w, box_h, fx=fx)
         if font is None:
             return None, 0, 0
         # Offset the draw by the ink's top-left (-bbox[0], -bbox[1]) so the glyphs sit flush in
         # the tightly-sized strip. PIL's default anchor leaves the font's ascender gap at the
         # top, which pushed the text to the BOTTOM of the box on the device while the preview
         # centered it. (The vertical_stacked branch already does this same -bbox offset.)
-        bbox = _text_bbox(pdraw, text, font)
-        strip = Image.new('RGB', (max(1, tw), max(1, th)), (0, 0, 0))
-        _draw_text(strip, (-bbox[0], -bbox[1]), text, color_rgb, font)
+        bbox = _text_bbox(pdraw, text, font, fx)
+        strip = Image.new('RGBA', (max(1, tw), max(1, th)), (0, 0, 0, 0))
+        _draw_text(strip, (-bbox[0], -bbox[1]), text, color_rgb, font, fx)
         return strip, strip.width, strip.height
 
 
@@ -2172,8 +2313,8 @@ def _shm_layout_ok(model_name, width, height):
 def render_to_shm(line_items, model_name, width, height):
     """Render multiple text lines to FPP shared memory, each with its own box, color, font,
     and orientation.
-    line_items: list of (text, box_x, box_y, box_w, box_h, color_hex, font_name, orientation)
-    tuples. orientation is 'horizontal' (default), 'vertical_rotated', or 'vertical_stacked'
+    line_items: list of (text, box_x, box_y, box_w, box_h, color_hex, font_name, orientation
+    [, effects]) tuples - effects is the line's outline/shadow dict (optional). orientation is 'horizontal' (default), 'vertical_rotated', or 'vertical_stacked'
  - see _render_oriented_text_strip. Font size is auto-fit to (box_w, box_h), then the
     rendered text is centered within the box. box_x/box_y == -1 auto-centers the box itself
     on the canvas (vertical stacking among lines is resolved by the caller before this
@@ -2187,20 +2328,24 @@ def render_to_shm(line_items, model_name, width, height):
     try:
         img = Image.new('RGB', (width, height), (0, 0, 0))
 
-        for (text, box_x, box_y, box_w, box_h, color_hex, font_name, orientation) in line_items:
+        for _li in line_items:
+            text, box_x, box_y, box_w, box_h, color_hex, font_name, orientation = _li[:8]
+            fx = _li[8] if len(_li) > 8 else None
             if not text:
                 continue
             resolved_bx = max(0, (width - box_w) // 2) if box_x == -1 else box_x
             resolved_by = max(0, (height - box_h) // 2) if box_y == -1 else box_y
             strip, sw, sh = _render_oriented_text_strip(text, font_name, box_w, box_h,
-                                                          _hex_to_rgb(color_hex), orientation)
+                                                          _hex_to_rgb(color_hex), orientation, fx)
             if strip is not None:
                 draw_x = resolved_bx + max(0, (box_w - sw) // 2)
                 draw_y = resolved_by + max(0, (box_h - sh) // 2)
                 logging.info(f"🅰️ TEXTPOS model={width}x{height} box=(x{box_x},y{box_y},w{box_w},h{box_h}) "
                              f"font={font_name!r} text={text!r} rendered_text={sw}x{sh} "
                              f"draw=(x{draw_x},y{draw_y}) orient={orientation}")
-                _paste_lighter(img, strip, (draw_x, draw_y))   # overlapping lines both stay visible
+                # Transparent strip, alpha-pasted: lines layer in order like the preview, so
+                # an overlapping box never blacks out another line's letters.
+                img.paste(strip, (draw_x, draw_y), strip)
 
         shm_path = f"/dev/shm/FPP-Model-Data-{model_name}"
         raw = img.tobytes()
@@ -2234,42 +2379,11 @@ def render_to_shm(line_items, model_name, width, height):
         return False
 
 
-def _paste_lighter(dst, src, xy):
-    """Composite a text strip (glyphs on BLACK) onto dst by keeping the brighter pixel. On a
-    black canvas this equals a plain paste wherever lines don't overlap - but where one
-    line's box overlaps another's (tall script fonts reaching past their box), the strip's
-    black background no longer paints over the other line's glyphs, so both stay visible
-    the way the preview shows them. Clipped to dst's bounds."""
-    from PIL import ImageChops
-    x, y = xy
-    box = (max(0, x), max(0, y), min(dst.width, x + src.width), min(dst.height, y + src.height))
-    if box[2] <= box[0] or box[3] <= box[1]:
-        return
-    s = src.crop((box[0] - x, box[1] - y, box[2] - x, box[3] - y))
-    dst.paste(ImageChops.lighter(dst.crop(box), s), box[:2])
-
-
-def _text_coverage_mask(strip):
-    """Build an alpha/coverage mask from an RGB text strip that was drawn as a colored
-    glyph on a BLACK background: per-pixel max of R,G,B. Glyph pixels → opaque, the black
-    background → transparent, anti-aliased edges → partial. Pass this as the mask when
-    pasting text onto an image so only the glyph lands (no black box); the black
-    background is what FPP's State-3 transparency handles for sequences, but over an
-    Opaque (State 1) image we must do that blending ourselves. Returns None on failure
-    (caller then pastes opaquely, as before)."""
-    try:
-        from PIL import ImageChops
-        r, g, b = strip.split()
-        return ImageChops.lighter(ImageChops.lighter(r, g), b)
-    except Exception:
-        return None
-
-
 def render_image_to_shm(image_path, model_name, width, height, line_items=None):
     """Load an image file, resize to model dimensions, optionally composite text on top,
     then write to FPP shared memory.  Returns True on success.
     line_items: optional list of (text, box_x, box_y, box_w, box_h, color_hex, font_name,
-    orientation) to draw over the image (same box-fit behavior as render_to_shm). State 1
+    orientation[, effects]) to draw over the image (same box-fit behavior as render_to_shm). State 1
     (Opaque) should be used so the image fully covers the background."""
     if not PIL_AVAILABLE or width <= 0 or height <= 0:
         return False
@@ -2280,18 +2394,20 @@ def render_image_to_shm(image_path, model_name, width, height, line_items=None):
         img = img.resize((width, height), Image.LANCZOS)
 
         if line_items:
-            for (text, box_x, box_y, box_w, box_h, color_hex, font_name, orientation) in line_items:
+            for _li in line_items:
+                text, box_x, box_y, box_w, box_h, color_hex, font_name, orientation = _li[:8]
+                fx = _li[8] if len(_li) > 8 else None
                 if not text:
                     continue
                 resolved_bx = max(0, (width - box_w) // 2) if box_x == -1 else box_x
                 resolved_by = max(0, (height - box_h) // 2) if box_y == -1 else box_y
                 strip, sw, sh = _render_oriented_text_strip(text, font_name, box_w, box_h,
-                                                              _hex_to_rgb(color_hex), orientation)
+                                                              _hex_to_rgb(color_hex), orientation, fx)
                 if strip is not None:
                     draw_x = resolved_bx + max(0, (box_w - sw) // 2)
                     draw_y = resolved_by + max(0, (box_h - sh) // 2)
-                    # Mask so only the glyph lands on the image (no black box behind text).
-                    img.paste(strip, (draw_x, draw_y), _text_coverage_mask(strip))
+                    # Transparent strip: only the text (and its effects) lands on the image.
+                    img.paste(strip, (draw_x, draw_y), strip)
 
         shm_path = f"/dev/shm/FPP-Model-Data-{model_name}"
         raw = img.tobytes()
@@ -2385,7 +2501,7 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
     Runs in a background thread for `duration` seconds then stops.
 
     items: [(text, box_x, box_y, box_w, box_h, color_hex, movement, speed, font_name,
-        orientation), ...]
+        orientation[, effects]), ...] - effects = the line's outline/shadow dict (optional).
         movement 'Center': text is auto-fit to (box_w, box_h) and centered in the box, fixed.
         orientation ('horizontal'/'vertical_rotated'/'vertical_stacked') applies to Center
         and to T2B/B2T (all three -- for rotated the glyphs read sideways, for stacked
@@ -2420,8 +2536,10 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
         probe = Image.new('RGB', (1, 1))
         pdraw = ImageDraw.Draw(probe)
         prepared = []
-        for (text, box_x, box_y, box_w, box_h, color_hex, movement, speed, font_name,
-             orientation) in items:
+        for _it in items:
+            (text, box_x, box_y, box_w, box_h, color_hex, movement, speed, font_name,
+             orientation) = _it[:10]
+            fx = _it[10] if len(_it) > 10 else None
             if not text:
                 continue
             resolved_bx = max(0, (width - box_w) // 2) if box_x == -1 else box_x
@@ -2436,9 +2554,9 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
                 # fixed); its height is unconstrained since it's the travel axis -- pass
                 # box_h=None through to _render_oriented_text_strip.
                 strip, tw, th = _render_oriented_text_strip(text, font_name, box_w, None,
-                                                              _hex_to_rgb(color_hex), orientation)
+                                                              _hex_to_rgb(color_hex), orientation, fx)
                 if strip is None:
-                    strip, tw, th = Image.new('RGB', (1, 1), (0, 0, 0)), 1, 1
+                    strip, tw, th = Image.new('RGBA', (1, 1), (0, 0, 0, 0)), 1, 1
             elif scrolling:
                 # Horizontal glyphs -- all other scrolling cases (L2R/R2L always, and
                 # T2B/B2T when not rotated/stacked). Orientation otherwise only applies
@@ -2452,23 +2570,24 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
                 horiz_scroll = movement in ('L2R', 'R2L')
                 box_w_fit = None if horiz_scroll else box_w
                 box_h_fit = box_h if horiz_scroll else None
-                font, tw, th = _fit_text_to_box(pdraw, text, font_name, box_w_fit, box_h_fit)
+                font, tw, th = _fit_text_to_box(pdraw, text, font_name, box_w_fit, box_h_fit, fx=fx)
                 tw, th = max(1, tw), max(1, th)
-                strip = Image.new('RGB', (tw, th), (0, 0, 0))
+                strip = Image.new('RGBA', (tw, th), (0, 0, 0, 0))
                 if font is not None:
-                    _draw_text(strip, (0, 0), text, _hex_to_rgb(color_hex), font)
+                    # Offset by the ink's top-left so the glyphs (and their outline) sit flush.
+                    _bb = _text_bbox(pdraw, text, font, fx)
+                    _draw_text(strip, (-_bb[0], -_bb[1]), text, _hex_to_rgb(color_hex), font, fx)
             else:
                 strip, tw, th = _render_oriented_text_strip(text, font_name, box_w, box_h,
-                                                              _hex_to_rgb(color_hex), orientation)
+                                                              _hex_to_rgb(color_hex), orientation, fx)
                 if strip is None:
-                    strip, tw, th = Image.new('RGB', (1, 1), (0, 0, 0)), 1, 1
+                    strip, tw, th = Image.new('RGBA', (1, 1), (0, 0, 0, 0)), 1, 1
 
+            # Strips are transparent RGBA and are alpha-pasted (the strip is its own mask), so
+            # text lands on an image background, or on black, with no box behind it, and
+            # overlapping lines layer in order like the preview.
             entry = {'strip': strip, 'tw': tw, 'th': th, 'movement': movement,
                      'clip': (resolved_bx, resolved_by, box_w, box_h)}
-            # Over an image background, paste only the glyph (mask out the strip's black
-            # box). Over a black background (no image) leave it None - those strips are
-            # combined with _paste_lighter so overlapping lines don't cover each other.
-            entry['mask'] = _text_coverage_mask(strip) if bg_image_path else None
             # speed == 0 is the "fit to display time" sentinel: instead of a fixed
             # px/s speed (which, with dynamic-length text, either loops a short name
             # several times or cuts a long name off mid-scroll), time one complete
@@ -2536,11 +2655,10 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
         if base_frame is None:
             base_frame = Image.new('RGB', (width, height), (0, 0, 0))
 
-        def _clip_paste(frame, strip, mask, src_x, src_y, dst_x, dst_y, vis_w, vis_h, clip):
+        def _clip_paste(frame, strip, src_x, src_y, dst_x, dst_y, vis_w, vis_h, clip):
             # Intersect the paste rect with the line's own box, so scrolling text is only
             # visible while inside it - entering/exiting at the box edges instead of the
-            # full canvas edges. `mask` (or None) is cropped the same way so text lands on
-            # an image background without its black box.
+            # full canvas edges. The strip is RGBA, so the cropped piece is its own mask.
             cx, cy, cw, ch = clip
             x0, y0 = max(dst_x, cx), max(dst_y, cy)
             x1, y1 = min(dst_x + vis_w, cx + cw), min(dst_y + vis_h, cy + ch)
@@ -2548,10 +2666,8 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
                 return
             crop_x0, crop_y0 = src_x + (x0 - dst_x), src_y + (y0 - dst_y)
             crop_box = (crop_x0, crop_y0, crop_x0 + (x1 - x0), crop_y0 + (y1 - y0))
-            if mask is not None:
-                frame.paste(strip.crop(crop_box), (x0, y0), mask.crop(crop_box))
-            else:
-                _paste_lighter(frame, strip.crop(crop_box), (x0, y0))
+            piece = strip.crop(crop_box)
+            frame.paste(piece, (x0, y0), piece)
 
         def _pos_at(e, t):
             # Closed-form scroll position at elapsed time `t` (seconds). Motion is a pure
@@ -2594,17 +2710,15 @@ def animate_lines_via_shm(items, model_name, width, height, duration, fps=None, 
                             src_x = max(0, -ix); dst_x = max(0, ix)
                             vis_w = min(e['tw'] - src_x, width - dst_x)
                             if vis_w > 0:
-                                _clip_paste(frame, e['strip'], e['mask'], src_x, 0, dst_x, e['dy'], vis_w, e['th'], e['clip'])
+                                _clip_paste(frame, e['strip'], src_x, 0, dst_x, e['dy'], vis_w, e['th'], e['clip'])
                         elif mv in ('T2B', 'B2T'):
                             iy = int(_pos_at(e, t))
                             src_y = max(0, -iy); dst_y = max(0, iy)
                             vis_h = min(e['th'] - src_y, height - dst_y)
                             if vis_h > 0:
-                                _clip_paste(frame, e['strip'], e['mask'], 0, src_y, e['dx'], dst_y, e['tw'], vis_h, e['clip'])
-                        elif e['mask'] is not None:
-                            frame.paste(e['strip'], (e['dx'], e['dy']), e['mask'])
+                                _clip_paste(frame, e['strip'], 0, src_y, e['dx'], dst_y, e['tw'], vis_h, e['clip'])
                         else:
-                            _paste_lighter(frame, e['strip'], (e['dx'], e['dy']))
+                            frame.paste(e['strip'], (e['dx'], e['dy']), e['strip'])
                     try:
                         buf = frame.tobytes()
                         shm.seek(0)
@@ -4813,6 +4927,7 @@ def send_to_fpp(name, override=None, preselected=_UNSET):
             line_speeds_cfg       = _item.get('line_speeds', [])
             line_fonts_cfg        = _item.get('line_fonts', [])
             line_orientations_cfg = _item.get('line_orientations', [])
+            line_effects_cfg      = _item.get('line_effects', [])
             _active_display_duration = int(_item.get('display_duration', config.get('display_duration', 30)) or 30)
         else:
             name_playlist         = config.get('name_display_playlist', '')
@@ -4823,6 +4938,7 @@ def send_to_fpp(name, override=None, preselected=_UNSET):
             line_speeds_cfg       = config.get('line_speeds', [])
             line_fonts_cfg        = config.get('line_fonts', [])
             line_orientations_cfg = config.get('line_orientations', [])
+            line_effects_cfg      = config.get('line_effects', [])
             _active_display_duration = int(config.get('display_duration', 30) or 30)
         if override is not None:
             # Background + timing are the master's selection; layout above stays local.
@@ -4853,7 +4969,7 @@ def send_to_fpp(name, override=None, preselected=_UNSET):
         # Collect non-empty rendered lines + their saved box/colors/movement/speed/font.
         # A line with no override for a given setting falls back to the matching global
         # default. Font size is not stored - it's auto-fit to the line's box at render time.
-        rendered_lines = []  # [(rendered_text, box_x, box_y, box_w, box_h, color_hex, movement, speed, font_name, orientation), ...]
+        rendered_lines = []  # [(rendered_text, box_x, box_y, box_w, box_h, color_hex, movement, speed, font_name, orientation, effects), ...]
         for i, tmpl_line in enumerate(message_lines):
             if not tmpl_line.strip():
                 continue
@@ -4870,8 +4986,9 @@ def send_to_fpp(name, override=None, preselected=_UNSET):
             speed = line_speeds_cfg[i] if (i < len(line_speeds_cfg) and line_speeds_cfg[i] is not None) else global_scroll_speed
             font_name = line_fonts_cfg[i] if i < len(line_fonts_cfg) and line_fonts_cfg[i] else global_font
             orientation = line_orientations_cfg[i] if i < len(line_orientations_cfg) and line_orientations_cfg[i] else 'horizontal'
+            effects = line_effects_cfg[i] if i < len(line_effects_cfg) and isinstance(line_effects_cfg[i], dict) else None
             rendered_lines.append((rendered, box.get('x', -1), box.get('y', -1), box.get('w', 300), box.get('h', 60),
-                                    line_color, movement, speed, font_name, orientation))
+                                    line_color, movement, speed, font_name, orientation, effects))
 
         # Compute stacked Y defaults (group centered vertically). Each line's own box height
         # determines its own height in the stack. Use the RESOLVED model height (same source the
@@ -4884,11 +5001,11 @@ def send_to_fpp(name, override=None, preselected=_UNSET):
 
         # Resolve each line's box Y (stacked default when unset). Box X stays -1
         # (auto-centered horizontally inside the render functions) unless explicitly positioned.
-        all_items = []  # [(text, box_x, resolved_box_y, box_w, box_h, color_hex, movement, speed, font_name, orientation), ...]
+        all_items = []  # [(text, box_x, resolved_box_y, box_w, box_h, color_hex, movement, speed, font_name, orientation, effects), ...]
         cumulative_y = stack_start_y
-        for idx, (rendered, bx, by, bw, bh, lcolor, movement, speed, font_name, orientation) in enumerate(rendered_lines):
+        for idx, (rendered, bx, by, bw, bh, lcolor, movement, speed, font_name, orientation, effects) in enumerate(rendered_lines):
             resolved_y = cumulative_y if by == -1 else by
-            all_items.append((rendered, bx, resolved_y, bw, bh, lcolor, movement, speed, font_name, orientation))
+            all_items.append((rendered, bx, resolved_y, bw, bh, lcolor, movement, speed, font_name, orientation, effects))
             cumulative_y += line_heights[idx]
 
         # True if at least one line scrolls - decides whether the fast one-shot static
@@ -5023,7 +5140,7 @@ def send_to_fpp(name, override=None, preselected=_UNSET):
 
                 if PIL_AVAILABLE and mw > 0 and mh > 0:
                     if not any_moving:
-                        line_items = [(t, bx, by, bw, bh, c, fn, o) for (t, bx, by, bw, bh, c, _m, _s, fn, o) in all_items]
+                        line_items = [(t, bx, by, bw, bh, c, fn, o, fx) for (t, bx, by, bw, bh, c, _m, _s, fn, o, fx) in all_items]
                         if img_bg_path:
                             shm_rendered = render_image_to_shm(
                                 img_bg_path, overlay_model, mw, mh,
@@ -7861,6 +7978,7 @@ def index():
                             </div>
                         </div>
                         <p class="help-text">🎨 Click the ▾ next to a line's color to save or recall colors. Each card's Movement controls that line only.</p>
+                        <p class="help-text">✨ <strong>Text effects</strong> per line, each in its own color: <strong>Outline</strong> (Bubble = fat wrap-around), <strong>2nd Outline</strong>, <strong>Shadow</strong>, <strong>Glow</strong>, and <strong>Gradient</strong> (line color at the top shading to a second color). <strong>Quick style</strong> applies a ready-made look (Bubble, Sticker, Neon, Gold, Candy Cane, Frosty). Effects scale with the text and stay inside the line's box. Pure black is shown as near-black, since FPP treats black overlay pixels as see-through.</p>
                     </div>
                 </div>
 
@@ -7936,6 +8054,7 @@ def index():
                             window._lineSpeedsInit = {{ (_active2.get('line_speeds') or [50, 50, 50, 50]) | tojson }};
                             window._lineFontsInit = {{ (_active2.get('line_fonts') or ['FreeSans', 'FreeSans', 'FreeSans', 'FreeSans']) | tojson }};
                             window._lineOrientationsInit = {{ (_active2.get('line_orientations') or ['horizontal', 'horizontal', 'horizontal', 'horizontal']) | tojson }};
+                            window._lineEffectsInit = {{ (_active2.get('line_effects') or []) | tojson }};
                             window._customColorsInit = {{ config.get('custom_colors', []) | tojson }};
                             window._namesContentListInit = {{ (config.get('names_content_list') or []) | tojson }};
                             window._namesContentModeInit = {{ config.get('names_content_mode', 'roundrobin') | tojson }};
@@ -9010,6 +9129,125 @@ def index():
                 while (initLO.length < 4) initLO.push('horizontal');
                 window._lineOrientations = initLO;
 
+                // Per-line text effects: outline + drop shadow, each with its own color. Sizes
+                // are a percent of the fitted font size (0 = off) - mirrors LINE_EFFECT_DEFAULT
+                // and _sanitize_line_effects on the server.
+                window._normLineEffects = function(arr) {
+                    var out = [];
+                    for (var k = 0; k < 4; k++) {
+                        var fx = (arr && arr[k] && typeof arr[k] === 'object') ? arr[k] : {};
+                        var hex = function(c, d) { return /^#[0-9a-fA-F]{6}$/.test(c || '') ? c.toUpperCase() : d; };
+                        var pct = function(v) { return Math.max(0, Math.min(40, parseInt(v, 10) || 0)); };
+                        out.push({
+                            outline: pct(fx.outline), outline_color: hex(fx.outline_color, '#FFFFFF'),
+                            outline2: pct(fx.outline2), outline2_color: hex(fx.outline2_color, '#111111'),
+                            shadow: pct(fx.shadow), shadow_color: hex(fx.shadow_color, '#111111'),
+                            glow: pct(fx.glow), glow_color: hex(fx.glow_color, '#FFD700'),
+                            gradient: (fx.gradient === 1 || fx.gradient === true || fx.gradient === '1') ? 1 : 0,
+                            gradient_color: hex(fx.gradient_color, '#FFFFFF')
+                        });
+                    }
+                    return out;
+                };
+                window._lineEffects = window._normLineEffects(window._lineEffectsInit);
+
+                // Text effect controls: two extra rows per line card, built here (after the Font
+                // row) so all four cards stay identical. Sizes are percent of the font size.
+                var _FX_PRESETS = {
+                    outline:  [[0,'None'],[4,'Thin'],[8,'Medium'],[12,'Thick'],[20,'Bubble']],
+                    outline2: [[0,'None'],[4,'Thin'],[8,'Medium'],[12,'Thick']],
+                    shadow:   [[0,'None'],[5,'Small'],[10,'Medium'],[15,'Large']],
+                    glow:     [[0,'None'],[8,'Soft'],[15,'Medium'],[25,'Strong']]
+                };
+                // Quick styles set several effects at once (and the text color where the look
+                // depends on it). Each stays fully editable afterwards.
+                var _FX_STYLES = {
+                    plain:   {label: 'Plain', fx: {}},
+                    bubble:  {label: 'Bubble', fx: {outline: 20, outline_color: '#FFFFFF', shadow: 10, shadow_color: '#111111'}},
+                    sticker: {label: 'Sticker', fx: {outline: 8, outline_color: '#FFFFFF', outline2: 8, outline2_color: '#111111'}},
+                    neon:    {label: 'Neon', color: '#FFFFFF', fx: {outline: 4, outline_color: '#00E5FF', glow: 25, glow_color: '#00E5FF'}},
+                    gold:    {label: 'Gold', color: '#FFE650', fx: {outline: 4, outline_color: '#5A3A00', shadow: 10, shadow_color: '#111111', gradient: 1, gradient_color: '#E07000'}},
+                    candy:   {label: 'Candy Cane', color: '#FFFFFF', fx: {outline: 12, outline_color: '#E00000', outline2: 4, outline2_color: '#FFFFFF', glow: 15, glow_color: '#FF6060'}},
+                    frosty:  {label: 'Frosty', color: '#E6FAFF', fx: {outline: 4, outline_color: '#5FB8FF', glow: 15, glow_color: '#BFE8FF', gradient: 1, gradient_color: '#5FB8FF'}}
+                };
+                function _fxOptions(sel, presets, val) {
+                    sel.innerHTML = '';
+                    var found = false;
+                    presets.forEach(function(p){ sel.appendChild(new Option(p[1], p[0], false, p[0] === val)); if (p[0] === val) found = true; });
+                    if (!found) sel.appendChild(new Option('Custom (' + val + '%)', val, false, true));
+                }
+                var _FX_SIZED = ['outline', 'outline2', 'shadow', 'glow'];
+                window.syncLineEffectControls = function() {
+                    for (var i = 0; i < 4; i++) {
+                        var fx = window._lineEffects[i], n = i + 1;
+                        var g = function(id){ return document.getElementById('line_' + n + '_' + id); };
+                        if (!g('outline')) continue;
+                        _FX_SIZED.forEach(function(k) {
+                            _fxOptions(g(k), _FX_PRESETS[k], fx[k]);
+                            var c = g(k + '_color'); if (c) { c.value = fx[k + '_color']; c.style.opacity = fx[k] ? '1' : '0.35'; }
+                        });
+                        g('gradient').checked = !!fx.gradient;
+                        g('gradient_color').value = fx.gradient_color;
+                        g('gradient_color').style.opacity = fx.gradient ? '1' : '0.35';
+                        g('style').value = '';
+                    }
+                };
+                window.onLineEffectChange = function(i) {
+                    var n = i + 1, g = function(id){ return document.getElementById('line_' + n + '_' + id); };
+                    var raw = {gradient: g('gradient').checked ? 1 : 0, gradient_color: g('gradient_color').value};
+                    _FX_SIZED.forEach(function(k){ raw[k] = g(k).value; raw[k + '_color'] = g(k + '_color').value; });
+                    window._lineEffects = window._normLineEffects(window._lineEffects);
+                    window._lineEffects[i] = window._normLineEffects([raw])[0];
+                    window.syncLineEffectControls();
+                    if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
+                    if (typeof saveConfig === 'function') saveConfig();
+                };
+                window.onLineStyleChange = function(i) {
+                    var sel = document.getElementById('line_' + (i + 1) + '_style');
+                    var st = sel && _FX_STYLES[sel.value];
+                    if (!st) return;
+                    window._lineEffects = window._normLineEffects(window._lineEffects);
+                    window._lineEffects[i] = window._normLineEffects([st.fx])[0];
+                    var col = document.getElementById('line_' + (i + 1) + '_color');
+                    if (st.color && col) col.value = st.color;
+                    window.syncLineEffectControls();
+                    if (typeof window.renderCanvasPreview === 'function') window.renderCanvasPreview();
+                    if (typeof saveConfig === 'function') saveConfig();
+                };
+                for (var _fi = 0; _fi < 4; _fi++) {
+                    var _fontSel = document.getElementById('line_' + (_fi + 1) + '_font');
+                    var _fontRow = _fontSel && _fontSel.closest('.line-movement-row');
+                    if (!_fontRow || document.getElementById('line_' + (_fi + 1) + '_outline')) continue;
+                    var _n = _fi + 1, _ch = 'onchange="onLineEffectChange(' + _fi + ')"';
+                    var _pick = function(k, label, title, gap) {
+                        return '<span class="line-mini-label"' + (gap ? ' style="margin-left:6px;"' : '') + '>' + label + ':</span>' +
+                            '<select id="line_' + _n + '_' + k + '" ' + _ch + ' style="flex:0 1 auto; min-width:84px;" title="' + title + '"></select>' +
+                            '<input type="color" id="line_' + _n + '_' + k + '_color" class="line-color-swatch" title="' + label + ' color" ' + _ch + '>';
+                    };
+                    var _styleOpts = '<option value="">Choose…</option>' + Object.keys(_FX_STYLES).map(function(k){
+                        return '<option value="' + k + '">' + _FX_STYLES[k].label + '</option>'; }).join('');
+                    var _row1 = document.createElement('div');
+                    _row1.className = 'line-movement-row';
+                    _row1.innerHTML = '<div class="line-group-controls">' +
+                        '<span class="line-mini-label">Quick style:</span>' +
+                        '<select id="line_' + _n + '_style" onchange="onLineStyleChange(' + _fi + ')" style="flex:0 1 auto; min-width:110px;" title="Apply a ready-made look (you can still change each effect below)">' + _styleOpts + '</select>' +
+                        _pick('outline', 'Outline', 'Border around the letters (Bubble = fat wrap-around)', true) +
+                        _pick('outline2', '2nd Outline', 'A second border outside the first', true) +
+                        '</div>';
+                    var _row2 = document.createElement('div');
+                    _row2.className = 'line-movement-row';
+                    _row2.innerHTML = '<div class="line-group-controls">' +
+                        _pick('shadow', 'Shadow', 'Drop shadow, down and to the right', false) +
+                        _pick('glow', 'Glow', 'Soft blurred halo around the text', true) +
+                        '<label class="line-speed-auto" style="margin-left:6px;" title="Shade the letters from the line color (top) to this color (bottom)">' +
+                        '<input type="checkbox" id="line_' + _n + '_gradient" ' + _ch + '> Gradient</label>' +
+                        '<input type="color" id="line_' + _n + '_gradient_color" class="line-color-swatch" title="Gradient bottom color" ' + _ch + '>' +
+                        '</div>';
+                    _fontRow.parentNode.insertBefore(_row2, _fontRow.nextSibling);
+                    _fontRow.parentNode.insertBefore(_row1, _fontRow.nextSibling);
+                }
+                window.syncLineEffectControls();
+
                 var selectedLine = -1;
                 var hoveredLine  = -1;
                 var lineRects    = [null, null, null, null]; // canvas-pixel rects, filled by render
@@ -9054,7 +9292,72 @@ def index():
                 // (Center draws without a clip, so the same oversized fit there just overflows
                 // invisibly instead of visibly losing its top). Matches the backend's PIL
                 // textbbox-based measurement in _fit_text_to_box.
-                function fitTextSize(text, fontName, boxW, boxH) {
+                // ---- Text effects (outline / drop shadow) - mirrors _fx_px / _draw_text ----
+                function getLineFx(i) { return (window._lineEffects || [])[i] || null; }
+                // Percent of the font size -> px (min 1 when on), like the device.
+                function fxPx(pct, size) { pct = parseInt(pct, 10) || 0; return pct > 0 ? Math.max(1, Math.round(size * pct / 100)) : 0; }
+                // Effect sizes in px at `size`, mirroring _fx_px: t = total border (outline +
+                // 2nd outline), g = glow, sh = shadow. The letters need t+g of room on the left/top
+                // and t+max(g, sh) on the right/bottom; o / s express that in the form the layout
+                // code uses (left/top pad = o, total extra = 2*o + s).
+                function fxPads(fx, size) {
+                    var o1 = fxPx(fx && fx.outline, size), t = o1 + fxPx(fx && fx.outline2, size);
+                    var g = fxPx(fx && fx.glow, size), sh = fxPx(fx && fx.shadow, size);
+                    return {o1: o1, t: t, g: g, sh: sh, o: t + g, s: Math.max(g, sh) - g};
+                }
+                // FPP treats black overlay pixels as see-through, so the device nudges pure black
+                // to near-black - preview the same color.
+                function fxColor(c, d) {
+                    c = /^#[0-9a-fA-F]{6}$/.test(c || '') ? c : d;
+                    var r = parseInt(c.substr(1,2),16), g = parseInt(c.substr(3,2),16), b = parseInt(c.substr(5,2),16);
+                    return Math.max(r, g, b) < 17 ? '#111111' : c;
+                }
+                // Draw one piece of a line's text with its effects at (x, baseline): the shadow
+                // (with the outline's silhouette) offset down-right first, then the outline, then
+                // the letters. `size` is the canvas font size the effect sizes are taken from.
+                function drawStyledText(i, text, x, y, size) {
+                    // Layers back to front, like _draw_text on the device: glow, shadow (the full
+                    // outlined silhouette), 2nd outline, outline, then the letters (solid or gradient).
+                    var fx = getLineFx(i), p = fxPads(fx, size);
+                    ctx.save();
+                    ctx.lineJoin = 'round'; ctx.miterLimit = 2;
+                    var shape = function(color, width, dx, dy) {
+                        ctx.fillStyle = color; ctx.strokeStyle = color;
+                        if (width) { ctx.lineWidth = 2 * width; ctx.strokeText(text, x + dx, y + dy); }
+                        ctx.fillText(text, x + dx, y + dy);
+                    };
+                    if (p.g) {
+                        var gc = fxColor(fx.glow_color, '#FFD700');
+                        ctx.shadowColor = gc; ctx.shadowBlur = p.g;     // ~ the device's blur radius g/2 (sigma)
+                        shape(gc, p.t, 0, 0); shape(gc, p.t, 0, 0);     // twice = the device's doubled halo
+                        ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0;
+                    }
+                    if (p.sh) shape(fxColor(fx.shadow_color, '#111111'), p.t, p.sh, p.sh);
+                    if (p.t > p.o1) {
+                        ctx.strokeStyle = fxColor(fx.outline2_color, '#111111'); ctx.lineWidth = 2 * p.t;
+                        ctx.strokeText(text, x, y);
+                    }
+                    if (p.o1) {
+                        ctx.strokeStyle = fxColor(fx.outline_color, '#FFFFFF'); ctx.lineWidth = 2 * p.o1;
+                        ctx.strokeText(text, x, y);
+                    }
+                    var fill = getLineColor(i);
+                    if (fx && fx.gradient) {
+                        var m = ctx.measureText(text);
+                        var top = y - (m.actualBoundingBoxAscent || size * 0.8), bot = y + (m.actualBoundingBoxDescent || 0);
+                        var gr = ctx.createLinearGradient(0, top, 0, Math.max(top + 1, bot));
+                        gr.addColorStop(0, fill); gr.addColorStop(1, fxColor(fx.gradient_color, '#FFFFFF'));
+                        fill = gr;
+                    }
+                    ctx.fillStyle = fill;
+                    ctx.fillText(text, x, y);
+                    ctx.restore();
+                }
+
+                // fx (optional): the line's effects - the outline (all sides) and shadow (down-right)
+                // are counted in the fitted size so they stay inside the box, like the device. The
+                // result carries o / s (their px at the chosen size) for positioning.
+                function fitTextSize(text, fontName, boxW, boxH, fx) {
                     var lo = 6;
                     // The cap has to scale with the box, not be a fixed number -- otherwise
                     // a constraining dimension bigger than the cap leaves real headroom
@@ -9063,7 +9366,7 @@ def index():
                     // actual ascent+descent was only ~225, well under the 300 limit).
                     var hi = Math.max(300, isFinite(boxW) ? Math.ceil(boxW * 2) : 0,
                                            isFinite(boxH) ? Math.ceil(boxH * 2) : 0);
-                    var best = { size: lo, ascent: lo * 0.8, descent: lo * 0.2 };
+                    var best = { size: lo, ascent: lo * 0.8, descent: lo * 0.2, o: 0, s: 0 };
                     // actualBoundingBoxAscent/Descent are measured relative to whatever
                     // textBaseline is current at measureText() time -- not always
                     // 'alphabetic' -- so it must be pinned here rather than inherited from
@@ -9084,9 +9387,10 @@ def index():
                                 ? (metrics.actualBoundingBoxRight + metrics.actualBoundingBoxLeft)
                                 : metrics.width;
                         var h = ascent + descent;
-                        if (w <= boxW && h <= boxH) {
+                        var _pd = fxPads(fx, mid), fo = _pd.o, fs = _pd.s;
+                        if (w + 2 * fo + fs <= boxW && h + 2 * fo + fs <= boxH) {
                             best = { size: mid, ascent: ascent, descent: descent,
-                                     inkW: w, left: (metrics.actualBoundingBoxLeft || 0) };
+                                     inkW: w, left: (metrics.actualBoundingBoxLeft || 0), o: fo, s: fs };
                             lo = mid + 1;
                         } else {
                             hi = mid - 1;
@@ -9099,7 +9403,7 @@ def index():
                 // sits on its own row (upright, not rotated), all sharing one font size --
                 // the largest where the widest character fits boxW and all rows stacked fit
                 // boxH. lineHeight is the per-row height (tallest character's ascent+descent).
-                function fitStackedTextSize(chars, fontName, boxW, boxH) {
+                function fitStackedTextSize(chars, fontName, boxW, boxH, fx) {
                     var lo = 6;
                     // See fitTextSize -- the cap must scale with the box or real headroom
                     // goes unused. For stacked text, a single row's height only needs to
@@ -9107,7 +9411,7 @@ def index():
                     // across all the rows), not the full boxH.
                     var hi = Math.max(300, isFinite(boxW) ? Math.ceil(boxW * 2) : 0,
                                            isFinite(boxH) ? Math.ceil((boxH / chars.length) * 2) : 0);
-                    var best = { size: lo, ascent: lo * 0.8, descent: lo * 0.2, lineHeight: lo };
+                    var best = { size: lo, ascent: lo * 0.8, descent: lo * 0.2, lineHeight: lo, o: 0, s: 0 };
                     ctx.textBaseline = 'alphabetic';
                     while (lo <= hi) {
                         var mid = Math.floor((lo + hi) / 2);
@@ -9119,10 +9423,12 @@ def index():
                             maxAscent = Math.max(maxAscent, metrics.actualBoundingBoxAscent || mid * 0.8);
                             maxDescent = Math.max(maxDescent, metrics.actualBoundingBoxDescent || mid * 0.2);
                         }
-                        var lineHeight = maxAscent + maxDescent;
+                        // Each row carries its own outline + shadow (the device styles every character).
+                        var _pd = fxPads(fx, mid), fo = _pd.o, fs = _pd.s;
+                        var lineHeight = maxAscent + maxDescent + 2 * fo + fs;
                         var totalH = lineHeight * chars.length;
-                        if (maxW <= boxW && totalH <= boxH) {
-                            best = { size: mid, ascent: maxAscent, descent: maxDescent, lineHeight: lineHeight };
+                        if (maxW + 2 * fo + fs <= boxW && totalH <= boxH) {
+                            best = { size: mid, ascent: maxAscent, descent: maxDescent, lineHeight: lineHeight, o: fo, s: fs };
                             lo = mid + 1;
                         } else {
                             hi = mid - 1;
@@ -9358,12 +9664,14 @@ def index():
                             // whichever dimension happens to be smaller. L2R/R2L travel along
                             // X, so height (boxH) is the constraint; T2B/B2T travel along Y,
                             // so width (boxW) is.
-                            var fit = scrollX ? fitTextSize(lineText, fontName, Infinity, boxH)
-                                               : fitTextSize(lineText, fontName, boxW, Infinity);
+                            var lfx = getLineFx(i);
+                            var fit = scrollX ? fitTextSize(lineText, fontName, Infinity, boxH, lfx)
+                                               : fitTextSize(lineText, fontName, boxW, Infinity, lfx);
                             var fitSize = fit.size;
                             ctx.font = fitSize + 'px "' + fontName + '", sans-serif';
-                            var textW = ctx.measureText(lineText).width;
-                            var textH = fit.ascent + fit.descent;
+                            // Block size includes the outline (both sides) + shadow, like the device strip.
+                            var textW = ctx.measureText(lineText).width + 2 * fit.o + fit.s;
+                            var textH = fit.ascent + fit.descent + 2 * fit.o + fit.s;
 
                             // Simulate the exact backend scroll position at the current scrub
                             // time (see animate_lines_via_shm's per-frame loop): a constant
@@ -9400,7 +9708,7 @@ def index():
                             // above where we thought the top was, since actualBoundingBoxAscent
                             // can exceed it.
                             var drawTop = horizScroll ? (boxY + Math.max(0, (boxH - textH) / 2)) : scrollPos;
-                            var drawBaseline = drawTop + fit.ascent;
+                            var drawBaseline = drawTop + fit.o + fit.ascent;
 
                             var arrowFont = 'bold ' + Math.max(8, Math.round(fitSize * 0.4)) + 'px sans-serif';
                             var arrowTxt = {L2R:'→', R2L:'←', T2B:'↓', B2T:'↑'}[movement];
@@ -9428,8 +9736,7 @@ def index():
                                 ctx.save();
                                 ctx.beginPath(); ctx.rect(clipX0, clipY0, clipX1 - clipX0, clipY1 - clipY0); ctx.clip();
                                 ctx.font = fitSize + 'px "' + fontName + '", sans-serif'; ctx.textBaseline = 'alphabetic';
-                                ctx.fillStyle = getLineColor(i);
-                                ctx.fillText(lineText, drawX, drawBaseline);
+                                drawStyledText(i, lineText, drawX + fit.o, drawBaseline, fitSize);
                                 ctx.restore();
                             }
                         } else if (scrolling && orientation === 'vertical_rotated' && scrollY) {
@@ -9440,10 +9747,11 @@ def index():
                             // fixed); rotated height is unconstrained since it's the travel axis
                             // -- equivalent to fitting raw (unrotated) height against boxW with
                             // raw width free.
-                            var fitTR = fitTextSize(lineText, fontName, Infinity, boxW);
+                            var fitTR = fitTextSize(lineText, fontName, Infinity, boxW, getLineFx(i));
                             ctx.font = fitTR.size + 'px "' + fontName + '", sans-serif';
-                            var rawWTR = ctx.measureText(lineText).width;
-                            var rawHTR = fitTR.ascent + fitTR.descent;
+                            var txtWTR = ctx.measureText(lineText).width;
+                            var rawWTR = txtWTR + 2 * fitTR.o + fitTR.s;
+                            var rawHTR = fitTR.ascent + fitTR.descent + 2 * fitTR.o + fitTR.s;
                             var rotatedW = rawHTR, rotatedH = rawWTR; // dims after rotation
 
                             var lineSpeedTR = getLineSpeed(i);
@@ -9473,8 +9781,9 @@ def index():
                                 ctx.translate(dxTR + rotatedW / 2, posTR + rotatedH / 2);
                                 ctx.rotate(-Math.PI / 2);
                                 ctx.textBaseline = 'alphabetic';
-                                ctx.fillStyle = getLineColor(i);
-                                ctx.fillText(lineText, -rawWTR / 2, (fitTR.ascent - fitTR.descent) / 2);
+                                // Center the text+effects block (the shadow shifts it down-right by s/2).
+                                drawStyledText(i, lineText, -txtWTR / 2 - fitTR.s / 2,
+                                               (fitTR.ascent - fitTR.descent) / 2 - fitTR.s / 2, fitTR.size);
                                 ctx.restore();
                             }
                         } else if (scrolling && orientation === 'vertical_stacked' && scrollY) {
@@ -9483,8 +9792,8 @@ def index():
                             // same simulation approach as the rotated branch above, just with
                             // the stack's own total height as the "moving" extent and no
                             // rotate transform.
-                            var charsVS = lineText.split('');
-                            var fitVS = fitStackedTextSize(charsVS, fontName, boxW, Infinity);
+                            var charsVS = Array.from(lineText);
+                            var fitVS = fitStackedTextSize(charsVS, fontName, boxW, Infinity, getLineFx(i));
                             var totalHVS = fitVS.lineHeight * charsVS.length;
 
                             var lineSpeedVS = getLineSpeed(i);
@@ -9512,12 +9821,11 @@ def index():
                                 ctx.beginPath(); ctx.rect(clipX0VS, clipY0VS, clipX1VS - clipX0VS, clipY1VS - clipY0VS); ctx.clip();
                                 ctx.font = fitVS.size + 'px "' + fontName + '", sans-serif';
                                 ctx.textBaseline = 'alphabetic';
-                                ctx.fillStyle = getLineColor(i);
                                 for (var ciVS = 0; ciVS < charsVS.length; ciVS++) {
                                     var cwVS = ctx.measureText(charsVS[ciVS]).width;
-                                    var cxVS = boxX + Math.max(0, (boxW - cwVS) / 2);
-                                    var cyVS = posVS + ciVS * fitVS.lineHeight + fitVS.ascent;
-                                    ctx.fillText(charsVS[ciVS], cxVS, cyVS);
+                                    var cxVS = boxX + Math.max(0, (boxW - cwVS - 2 * fitVS.o - fitVS.s) / 2) + fitVS.o;
+                                    var cyVS = posVS + ciVS * fitVS.lineHeight + fitVS.o + fitVS.ascent;
+                                    drawStyledText(i, charsVS[ciVS], cxVS, cyVS, fitVS.size);
                                 }
                                 ctx.restore();
                             }
@@ -9529,45 +9837,45 @@ def index():
                             // stacked. Leaving boxW unconstrained let short strings (e.g. a
                             // single character) pick an oversized font whose thickness blew
                             // past the box's width.
-                            var fitR = fitTextSize(lineText, fontName, boxH, boxW);
+                            var fitR = fitTextSize(lineText, fontName, boxH, boxW, getLineFx(i));
                             ctx.font = fitR.size + 'px "' + fontName + '", sans-serif';
                             var rawW = ctx.measureText(lineText).width;
                             ctx.save();
                             ctx.translate(boxX + boxW / 2, boxY + boxH / 2);
                             ctx.rotate(-Math.PI / 2);
                             ctx.textBaseline = 'alphabetic';
-                            ctx.fillStyle = getLineColor(i);
                             // Centers the (unrotated) text on the box's center: horizontally
-                            // by its own width, vertically by the midpoint of its ascent/descent.
-                            ctx.fillText(lineText, -rawW / 2, (fitR.ascent - fitR.descent) / 2);
+                            // by its own width, vertically by the midpoint of its ascent/descent
+                            // (shifted up-left by s/2 so the text+shadow block is what's centered).
+                            drawStyledText(i, lineText, -rawW / 2 - fitR.s / 2,
+                                           (fitR.ascent - fitR.descent) / 2 - fitR.s / 2, fitR.size);
                             ctx.restore();
                         } else if (orientation === 'vertical_stacked') {
-                            var chars = lineText.split('');
-                            var fitS = fitStackedTextSize(chars, fontName, boxW, boxH);
+                            var chars = Array.from(lineText);
+                            var fitS = fitStackedTextSize(chars, fontName, boxW, boxH, getLineFx(i));
                             ctx.font = fitS.size + 'px "' + fontName + '", sans-serif';
                             ctx.textBaseline = 'alphabetic';
-                            ctx.fillStyle = getLineColor(i);
                             var totalH = fitS.lineHeight * chars.length;
                             var stackTop = boxY + Math.max(0, (boxH - totalH) / 2);
                             for (var ci = 0; ci < chars.length; ci++) {
                                 var cw = ctx.measureText(chars[ci]).width;
-                                var cx = boxX + Math.max(0, (boxW - cw) / 2);
-                                var cy = stackTop + ci * fitS.lineHeight + fitS.ascent;
-                                ctx.fillText(chars[ci], cx, cy);
+                                var cx = boxX + Math.max(0, (boxW - cw - 2 * fitS.o - fitS.s) / 2) + fitS.o;
+                                var cy = stackTop + ci * fitS.lineHeight + fitS.o + fitS.ascent;
+                                drawStyledText(i, chars[ci], cx, cy, fitS.size);
                             }
                         } else {
-                            var fitH = fitTextSize(lineText, fontName, boxW, boxH);
+                            var fitH = fitTextSize(lineText, fontName, boxW, boxH, getLineFx(i));
                             ctx.font = fitH.size + 'px "' + fontName + '", sans-serif';
                             var inkWH = fitH.inkW != null ? fitH.inkW : ctx.measureText(lineText).width;
                             var textHH = fitH.ascent + fitH.descent;
+                            var padH = 2 * fitH.o + fitH.s;   // outline both sides + shadow
                             // Center the INK in the box (shift by the left side-bearing so the
                             // visible glyphs, not the advance box, are centered - matches the
                             // device, which centers the ink strip).
-                            var drawXH = boxX + Math.max(0, (boxW - inkWH) / 2) + (fitH.left || 0);
-                            var drawBaselineH = boxY + Math.max(0, (boxH - textHH) / 2) + fitH.ascent;
+                            var drawXH = boxX + Math.max(0, (boxW - inkWH - padH) / 2) + fitH.o + (fitH.left || 0);
+                            var drawBaselineH = boxY + Math.max(0, (boxH - textHH - padH) / 2) + fitH.o + fitH.ascent;
                             ctx.textBaseline = 'alphabetic';
-                            ctx.fillStyle = getLineColor(i);
-                            ctx.fillText(lineText, drawXH, drawBaselineH);
+                            drawStyledText(i, lineText, drawXH, drawBaselineH, fitH.size);
                         }
 
                         if (i === selectedLine) {
@@ -9846,6 +10154,7 @@ def index():
                         line_speeds: [50,50,50,50],
                         line_fonts: ['FreeSans','FreeSans','FreeSans','FreeSans'],
                         line_orientations: ['horizontal','horizontal','horizontal','horizontal'],
+                        line_effects: window._normLineEffects([]),
                         display_duration: parseInt(window._flatDisplayDurationInit) || 30
                     };
                 }
@@ -9861,6 +10170,7 @@ def index():
                         line_speeds: (window._lineSpeeds||[50,50,50,50]).slice(0,4),
                         line_fonts: [1,2,3,4].map(function(n){var el=document.getElementById('line_'+n+'_font'); return (el&&el.value)?el.value:'FreeSans';}),
                         line_orientations: (window._lineOrientations||['horizontal','horizontal','horizontal','horizontal']).slice(0,4),
+                        line_effects: window._normLineEffects(window._lineEffects),
                         display_duration: parseInt(gv('content_duration'))||30
                     };
                 }
@@ -9869,7 +10179,7 @@ def index():
                 // Canonical signature of just the layout fields, so a background poll can tell when
                 // the OTHER side changed this content vs. what's in the editor right now.
                 var _LAYOUT_SIG_KEYS = ['message_lines','line_boxes','line_colors','line_movements',
-                                        'line_speeds','line_fonts','line_orientations','display_duration'];
+                                        'line_speeds','line_fonts','line_orientations','line_effects','display_duration'];
                 function _layoutSig(o) {
                     o = o || {};
                     return JSON.stringify(_LAYOUT_SIG_KEYS.map(function(k){ return o[k]; }));
@@ -9890,6 +10200,8 @@ def index():
                     window._lineMovements = (L.line_movements||[]).slice(0,4); while(window._lineMovements.length<4) window._lineMovements.push('Center');
                     window._lineSpeeds = (L.line_speeds||[]).slice(0,4); while(window._lineSpeeds.length<4) window._lineSpeeds.push(50);
                     window._lineOrientations = (L.line_orientations||[]).slice(0,4); while(window._lineOrientations.length<4) window._lineOrientations.push('horizontal');
+                    window._lineEffects = window._normLineEffects(L.line_effects);
+                    if (typeof window.syncLineEffectControls === 'function') window.syncLineEffectControls();
                     var ml=L.message_lines||[], lc=L.line_colors||[], lf=L.line_fonts||[];
                     for (var n=0;n<4;n++){
                         var t=document.getElementById('line_'+(n+1)); if(t) t.value=ml[n]||'';
@@ -9906,7 +10218,11 @@ def index():
                         if (typeof updateLineSpeedRowVisibility==='function') updateLineSpeedRowVisibility(n);
                         if (typeof updateLineOrientationRowVisibility==='function') updateLineOrientationRowVisibility(n);
                     }
-                    var d=document.getElementById('content_duration'); if(d) d.value=L.display_duration||30;
+                    // Timing is the Master's: while previewing a remote, show THIS master's duration
+                    // for the content (what the show actually uses), never the remote's own copy.
+                    var _mi=(window._namesContentList||[])[window._namesSelectedIndex];
+                    var d=document.getElementById('content_duration');
+                    if(d) d.value=((window._editTarget && _mi) ? _mi.display_duration : L.display_duration)||30;
                     if (typeof window.renderCanvasPreview==='function') window.renderCanvasPreview();
                 }
 
@@ -9922,7 +10238,7 @@ def index():
                         var L=collectEditorLayout(); var it=lst[idx];
                         it.message_lines=L.message_lines; it.line_boxes=L.line_boxes; it.line_colors=L.line_colors;
                         it.line_movements=L.line_movements; it.line_speeds=L.line_speeds;
-                        it.line_orientations=L.line_orientations; it.display_duration=L.display_duration;
+                        it.line_orientations=L.line_orientations; it.line_effects=L.line_effects; it.display_duration=L.display_duration;
                         // Only capture fonts once the font dropdowns are populated, else an
                         // early autosave would overwrite real fonts with the FreeSans default.
                         if (window._fontsReady) it.line_fonts=L.line_fonts;
@@ -9988,7 +10304,9 @@ def index():
                     // content is being previewed - it may differ from the one picked on this Pi.
                     if (prow) prow.style.display=rc ? 'block' : ((lst.length>1)?'block':'none');
                     var scope=document.getElementById('content_duration_scope');
-                    if (scope) scope.textContent=(lst.length>0)?('- for content '+(window._namesSelectedIndex+1)):'- shown over waiting content';
+                    if (scope) scope.textContent=(lst.length>0)
+                        ? ('- for content '+(window._namesSelectedIndex+1)+(window._editTarget ? ' (set on this Master, applies to every Pi)' : ''))
+                        : '- shown over waiting content';
                 }
 
                 // ---- Manage Content modal (Available <-> Names list, with arrows) ----
@@ -10145,6 +10463,14 @@ def index():
                 function onNamesModeChange(mode){ window._namesMode=(mode==='random')?'random':'roundrobin'; saveConfig(); }
                 function onContentDurationChange(){
                     flushEditorToSelected();
+                    if (window._editTarget) {
+                        // Previewing a remote: flushEditorToSelected skips the master's item, but the
+                        // duration IS the master's (it drives every Pi), so set it there. saveConfig
+                        // below saves it on the master; remotes pick it up from the master.
+                        var _it=(window._namesContentList||[])[window._namesSelectedIndex];
+                        var _d=document.getElementById('content_duration');
+                        if (_it && _d) _it.display_duration=parseInt(_d.value)||30;
+                    }
                     // Re-cap the background scrubber and re-fit "Fit to time" scroll lines to
                     // the new duration.
                     if (typeof window.toggleFseqPreview==='function') window.toggleFseqPreview();
@@ -10233,7 +10559,7 @@ def index():
                         applyLayoutToEditor({
                             message_lines: L.message_lines, line_boxes: boxes, line_colors: L.line_colors,
                             line_movements: L.line_movements, line_speeds: L.line_speeds,
-                            line_fonts: L.line_fonts, line_orientations: L.line_orientations,
+                            line_fonts: L.line_fonts, line_orientations: L.line_orientations, line_effects: L.line_effects,
                             display_duration: L.display_duration
                         });
                         flushEditorToSelected();
@@ -11297,6 +11623,7 @@ var _saveTimer = null;
                     line_movements: window._lineMovements || ['Center','Center','Center','Center'],
                     line_speeds: window._lineSpeeds || [50,50,50,50],
                     line_orientations: window._lineOrientations || ['horizontal','horizontal','horizontal','horizontal'],
+                    line_effects: window._normLineEffects(window._lineEffects),
                     custom_colors: window._customColors || [],
                     sms_response_show_not_live: document.getElementById('sms_response_show_not_live').checked,
                     sms_response_success: document.getElementById('sms_response_success').checked,
@@ -11350,7 +11677,7 @@ var _saveTimer = null;
                 // the master's own and is untouched in remote mode.)
                 if (window._editTarget) {
                     ['message_lines','line_boxes','line_colors','line_movements',
-                     'line_speeds','line_orientations','line_fonts'].forEach(function(k){ delete data[k]; });
+                     'line_speeds','line_orientations','line_fonts','line_effects'].forEach(function(k){ delete data[k]; });
                 }
 
                 fetch('/api/config', {
@@ -11794,6 +12121,8 @@ def update_config():
         if _lst_len == 0 or int(config.get('names_content_rr_index', -1) or -1) >= _lst_len:
             config['names_content_rr_index'] = -1
 
+        if 'line_effects' in new_config:
+            config['line_effects'] = _sanitize_line_effects(new_config.get('line_effects'))
         # Sanitize the WAITING content rotation list the same way.
         if 'default_content_list' in new_config:
             raw_wlist = new_config.get('default_content_list')
@@ -14873,15 +15202,14 @@ def api_tml_layout():
     if not item:
         return jsonify({"found": False, "model_w": mw, "model_h": mh})
     return jsonify({"found": True, "model_w": mw, "model_h": mh, "layout": {
-        k: item.get(k) for k in ('message_lines', 'line_boxes', 'line_colors', 'line_movements',
-                                 'line_speeds', 'line_fonts', 'line_orientations', 'display_duration')
+        k: item.get(k) for k in _LAYOUT_KEYS
     }})
 
 
 # Keys that make up a single content's text layout - the unit the master reads from and
 # writes to a remote (and the master's own names_content_list items use the same shape).
 _LAYOUT_KEYS = ('message_lines', 'line_boxes', 'line_colors', 'line_movements',
-                'line_speeds', 'line_fonts', 'line_orientations', 'display_duration')
+                'line_speeds', 'line_fonts', 'line_orientations', 'line_effects', 'display_duration')
 
 
 @app.route('/api/tml/editinfo', methods=['GET'])
@@ -14953,7 +15281,7 @@ def api_tml_remote_config():
             config['names_content_list'] = lst
         for k in _LAYOUT_KEYS:
             if k in layout and layout[k] is not None:
-                item[k] = layout[k]
+                item[k] = _sanitize_line_effects(layout[k]) if k == 'line_effects' else layout[k]
         save_config()
         # Best-effort live refresh: only if this exact name+content is on screen right now.
         # Fire-and-forget so the push returns immediately and never blocks the master's UI.

@@ -79,7 +79,7 @@ A single text can add **several names at once** — this is detected automatical
 
 ### How to separate names
 
-Names must be separated by **commas** or **line breaks** — **never by spaces alone**. This is what keeps multi-word names intact.
+Names must be separated by **commas**, **line breaks**, **"and"** or **"&"** — **never by spaces alone**. This is what keeps multi-word names intact. "and" only counts as a separator when it's its own word, so names like `Andy` or `Brandon` are unaffected.
 
 **Commas — all on one line:**
 ```
@@ -96,10 +96,13 @@ Riley
 Casey
 ```
 
-Both of the above add **6 names** to the display. Multi-word names stay together, because names are split **only** on commas and line breaks (not spaces):
+Both of the above add **6 names** to the display. Multi-word names stay together, because names are never split on spaces:
 
 | Text | Result |
 |------|--------|
+| `Wyatt and Theo` | **2 names** — `Wyatt` and `Theo` |
+| `Wyatt & Theo` | **2 names** — `Wyatt` and `Theo` |
+| `Wyatt, Theo, and Bill` | **3 names** — `Wyatt`, `Theo` and `Bill` |
 | `Mary Jane, Alex` | **2 names** — `Mary Jane` and `Alex` |
 | `Mary-Jane, Alex` | **2 names** — `Mary-Jane` and `Alex` |
 

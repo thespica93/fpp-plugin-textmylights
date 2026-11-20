@@ -5938,17 +5938,23 @@ def get_queue_status():
 
     return status
 
-def parse_name_list(body):
-    """If `body` is a genuine multi-name list - names separated by commas or
-    line breaks, with 2+ that pass name validation - return the list of
-    extracted names. Otherwise return None, signalling the caller to handle the
-    message as a single submission (unchanged behavior).
+# Separators between names in a grouped text: commas, line breaks, "&", and the whole
+# word "and" (so "Andy" / "Brandon" are untouched). "Wyatt, Theo, and Bill" → 3 names.
+_NAME_SEP_RE = re.compile(r'[\n\r,&]+|\band\b', re.IGNORECASE)
 
-    Only commas and line breaks separate names - NEVER spaces - so multi-word
-    names like "Jean Luke" and hyphenated names like "Jean-Luke" each stay a
-    single name."""
-    tokens = [t.strip() for t in re.split(r'[\n\r,]+', body)]
-    tokens = [t for t in tokens if t and re.search(r'[a-zA-Z]', t)]
+def split_name_tokens(body):
+    """Split `body` on name separators, dropping pieces with no letters."""
+    return [t.strip() for t in _NAME_SEP_RE.split(body) if re.search(r'[a-zA-Z]', t)]
+
+def parse_name_list(body):
+    """If `body` is a genuine multi-name list - names separated by commas,
+    line breaks, "&" or "and", with 2+ that pass name validation - return the
+    list of extracted names. Otherwise return None, signalling the caller to
+    handle the message as a single submission (unchanged behavior).
+
+    Spaces alone NEVER separate names, so multi-word names like "Jean Luke" and
+    hyphenated names like "Jean-Luke" each stay a single name."""
+    tokens = split_name_tokens(body)
     if len(tokens) < 2:
         return None
 
@@ -6010,9 +6016,9 @@ def process_incoming_message(from_number, body):
         return
 
     # The admin phone is trusted: no blocklist, rate limit, duplicate, length/word,
-    # whitelist or profanity checks. Commas / line breaks still split multiple names.
+    # whitelist or profanity checks. Name separators still split multiple names.
     if _is_admin_sender(from_number):
-        tokens = [t for t in re.split(r'[\n\r,]+', body) if re.search(r'[a-zA-Z]', t)]
+        tokens = split_name_tokens(body)
         queued = []
         for nm in (extract_name(t) for t in (tokens or [body])):
             if add_to_queue(nm, from_number, body):
@@ -6033,7 +6039,7 @@ def process_incoming_message(from_number, body):
         send_sms_response(from_number, "blocked")
 
     elif parse_name_list(body) is not None:
-        # ── Grouped / multi-name text (commas or line breaks, 2+ valid names) ──
+        # ── Grouped / multi-name text (commas, line breaks, "and"; 2+ valid names) ──
         # To keep the sender experience simple, a grouped text is all-or-nothing
         # and is ONLY accepted when the box is fully "open": no rate limiting,
         # duplicates allowed, and every name valid / whitelisted. Any restriction
@@ -7231,9 +7237,9 @@ def index():
                 <!-- Multiple names (grouped texts) explainer -->
                 <div style="background:var(--bs-info-bg-subtle, #e7f3ff); border:1px solid #4a90d9; color:var(--bs-info-text-emphasis, #1a3d5c); border-radius:6px; padding:10px 14px; margin-top:14px; font-size:13px; line-height:1.55;">
                     <strong>📝 Multiple names in one text</strong><br>
-                    Texters can submit several names at once, separated by <strong>commas or line breaks</strong>
-                    (e.g. <em>"Alex, Sam, Jordan"</em>). Multi-word names like <em>"Mary Jane"</em> stay intact -
-                    only commas and line breaks split names, never spaces.
+                    Texters can submit several names at once, separated by <strong>commas, line breaks, "and" or "&amp;"</strong>
+                    (e.g. <em>"Alex, Sam, and Jordan"</em>). Multi-word names like <em>"Mary Jane"</em> stay intact -
+                    spaces alone never split names.
                     <br><br>
                     To keep replies simple, a grouped text is <strong>all-or-nothing</strong> and is only accepted
                     when the box is fully open:

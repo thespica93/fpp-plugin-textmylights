@@ -189,6 +189,7 @@ $fppTheme = tml_fpp_theme_help();
     <!-- ================= SETTINGS ================= -->
     <section class="tml-panel" id="panel-settings">
     <h2>⚙️ Plugin Settings</h2>
+    <div class="note"><strong>📱 Works on your phone.</strong> The Config page fits small screens: the tabs, <em>View Message Queue</em> and <em>Start / Stop</em> wrap onto extra rows, side-by-side sections stack, and the Display tab shows the Preview above the line editors. One limit for now: dragging or resizing a line's box in the Preview needs a mouse — on a phone, set text, colors, effects and movement, and do box positioning from a computer.</div>
 
     <h3>Settings tab</h3>
     <div class="ref"><table>
@@ -257,6 +258,7 @@ $fppTheme = tml_fpp_theme_help();
         <tr><th>Setting</th><th>What it does</th></tr>
         <tr><td>Response toggles</td><td>Turn each automatic reply on/off: success, blocked, rate-limited, duplicate, invalid format, not whitelisted, show-not-live.</td></tr>
         <tr><td>Response text</td><td>The message sent back for each case. Customize to your show.</td></tr>
+        <tr><td>👥 Multiple Names</td><td>Indented under <strong>Success</strong>. Sent <strong>instead of</strong> the Success reply when one text puts two or more names on the display (see <a href="#multi-name">Several names in one text</a>). Default: <em>“Merry Christmas! It looks like you sent more than 1 name. Your names will appear 1 at a time on our display! 🎄”</em>. It has no toggle of its own — it follows the Success toggle. It is greyed out, with a note naming the cause, while the <strong>Name Whitelist</strong> is on, <strong>Max Messages Per Phone</strong> is above 0, or <strong>Allow Duplicate Names</strong> is off, because multi-name texts are rejected in those cases.</td></tr>
     </table></div>
     <div class="note">Works with both sources. Twilio sends via its API; Google Voice sends by emailing a reply back through Google Voice (best-effort, may be rate-limited).</div>
 
@@ -273,9 +275,22 @@ $fppTheme = tml_fpp_theme_help();
     </table></div>
     <div class="note">A text that is only emoji or a phone “reaction” (like 👍 or <em>Loved “…”</em>) is ignored — it is not a name, gets no reply, and is never shown.</div>
 
+    <h3 id="multi-name">👥 Several names in one text</h3>
+    <p>A visitor can send more than one name in a single text. Names are split on <strong>commas</strong>, <strong>line breaks</strong>, <strong>&amp;</strong>, and the word <strong>and</strong>:</p>
+    <div class="ref"><table>
+        <tr><th>Text</th><th>Names shown</th></tr>
+        <tr><td>Maggie and Tess</td><td>Maggie, Tess</td></tr>
+        <tr><td>Maggie, Tess</td><td>Maggie, Tess</td></tr>
+        <tr><td>Maggie &amp; Tess</td><td>Maggie, Tess</td></tr>
+        <tr><td>Wyatt, Theo, and Bill</td><td>Wyatt, Theo, Bill</td></tr>
+        <tr><td>Andy Brandon</td><td>Andy Brandon <span style="color:#888;">(one name — “and” only splits as a whole word, and spaces never split)</span></td></tr>
+    </table></div>
+    <p>Each name is queued and shown <strong>one at a time</strong>, and the visitor gets the <strong>Multiple Names</strong> reply instead of the normal Success reply. At least two real names are needed before a text is treated as a list, so an ordinary sentence with a comma isn't chopped up. Up to 25 names per text are used.</p>
+    <div class="warn"><strong>Multi-name texts are all-or-nothing.</strong> They are only accepted when the <strong>Name Whitelist is off</strong>, <strong>Max Messages Per Phone is 0</strong> (unlimited), and <strong>Allow Duplicate Names is on</strong> — the Google Voice defaults. If any of those is set differently, or any name fails the format rules, the whole text gets the <strong>Invalid Format</strong> reply (and it doesn't count toward the daily limit). Profanity anywhere in the text rejects the whole text with the Profanity reply.</div>
+
     <h3 id="unfiltered">🧪 Testing tab &amp; admin phone skip every filter</h3>
     <p>Names sent from the <strong>Testing</strong> tab, and names texted from the <strong>Admin Phone Number</strong> (Google Voice), go straight to the display queue. They skip <strong>all</strong> of the checks above: profanity and emoji blacklist, whitelist, phone blocklist, max length, word rules, duplicate check, and the per-phone daily limit. They don't count toward any limit or auto-block tally.</p>
-    <div class="warn"><strong>🔴 Profanity is allowed from the Testing tab and the admin phone.</strong> Anything typed there will be displayed, so only use them yourself. Names are still cleaned up the same way (symbols removed, Proper Case), and emoji follow the <em>Allow Emoji in Names</em> setting. Admin replies of <strong>Y</strong>/<strong>N</strong> and the word <strong>admin</strong> are still handled as approvals/connect, never displayed. The admin texting several names separated by commas or line breaks shows each one.</div>
+    <div class="warn"><strong>🔴 Profanity is allowed from the Testing tab and the admin phone.</strong> Anything typed there will be displayed, so only use them yourself. Names are still cleaned up the same way (symbols removed, Proper Case), and emoji follow the <em>Allow Emoji in Names</em> setting. Admin replies of <strong>Y</strong>/<strong>N</strong> and the word <strong>admin</strong> are still handled as approvals/connect, never displayed. The admin texting several names (separated by commas, line breaks, <strong>&amp;</strong> or <strong>and</strong>) shows each one, and gets the Multiple Names reply — even while the whitelist or limits are on.</div>
 
     <h3 id="live-approval">🙋 Live Name Approval over text <span style="color:#888;font-weight:normal;">(Google Voice only)</span></h3>
     <p>With the whitelist <strong>on</strong>, a name that is not on the list is normally rejected. Live Name Approval lets you say "yes" from your phone instead: when a visitor texts a name you have not pre-approved, the plugin texts <strong>you</strong> the name and you reply <strong>Y</strong> to add it and show it, or <strong>N</strong> to deny it. It runs only while the show is live, and only for Google Voice. Leave the Admin Phone Number blank to turn it off.</p>
@@ -287,7 +302,7 @@ $fppTheme = tml_fpp_theme_help();
         <li>From that phone, text the word <strong>admin</strong> to your Google Voice number.</li>
         <li>The yellow "Action needed" banner turns green ("Admin phone connected") within a few seconds.</li>
     </ol>
-    <div class="note">The word <strong>admin</strong> is reserved — it is used only to connect and is <strong>never shown on the display</strong>. The plugin also scans your existing Google Voice history in Gmail, so if you have already texted the number from your admin phone it may connect on its own. If you change the admin number, text <strong>admin</strong> again from the new phone.</div>
+    <div class="note">The word <strong>admin</strong> is reserved — it is used only to connect and is <strong>never shown on the display</strong>. Connecting is always deliberate: texting names from the admin phone, or old texts already in Gmail, never connects it on their own — only the word <strong>admin</strong> does. You'll get a confirmation text back once it's connected. If you change the admin number, text <strong>admin</strong> again from the new phone.</div>
 
     <div class="warn"><strong>🔴 Keep the conversation thread.</strong> Approvals work only while that Google Voice conversation with your admin number is still in your Gmail <strong>inbox</strong>. If you delete it or archive it out of the inbox, the plugin notices (it re-checks that exact message periodically), the banner reverts to "Action needed," and approvals pause until you text <strong>admin</strong> again.</div>
 

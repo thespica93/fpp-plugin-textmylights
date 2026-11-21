@@ -304,7 +304,7 @@ $fppTheme = tml_fpp_theme_help();
     </ol>
     <div class="note">The word <strong>admin</strong> is reserved — it is used only to connect and is <strong>never shown on the display</strong>. Connecting is always deliberate: texting names from the admin phone, or old texts already in Gmail, never connects it on their own — only the word <strong>admin</strong> does. You'll get a confirmation text back once it's connected. If you change the admin number, text <strong>admin</strong> again from the new phone.</div>
 
-    <div class="warn"><strong>🔴 Keep the conversation thread.</strong> Approvals work only while that Google Voice conversation with your admin number is still in your Gmail <strong>inbox</strong>. If you delete it or archive it out of the inbox, the plugin notices (it re-checks that exact message periodically), the banner reverts to "Action needed," and approvals pause until you text <strong>admin</strong> again.</div>
+    <div class="warn"><strong>🔴 Keep the conversation thread.</strong> Google Voice sends approval texts by replying inside that Gmail conversation with your admin number, so leave it in your <strong>inbox</strong>. The connection itself is kept until you change the admin number — it survives plugin updates and restarts, and is never dropped automatically. If you ever delete the conversation and approval texts stop arriving, just text <strong>admin</strong> again.</div>
 
     <h4>Approving names during the show</h4>
     <div class="ref"><table>

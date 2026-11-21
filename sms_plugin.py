@@ -149,6 +149,9 @@ PROFANITY_STRIKES_FILE = os.path.join(PLUGIN_DATA_DIR, "profanity_strikes.json")
 # thread) plus the phone it belongs to; pending_approvals.json is the FIFO list of
 # outstanding name requests awaiting an admin Y/N. See _maybe_handle_admin_message().
 ADMIN_CTX_FILE          = os.path.join(PLUGIN_DATA_DIR, "admin_reply_ctx.json")
+# Written whenever the admin context is cleared (time + reason) so a disconnect can be
+# explained later - the plugin log does not survive plugin updates.
+ADMIN_CTX_CLEARED_FILE  = os.path.join(PLUGIN_DATA_DIR, "admin_ctx_cleared.json")
 PENDING_APPROVALS_FILE  = os.path.join(PLUGIN_DATA_DIR, "pending_approvals.json")
 # Requests that timed out before the admin answered are moved here so a LATE "Y" can
 # still add the name to the whitelist (for next time) without showing it now. Bounded.
@@ -3546,18 +3549,30 @@ def load_admin_ctx():
     return None
 
 def save_admin_ctx(ctx):
+    # Atomic write (temp + rename): the plugin is stopped/restarted on every update, and a
+    # write cut off mid-way must never leave a truncated file that reads as "not connected".
+    tmp = ADMIN_CTX_FILE + '.tmp'
     try:
-        with open(ADMIN_CTX_FILE, 'w') as f:
+        with open(tmp, 'w') as f:
             json.dump(ctx, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, ADMIN_CTX_FILE)
     except Exception as e:
         logging.error(f"Error saving admin reply ctx: {e}")
 
-def clear_admin_ctx():
-    """Forget the seeded admin context (used when admin_phone changes so the
-    bootstrap banner reappears until the new number texts in)."""
+def clear_admin_ctx(reason):
+    """Forget the seeded admin context. The ONLY caller is a change of admin_phone to a
+    different number (the new phone must text "admin" to connect). Every clear leaves a
+    breadcrumb in ADMIN_CTX_CLEARED_FILE - the plugin log is replaced on each update, so
+    the log alone can't explain a disconnect after the fact."""
     try:
         if os.path.exists(ADMIN_CTX_FILE):
             os.remove(ADMIN_CTX_FILE)
+            logging.warning(f"Admin reply context cleared: {reason}")
+            with open(ADMIN_CTX_CLEARED_FILE, 'w') as f:
+                json.dump({"time": datetime.now().isoformat(timespec='seconds'),
+                           "reason": reason}, f, indent=2)
     except Exception as e:
         logging.error(f"Error clearing admin reply ctx: {e}")
 
@@ -3582,24 +3597,23 @@ def admin_ctx_is_seeded():
     return _normalize_phone(ctx.get('phone', '')) == _normalize_phone(admin_phone)
 
 _last_admin_verify_scan = 0.0
+_last_admin_missing_warn = 0.0
 
 # NOTE: the admin reply context is NOT auto-seeded from existing inbox history. The operator
 # must explicitly connect by texting the "admin" keyword (see _maybe_handle_admin_message), so
 # "connected" never turns on merely because the admin number texted names in the past.
 
 def verify_admin_ctx(force=False):
-    """Confirm the stored admin reply context still points at a live email thread.
+    """Check (throttled) that the stored admin reply context's email is still in the inbox.
 
-    The reply context only works while the Google Voice conversation email is still
-    in the inbox - if the operator deletes (or archives out) that thread, Google
-    Voice can no longer route our reply and approvals silently break. We re-check
-    cheaply by searching the inbox DIRECTLY for the stored Message-ID (no full
-    mailbox scan). If it is gone, we clear the context so the setup banner reverts
-    and the operator knows to text the number again.
+    NON-DESTRUCTIVE: a miss only logs a warning - it NEVER clears the context. Clearing on
+    a "not found" used to disconnect the admin across plugin updates (the check runs right
+    after every restart, and one bad search result wiped the connection, forcing the admin
+    to text "admin" again). The admin stays connected until they change the admin number;
+    replies still go to the Google Voice thread address, and every later admin text
+    refreshes the context anyway.
 
-    Returns True if the context is still valid (or could not be checked this call),
-    False only when we positively confirmed the thread no longer exists and cleared
-    it. Transient failures (no network, Gmail hiccup) NEVER clear a good context."""
+    Returns True while a context is stored (whatever the search says)."""
     global _last_admin_verify_scan
     if config.get('message_source') != 'google_voice':
         return False
@@ -3634,15 +3648,15 @@ def verify_admin_ctx(force=False):
         _mid = _sanitize_header(msgid).replace('\\', '\\\\').replace('"', '\\"')
         typ, data = imap.uid('search', None, 'HEADER', 'Message-ID', '"%s"' % _mid)
         found = (typ == 'OK' and data and data[0] and len(data[0].split()) > 0)
-        if found:
-            return True
-        # Positively absent from the inbox: the thread was deleted/archived.
-        clear_admin_ctx()
-        logging.warning("Admin reply thread no longer in inbox - cleared context; "
-                        "live approvals paused until the admin texts the number again")
-        return False
+        if not found:
+            # Warn only (at most every 10 min) - never disconnect the admin over this.
+            global _last_admin_missing_warn
+            if now - _last_admin_missing_warn > 600:
+                _last_admin_missing_warn = now
+                logging.warning("Admin reply email not found in the inbox - keeping the admin "
+                                "connected. If approval texts stop arriving, text 'admin' again.")
+        return True
     except Exception as e:
-        # Network/Gmail error - do NOT clear a context we simply couldn't reach.
         logging.error(f"Admin ctx verify failed (leaving context in place): {e}")
         return True
     finally:
@@ -10408,7 +10422,7 @@ def index():
                     }
                     if (!val) return null;
                     if (val.startsWith('seq:')) {
-                        return { type: 'seq', file: val.replace(/^seq:/, '').replace(/\.fseq$/, '') };
+                        return { type: 'seq', file: val.replace(/^seq:/, '').replace(/\\.fseq$/, '') };
                     }
                     if (val.startsWith('vid:')) {
                         return { type: 'vid', file: val.replace(/^vid:/, '') };
@@ -12451,11 +12465,16 @@ def update_config():
         # operator changed it, drop the seeded reply context so it no longer counts
         # as "connected" - the new number must text the GV number once to re-seed
         # (the bootstrap banner reappears until it does).
+        # Blank / partial values never clear it: blanking the field just turns the feature off,
+        # and re-entering the same number reconnects with no new "admin" text.
         if 'admin_phone' in new_config:
             config['admin_phone'] = _normalize_phone(config.get('admin_phone', ''))
             _ctx = load_admin_ctx()
-            if _ctx and _normalize_phone(_ctx.get('phone', '')) != config['admin_phone']:
-                clear_admin_ctx()
+            _ctx_phone = _normalize_phone((_ctx or {}).get('phone', ''))
+            if (_ctx and len(config['admin_phone']) >= 10 and _ctx_phone
+                    and _ctx_phone != config['admin_phone']):
+                clear_admin_ctx(f"admin number changed from ...{_ctx_phone[-4:]} "
+                                f"to ...{config['admin_phone'][-4:]} on settings save")
             # The number was just entered/changed - let the very next status poll re-verify
             # immediately instead of waiting out the verify throttle window.
             global _last_admin_verify_scan
@@ -15905,6 +15924,13 @@ if __name__ == '__main__':
         logging.warning(f"Could not write PID file {PID_FILE}: {_e}")
 
     load_config()
+
+    # Record the admin connection state at every start, so a disconnect across an update is
+    # visible in the (fresh) log.
+    if config.get('admin_phone'):
+        logging.info("🔑 Admin phone ...%s: %s", config['admin_phone'][-4:],
+                     "connected" if admin_ctx_is_seeded()
+                     else "NOT connected (text 'admin' from the admin phone)")
 
     # Reflect the current role in FPP's Run Script list at boot: a remote hides the Start/Stop
     # scheduler scripts (the master drives it), a master keeps them. Runs after a brief delay so

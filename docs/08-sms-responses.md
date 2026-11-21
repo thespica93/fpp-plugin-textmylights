@@ -44,6 +44,7 @@ There are **eight** response scenarios, each with its own customizable message:
 | Response Type | When It's Sent |
 |--------------|----------------|
 | **Success** | Name was accepted and added to the display queue |
+| ↳ **Multiple Names** | Sent *instead of* Success when one text queues 2+ names ("Maggie and Tess", "Maggie, Tess", "Maggie & Tess"). Uses the Success toggle. Greyed out while the Name Whitelist is on, Max Messages Per Phone is above 0, or Allow Duplicate Names is off — multi-name texts get **Invalid Format** in those cases. |
 | **Blocked (Profanity)** | Message contained a word from the profanity blacklist |
 | **Rate Limited** | Sender has already reached the daily message limit |
 | **Duplicate Name** | Same name from the same phone was already submitted today |
@@ -95,6 +96,11 @@ Below are suggested messages for each response type. Feel free to personalize th
 🎄 Ho ho ho! "{name}" has been added to our display! Watch for it on the lights! Merry Christmas! 🎄
 ```
 
+### Multiple Names (Success)
+```
+Merry Christmas! It looks like you sent more than 1 name. Your names will appear 1 at a time on our display! 🎄
+```
+
 ### Blocked (Profanity)
 ```
 Sorry, your message contained inappropriate content and could not be displayed. Please try a different name!
@@ -112,7 +118,7 @@ You've reached today's limit of {limit} messages. Thanks for participating! Chec
 
 ### Invalid Format
 ```
-Please send only 1 name ({words}, no sentences).
+Please send only 1 name ({words}, no sentences), and try again!
 ```
 `{words}` automatically becomes **"1 word"** or **"2 words"** to match your current Name Format Rule, so the reply always tells texters the right limit.
 

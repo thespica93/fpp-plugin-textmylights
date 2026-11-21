@@ -8295,7 +8295,7 @@ def index():
                     <div id="multi_success_block" style="margin:14px 0 4px 22px; padding:10px 0 4px 14px; border-left:3px solid #90caf9;">
                         <div class="resp-toggle" style="font-weight:bold;">👥 Multiple Names - Success Response</div>
                         <p id="multi_success_disabled_warning" class="resp-locked-note" style="{{ '' if _multi_blocked else 'display:none;' }}">⚠️ <strong>Multi-name texts are rejected</strong> - <span id="multi_success_reasons"></span>. A text with more than one name gets the <strong>Invalid Format</strong> response instead, so this response is disabled.</p>
-                        <p class="help-text" style="margin:2px 0 8px;">Sent <strong>instead of</strong> the Success response above when one text contains more than one name (e.g. "Maggie and Tess", "Maggie, Tess", "Maggie &amp; Tess"). Uses the Success toggle.</p>
+                        <p class="help-text" style="margin:2px 0 8px;">Sent <strong>instead of</strong> the Success response above when one text contains more than one name.</p>
                         <textarea id="response_success_multi" rows="2">{{ config.get('response_success_multi', response_defaults.get('response_success_multi', '')) }}</textarea>
                     </div>
                 </div>

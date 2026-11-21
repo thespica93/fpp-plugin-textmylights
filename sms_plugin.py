@@ -556,11 +556,14 @@ DEFAULT_CONFIG = {
     "sms_response_blocked": True,
     "response_show_not_live": "Ho, Ho, Ho, It looks like our show isn't running now. Try again later.",
     "response_success": "Merry Christmas! Your name will appear on our display soon! 🎄",
+    # Sent INSTEAD of response_success when one text queues 2+ names ("maggie and tess").
+    # Shares the Success on/off toggle - it has no toggle of its own.
+    "response_success_multi": "Merry Christmas! It looks like you sent more than 1 name. Your names will appear 1 at a time on our display! 🎄",
     "response_profanity": "Ho Ho Ho! That one didn't make the nice list. More texts with profanity may block your phone 🎅",
     "response_blocked": "Sorry, Your phone number has been blocked from sending messages.",
     "response_rate_limited": "You've reached the maximum number of messages allowed. Please try again tomorrow!",
     "response_duplicate": "You've already sent this name today!",
-    "response_invalid_format": "Please send only 1 name ({words}, no sentences).",
+    "response_invalid_format": "Please send only 1 name ({words}, no sentences), and try again!",
     "response_too_long": "I'm sorry, your message exceeds our max message length. Please only send your name.",
     "response_not_whitelisted": "Sorry, that name is not on our approved list and cannot be shown.",
     # --- Admin whitelist approval over SMS (Google Voice ONLY) ---
@@ -4010,7 +4013,9 @@ def send_sms_response(to_phone, message_type):
     Twilio: sends via the Twilio API. Google Voice: sends by replying to the
     forwarding email (Google Voice converts an email reply into an outbound SMS),
     using the reply context captured by the poller for the current message."""
-    if not config.get(f'sms_response_{message_type}', False):
+    # The multi-name Success message rides on the Success toggle (no toggle of its own).
+    toggle_type = 'success' if message_type == 'success_multi' else message_type
+    if not config.get(f'sms_response_{toggle_type}', False):
         return False
 
     # Honor the "greyed out" state at send time without ever having persisted
@@ -6029,7 +6034,7 @@ def process_incoming_message(from_number, body):
                 logging.warning(f"❌ Queue error: {_mask_name(nm)}")
                 log_message(from_number, body, nm, "error", counts=False)
         if queued:
-            send_sms_response(from_number, "success")
+            send_sms_response(from_number, "success_multi" if len(queued) > 1 else "success")
         return
 
     # Exactly one branch fires - only one SMS response is ever sent per message
@@ -6083,7 +6088,7 @@ def process_incoming_message(from_number, body):
                     log_message(from_number, body, nm, "error", counts=False)
             if queued:
                 logging.info(f"✅ Grouped text queued {len(queued)} name(s): {from_number[-4:]}")
-                send_sms_response(from_number, "success")
+                send_sms_response(from_number, "success_multi" if len(queued) > 1 else "success")
 
     else:
         # ── Single-name text (original behavior) ──
@@ -6843,6 +6848,21 @@ def index():
             .tab-btn:hover:not(.active) { background: var(--tab-hover); }
             .tab-content { display: none; }
             .tab-content.active { display: block; }
+            /* Phone / narrow widths. The page lives in FPP's iframe with scrolling="no", so
+               anything wider than the screen is clipped - not scrollable. Wrap the tab bar,
+               stack the two-column layouts, and trim the padding so everything fits. */
+            img, video, canvas, table { max-width: 100%; }
+            @media (max-width: 760px) {
+                body { padding: 10px; }
+                .section { padding: 14px; margin: 14px 0; }
+                .tabs { flex-wrap: wrap; row-gap: 6px; }
+                .tabs .tab-btn { flex: 1 1 auto; }
+                #btn_view_queue { margin: 0 !important; }
+                .columns { flex-direction: column; gap: 0; }
+                /* Display tab: show the live preview above the line editors. */
+                #tab-display .columns > .column:last-child { order: -1; }
+                #canvas_tools_row { flex-wrap: wrap; }
+            }
         </style>
         <script>
             /* Apply the theme BEFORE first paint to avoid a flash. Priority: explicit ?theme=
@@ -7297,6 +7317,39 @@ def index():
                         toggleResp('duplicate');  // reflect the preserved state
                     }
                     if (warn) warn.style.display = allowDupes ? '' : 'none';
+                    checkMultiSuccessState();
+                }
+                // Multi-name Success response: a grouped text ("Maggie and Tess") is only
+                // accepted when the whitelist is off, Max Messages Per Phone is 0 and duplicates
+                // are allowed (see process_incoming_message). Otherwise the whole text gets the
+                // Invalid Format reply, so grey this box out and say which settings block it.
+                // Greys only its own textarea/reset - the Success row's toggle is untouched.
+                function checkMultiSuccessState() {
+                    var block = document.getElementById('multi_success_block');
+                    if (!block) return;  // SMS-responses tab not parsed yet (init runs later)
+                    var wl = document.getElementById('use_whitelist');
+                    var mm = document.getElementById('max_messages');
+                    var dup = document.getElementById('allow_duplicate_names');
+                    var reasons = [];
+                    if (wl && wl.checked) reasons.push('Name Whitelist is on');
+                    if (mm && parseInt(mm.value || '0', 10) > 0) reasons.push('Max Messages Per Phone is above 0');
+                    if (dup && !dup.checked) reasons.push('Allow Duplicate Names is off');
+                    var blocked = reasons.length > 0;
+                    var warn = document.getElementById('multi_success_disabled_warning');
+                    var why = document.getElementById('multi_success_reasons');
+                    if (why) why.textContent = reasons.join(', ');
+                    if (warn) warn.style.display = blocked ? '' : 'none';
+                    var ta = document.getElementById('response_success_multi');
+                    if (ta) {
+                        // Inline so it wins over .resp-row.enabled (the Success row's ON state).
+                        ta.style.opacity = blocked ? '0.4' : '';
+                        ta.style.pointerEvents = blocked ? 'none' : '';
+                        var btn = ta.nextElementSibling;
+                        if (btn && btn.classList.contains('reset-default-btn')) {
+                            btn.style.opacity = blocked ? '0.4' : '';
+                            btn.style.pointerEvents = blocked ? 'none' : '';
+                        }
+                    }
                 }
                 function checkFiltersState() {
                     var whitelistOn = document.getElementById('use_whitelist').checked;
@@ -7370,6 +7423,7 @@ def index():
                             toggleResp('not_whitelisted');  // reflect the preserved state
                         }
                     }
+                    checkMultiSuccessState();
                 }
                 // Rate-Limited response is meaningless when Max Messages Per Phone is 0
                 // (unlimited) - no one is ever rate limited. Lock the row live.
@@ -7392,6 +7446,7 @@ def index():
                         toggleResp('rate_limited');  // reflect the preserved state
                     }
                     if (warn) warn.style.display = unlimited ? '' : 'none';
+                    checkMultiSuccessState();
                 }
                 // Live preview for the {words} placeholder in the Invalid Format
                 // response - mirrors word_rule_phrase() on the backend.
@@ -8207,7 +8262,7 @@ def index():
                 }
                 // Inject a "Reset to default" button after each response textarea once.
                 function addResetButtons() {
-                    ['show_not_live','blocked','profanity','duplicate','invalid_format','too_long','rate_limited','not_whitelisted','success'].forEach(function(id) {
+                    ['show_not_live','blocked','profanity','duplicate','invalid_format','too_long','rate_limited','not_whitelisted','success','success_multi'].forEach(function(id) {
                         var ta = document.getElementById('response_' + id);
                         if (!ta || ta._hasReset) return;
                         var btn = document.createElement('button');
@@ -8233,6 +8288,16 @@ def index():
                         <label for="sms_response_success" style="margin-left:10px;vertical-align:middle;">✅ Success - Send Response</label>
                     </div>
                     <textarea id="response_success" rows="2">{{ config.get('response_success', 'Thanks! Your name will appear on our display soon! 🎄') }}</textarea>
+
+                    <!-- Multi-name Success - nested inside row_success so it greys out with the
+                         Success toggle (it has no toggle of its own). -->
+                    {% set _multi_blocked = config.get('use_whitelist', False) or (config.get('max_messages_per_phone', 0) or 0) > 0 or not config.get('allow_duplicate_names', False) %}
+                    <div id="multi_success_block" style="margin:14px 0 4px 22px; padding:10px 0 4px 14px; border-left:3px solid #90caf9;">
+                        <div class="resp-toggle" style="font-weight:bold;">👥 Multiple Names - Success Response</div>
+                        <p id="multi_success_disabled_warning" class="resp-locked-note" style="{{ '' if _multi_blocked else 'display:none;' }}">⚠️ <strong>Multi-name texts are rejected</strong> - <span id="multi_success_reasons"></span>. A text with more than one name gets the <strong>Invalid Format</strong> response instead, so this response is disabled.</p>
+                        <p class="help-text" style="margin:2px 0 8px;">Sent <strong>instead of</strong> the Success response above when one text contains more than one name (e.g. "Maggie and Tess", "Maggie, Tess", "Maggie &amp; Tess"). Uses the Success toggle.</p>
+                        <textarea id="response_success_multi" rows="2">{{ config.get('response_success_multi', response_defaults.get('response_success_multi', '')) }}</textarea>
+                    </div>
                 </div>
 
                 <div id="row_show_not_live" class="resp-row">
@@ -11443,6 +11508,7 @@ def index():
             _init('whitelistResp', checkWhitelistResponseState);
             _init('rateLimitResp', checkRateLimitResponseState);
             _init('duplicateResp', checkDuplicateState);
+            _init('multiSuccessResp', checkMultiSuccessState);
             _init('wordsPreview', updateWordsPreview);
             _init('autoSave', setupAutoSave);
             // Keep the role toggle + remote view in sync with the LIVE role while the page is
@@ -11851,6 +11917,7 @@ var _saveTimer = null;
                     sms_response_not_whitelisted: document.getElementById('sms_response_not_whitelisted').checked,
                     sms_response_blocked: document.getElementById('sms_response_blocked').checked,
                     response_success: document.getElementById('response_success').value,
+                    response_success_multi: document.getElementById('response_success_multi').value,
                     response_profanity: document.getElementById('response_profanity').value,
                     response_rate_limited: document.getElementById('response_rate_limited').value,
                     response_duplicate: document.getElementById('response_duplicate').value,
@@ -11994,7 +12061,7 @@ var _saveTimer = null;
                  'poll_interval','display_duration','max_messages','max_length',
                  'profanity_threshold',
                  'line_1','line_2','line_3','line_4',
-                 'response_success','response_profanity','response_rate_limited',
+                 'response_success','response_success_multi','response_profanity','response_rate_limited',
                  'response_duplicate','response_invalid_format','response_too_long',
                  'response_not_whitelisted','response_blocked'
                 ].forEach(function(id) {
